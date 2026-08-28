@@ -42290,6 +42290,9 @@ struct ds4_engine {
     bool ssd_streaming_budget_finalized;
     bool ssd_streaming_static_decode_map;
     ds4_distributed_options distributed;
+    /* One coordinator endpoint per engine, opened on the first coordinator
+     * session. Sessions borrow it; it outlives all of them. */
+    ds4_dist_coordinator *dist_coordinator;
     ds4_engine_tp_state tp;
     bool metal_ready;
     bool mtp_ready;
@@ -72620,6 +72623,8 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    ds4_dist_coordinator_close(e->dist_coordinator);
+    e->dist_coordinator = NULL;
     ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);
@@ -72786,6 +72791,29 @@ static int ds4_session_tp_register(ds4_session *s) {
     }
     s->tp_session_id = id;
     return 1;
+}
+
+/* Attach a coordinator session to the engine's endpoint, opening the endpoint
+ * on first use.  ctx_size comes from the first session; every resident session
+ * on a server shares it. */
+static int ds4_session_attach_distributed(ds4_session *s, ds4_engine *e,
+                                          int ctx_size) {
+    char err[256];
+    if (!e->dist_coordinator &&
+        ds4_dist_coordinator_open(&e->dist_coordinator, e, &e->distributed,
+                                  ctx_size, err, sizeof(err)) != 0) {
+        fprintf(stderr,
+                "ds4: failed to open distributed coordinator endpoint: %s\n",
+                err[0] ? err : "unknown error");
+        return 1;
+    }
+    if (ds4_dist_session_create(&s->distributed, e->dist_coordinator,
+                                err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: failed to create distributed coordinator session: %s\n",
+                err[0] ? err : "unknown error");
+        return 1;
+    }
+    return 0;
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
@@ -73053,26 +73081,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs =
             xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
-        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
-            char err[256];
-            if (ds4_dist_session_create(&s->distributed,
-                                        e,
-                                        &e->distributed,
-                                        s,
-                                        ctx_size,
-                                        err,
-                                        sizeof(err)) != 0) {
-                fprintf(stderr,
-                        "ds4: failed to create distributed coordinator session: %s\n",
-                        err[0] ? err : "unknown error");
-                glm_graph_free(&s->glm_graph);
-                free(s->glm_mtp_hc);
-                free(s->glm_mtp_logits0);
-                free(s->logits);
-                free(s->sample_probs);
-                free(s);
-                return 1;
-            }
+        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+            ds4_session_attach_distributed(s, e, ctx_size) != 0) {
+            glm_graph_free(&s->glm_graph);
+            free(s->glm_mtp_hc);
+            free(s->glm_mtp_logits0);
+            free(s->logits);
+            free(s->sample_probs);
+            free(s);
+            return 1;
         }
         s->glm_reserved_graph_bytes = session_mem.total_bytes;
         e->glm_session_graph_bytes = glm_graph_saturating_add_u64(
@@ -73221,28 +73238,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
         s->mtp_draft_token = -1;
     }
-    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
-        char err[256];
-        if (ds4_dist_session_create(&s->distributed,
-                                    e,
-                                    &e->distributed,
-                                    s,
-                                    ctx_size,
-                                    err,
-                                    sizeof(err)) != 0) {
-            fprintf(stderr,
-                    "ds4: failed to create distributed coordinator session: %s\n",
-                    err[0] ? err : "unknown error");
-            metal_graph_free(&s->graph);
-            free(s->logits);
-            free(s->sample_probs);
-            free(s->mtp_logits);
-            free(s->spec_row_logits);
-            free(s->dspark_markov_bias);
-            free(s->dspark_conf_features);
-            free(s);
-            return 1;
-        }
+    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        ds4_session_attach_distributed(s, e, ctx_size) != 0) {
+        metal_graph_free(&s->graph);
+        free(s->logits);
+        free(s->sample_probs);
+        free(s->mtp_logits);
+        free(s->spec_row_logits);
+        free(s->dspark_markov_bias);
+        free(s->dspark_conf_features);
+        free(s);
+        return 1;
     }
     if (!ds4_session_tp_register(s)) {
         ds4_session_free(s);
