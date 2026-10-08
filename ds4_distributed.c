@@ -2236,10 +2236,12 @@ static bool dist_coordinator_build_route_plan(
         ds4_dist_coordinator_state *state,
         ds4_dist_route_plan *plan,
         uint64_t *generation,
+        bool *layer_missing,
         char *err,
         size_t errlen) {
     memset(plan, 0, sizeof(*plan));
     if (generation) *generation = 0;
+    if (layer_missing) *layer_missing = false;
 
     pthread_mutex_lock(&state->mu);
     uint32_t n = 0;
@@ -2288,6 +2290,7 @@ static bool dist_coordinator_build_route_plan(
         pthread_mutex_unlock(&state->mu);
         free(workers);
         free(path);
+        if (layer_missing) *layer_missing = true;
         if (errlen) snprintf(err, errlen, "distributed route incomplete: missing layer %u", missing);
         return false;
     }
@@ -2354,6 +2357,16 @@ static int dist_logits_argmax(const float *logits, int n_vocab) {
     return best;
 }
 
+/* How long a request waits for a missing stage to register before failing.
+ * A worker that restarts (a crash under a restart policy, or an operator
+ * restart) takes roughly 20-60 s to reload its slice and dial back in.
+ * Failing at once would turn that window into errors for every request, and
+ * would also defeat dist_coordinator_rebuild_from_transcript(): a stream whose
+ * worker died mid-decode could replay its transcript into the new worker and
+ * finish, but only if the route is allowed to come back first. */
+#define DS4_DIST_ROUTE_WAIT_SEC 120.0
+#define DS4_DIST_ROUTE_POLL_US 250000
+
 /* Builds the plan, then gives it its own connection to the first hop.
  *
  * The dial sits here and not in dist_coordinator_build_route_plan() because
@@ -2368,8 +2381,35 @@ static bool dist_coordinator_ensure_route(
         uint64_t *generation,
         char *err,
         size_t errlen) {
-    if (!dist_coordinator_build_route_plan(state, plan, generation, err, errlen)) {
-        return false;
+    /* Only a missing layer is worth waiting for: it is the one failure that
+     * a worker registering later can cure.  Configuration errors fail now. */
+    const double t0 = dist_now_sec();
+    bool waited = false;
+    for (;;) {
+        bool layer_missing = false;
+        if (dist_coordinator_build_route_plan(state, plan, generation,
+                                              &layer_missing, err, errlen)) {
+            break;
+        }
+        if (!layer_missing || dist_now_sec() - t0 >= DS4_DIST_ROUTE_WAIT_SEC) {
+            if (waited) {
+                fprintf(stderr,
+                        "ds4: distributed coordinator: no complete route after %.0f s: %s\n",
+                        dist_now_sec() - t0, err);
+            }
+            return false;
+        }
+        if (!waited) {
+            fprintf(stderr,
+                    "ds4: distributed coordinator: %s; waiting up to %.0f s for a worker\n",
+                    err, DS4_DIST_ROUTE_WAIT_SEC);
+            waited = true;
+        }
+        usleep(DS4_DIST_ROUTE_POLL_US);
+    }
+    if (waited) {
+        fprintf(stderr, "ds4: distributed coordinator: route restored after %.1f s\n",
+                dist_now_sec() - t0);
     }
     /* count == 0 is a local-only route; fd >= 0 is the one-shot coordinator's
      * dup() of the control link. */
@@ -5631,7 +5671,7 @@ int ds4_dist_session_route_ready(ds4_dist_session *d, char *err, size_t errlen) 
     }
 
     ds4_dist_route_plan probe = {0};
-    if (!dist_coordinator_build_route_plan(&d->coord->state, &probe, NULL, err, errlen)) {
+    if (!dist_coordinator_build_route_plan(&d->coord->state, &probe, NULL, NULL, err, errlen)) {
         return 0;
     }
     dist_route_plan_free(&probe);
