@@ -10051,6 +10051,8 @@ struct server_slot {
     double prefill_gate_wait;   /* Seconds spent waiting at the gate. */
     double prefill_compute;     /* Seconds spent holding the gate. */
     double prefill_chunk_t0;    /* now_sec() when the current chunk got the gate. */
+    double prefill_remote;      /* Seconds the gate was lent out during remote waits. */
+    double prefill_remote_t0;   /* now_sec() when the gate was last lent out. */
 
     bool decode_pending;
     bool decode_in_flight;
@@ -12429,9 +12431,11 @@ static void server_prefill_acquired(server_slot *slot, double t_wait0,
     if (slot->prefill_chunks == 1) {
         server_log(DS4_LOG_PREFILL,
                    "sched t=%.3f req#%llu slot %d: prefill compute START "
-                   "(%.1f ms after arrival, gate wait %.1f ms, blocked by: %s)",
+                   "(%.1f ms after arrival: %.1f ms of setup before the gate, "
+                   "gate wait %.1f ms, blocked by: %s)",
                    sched_t(now), j ? (unsigned long long)j->id : 0ull,
                    slot->id, j ? (now - j->t_arrive) * 1000.0 : 0.0,
+                   j ? (t_wait0 - j->t_arrive) * 1000.0 : 0.0,
                    wait * 1000.0, blocker);
     } else if (sched_chunk_log_enabled()) {
         server_log(DS4_LOG_PREFILL,
@@ -12505,6 +12509,97 @@ static void server_prefill_leave(server *s, server_slot *slot) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* Remote-yield hook for a distributed coordinator session (see
+ * ds4_session_set_remote_yield).  A distributed prefill chunk is a local layer
+ * slice followed by a send and a wait on the next stage, and the wait is about
+ * half the chunk.  Lending the prefill gate out across it lets another slot's
+ * prefill, or a decode batch, run its local slice on this GPU while the remote
+ * stage works on ours, so both nodes are busy instead of taking turns.  Only
+ * the executor is lent: the slot keeps its place in the job, and the session
+ * touches neither the GPU nor the shared prefill workspace until it is back.
+ *
+ * Getting the gate back skips the round-robin and decode-pending checks of
+ * server_prefill_enter(): the session is mid-chunk, and what is left of the
+ * chunk is a logits copy, so it only waits for the current holder to finish. */
+static void server_prefill_remote_yield(void *ud, bool acquire) {
+    server_slot *slot = ud;
+    server *s = slot->srv;
+    const job *j = slot->running;
+    if (!acquire) {
+        const double now = now_sec();
+        slot->prefill_compute += now - slot->prefill_chunk_t0;
+        slot->prefill_remote_t0 = now;
+        pthread_mutex_unlock(&s->inference_mu);
+        pthread_mutex_lock(&s->model_mu);
+        s->model_busy = false;
+        pthread_cond_broadcast(&s->model_cv);
+        pthread_mutex_unlock(&s->model_mu);
+        if (sched_chunk_log_enabled()) {
+            server_log(DS4_LOG_PREFILL,
+                       "sched t=%.3f req#%llu slot %d: prefill chunk %d lent "
+                       "gate out for the remote stage",
+                       sched_t(now), j ? (unsigned long long)j->id : 0ull,
+                       slot->id, slot->prefill_chunks);
+        }
+        return;
+    }
+    const double t_back0 = now_sec();
+    pthread_mutex_lock(&s->model_mu);
+    while (s->model_busy) pthread_cond_wait(&s->model_cv, &s->model_mu);
+    s->model_busy = true;
+    s->model_holder = slot->id;
+    pthread_mutex_unlock(&s->model_mu);
+    pthread_mutex_lock(&s->inference_mu);
+    const double now = now_sec();
+    slot->prefill_remote += t_back0 - slot->prefill_remote_t0;
+    slot->prefill_gate_wait += now - t_back0;
+    slot->prefill_chunk_t0 = now;
+    if (sched_chunk_log_enabled()) {
+        server_log(DS4_LOG_PREFILL,
+                   "sched t=%.3f req#%llu slot %d: prefill chunk %d remote "
+                   "stage done after %.1f ms, gate back after %.1f ms",
+                   sched_t(now), j ? (unsigned long long)j->id : 0ull,
+                   slot->id, slot->prefill_chunks,
+                   (t_back0 - slot->prefill_remote_t0) * 1000.0,
+                   (now - t_back0) * 1000.0);
+    }
+}
+
+/* DS4_SERVER_NO_PREFILL_LEND keeps the gate held across remote waits, for
+ * A/B measurement against the serialized schedule. */
+static bool server_prefill_lend_enabled(const server *s, server_slot *slot) {
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("DS4_SERVER_NO_PREFILL_LEND") != NULL;
+    return !disabled && s->batched_mode && ds4_session_is_distributed(slot->session);
+}
+
+/* Lend the gate out during remote waits only in batched mode, where another
+ * slot can use it, and only for the duration of one gated sync call. */
+static int server_gated_session_sync(server *s, server_slot *slot,
+                                     const ds4_tokens *prefix,
+                                     char *err, size_t errlen) {
+    const bool lend = server_prefill_lend_enabled(s, slot);
+    if (lend) ds4_session_set_remote_yield(slot->session,
+                                           server_prefill_remote_yield, slot);
+    int rc = ds4_session_sync(slot->session, prefix, err, errlen);
+    if (lend) ds4_session_set_remote_yield(slot->session, NULL, NULL);
+    return rc;
+}
+
+static int server_gated_session_sync_multimodal(server *s, server_slot *slot,
+                                                const ds4_tokens *prefix,
+                                                const ds4_vision_span *images,
+                                                size_t image_count,
+                                                char *err, size_t errlen) {
+    const bool lend = server_prefill_lend_enabled(s, slot);
+    if (lend) ds4_session_set_remote_yield(slot->session,
+                                           server_prefill_remote_yield, slot);
+    int rc = ds4_session_sync_multimodal(slot->session, prefix, images,
+                                         image_count, err, errlen);
+    if (lend) ds4_session_set_remote_yield(slot->session, NULL, NULL);
+    return rc;
+}
+
 /* Log the end of a prompt sync: compare its wall time against the time it
  * actually held the gate to see how much it was serialized behind others. */
 static void server_prefill_finished(const server_slot *slot, int tokens) {
@@ -12512,10 +12607,11 @@ static void server_prefill_finished(const server_slot *slot, int tokens) {
     const double now = now_sec();
     server_log(DS4_LOG_PREFILL,
                "sched t=%.3f req#%llu slot %d: prefill DONE tokens=%d "
-               "chunks=%d compute=%.1f ms gate_wait=%.1f ms "
-               "(%.1f ms after arrival)",
+               "chunks=%d compute=%.1f ms remote_lent=%.1f ms "
+               "gate_wait=%.1f ms (%.1f ms after arrival)",
                sched_t(now), j ? (unsigned long long)j->id : 0ull, slot->id,
                tokens, slot->prefill_chunks, slot->prefill_compute * 1000.0,
+               slot->prefill_remote * 1000.0,
                slot->prefill_gate_wait * 1000.0,
                j ? (now - j->t_arrive) * 1000.0 : 0.0);
 }
@@ -12570,7 +12666,7 @@ static int server_session_sync(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
+        int rc = server_gated_session_sync(s, slot, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s, slot);
         called = true;
@@ -12657,9 +12753,9 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync_multimodal(slot->session, &prefix,
-                                             images, prefix_images,
-                                             err, errlen);
+        int rc = server_gated_session_sync_multimodal(s, slot, &prefix,
+                                                      images, prefix_images,
+                                                      err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s, slot);
         called = true;
@@ -14880,6 +14976,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->prefill_chunks = 0;
     slot->prefill_gate_wait = 0.0;
     slot->prefill_compute = 0.0;
+    slot->prefill_remote = 0.0;
     server_log(DS4_LOG_DEFAULT,
                "sched t=%.3f req#%llu slot %d: worker started job "
                "(%.1f ms after arrival)",
@@ -16343,6 +16440,65 @@ static void test_batched_prefill_round_robin(void) {
     slots[0].prefill_waiting = false;
     slots[2].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+}
+
+typedef struct {
+    server *srv;
+    server_slot *slot;
+    volatile bool back;
+} test_lend_arg;
+
+static void *test_lend_reacquire_main(void *arg) {
+    test_lend_arg *a = arg;
+    server_prefill_remote_yield(a->slot, true);
+    a->back = true;
+    server_prefill_leave(a->srv, a->slot);
+    return NULL;
+}
+
+/* A slot that lends the prefill gate out for its remote wait lets another
+ * slot's prefill in, and gets the gate back only once that slot leaves. */
+static void test_batched_prefill_lends_gate_across_remote_wait(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    s.batched_mode = true;
+    s.last_prefill_slot = 1;
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s.inference_mu, &attr);
+    pthread_mutexattr_destroy(&attr);
+    pthread_mutex_init(&s.model_mu, NULL);
+    pthread_cond_init(&s.model_cv, NULL);
+    for (int i = 0; i < 2; i++) {
+        slots[i].srv = &s;
+        slots[i].id = i;
+    }
+
+    TEST_ASSERT(server_prefill_enter(&s, &slots[0]));
+    server_prefill_remote_yield(&slots[0], false);
+    TEST_ASSERT(!s.model_busy);
+
+    /* Slot 1 runs its local slice while slot 0 waits on the remote stage. */
+    TEST_ASSERT(server_prefill_enter(&s, &slots[1]));
+    TEST_ASSERT(s.model_busy && s.model_holder == 1);
+
+    test_lend_arg arg = {.srv = &s, .slot = &slots[0]};
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, test_lend_reacquire_main, &arg) == 0);
+    usleep(50000);
+    TEST_ASSERT(!arg.back);
+    server_prefill_leave(&s, &slots[1]);
+    pthread_join(th, NULL);
+    TEST_ASSERT(arg.back);
+    TEST_ASSERT(!s.model_busy);
+    TEST_ASSERT(slots[0].prefill_chunks == 1 && slots[1].prefill_chunks == 1);
+
+    pthread_cond_destroy(&s.model_cv);
+    pthread_mutex_destroy(&s.model_mu);
+    pthread_mutex_destroy(&s.inference_mu);
 }
 
 static void test_mixed_prefill_quantum_option(void) {
@@ -23107,6 +23263,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
+    test_batched_prefill_lends_gate_across_remote_wait();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();

@@ -2667,6 +2667,7 @@ static int dist_coordinator_finish_remote_on_fd(
         uint64_t request_id,
         uint64_t expected_result_hash,
         uint32_t hidden_hc_bytes,
+        bool reacquire_executor,
         float *logits,
         char *err,
         size_t errlen) {
@@ -2684,6 +2685,9 @@ static int dist_coordinator_finish_remote_on_fd(
                                     &payload_bytes,
                                     err,
                                     errlen);
+    /* The executor was lent out for the wait; take it back before anything
+     * below can run the output head. */
+    if (reacquire_executor) ds4_session_remote_yield(session, true);
     if (profile) {
         fprintf(stderr,
                 "ds4: dist decode profile: remote request=%llu wait_result=%.3fms kind=%u payload=%.2fMiB\n",
@@ -2744,6 +2748,11 @@ static int dist_coordinator_eval_remote_on_fd(
         float *logits,
         char *err,
         size_t errlen) {
+    /* The local slice has been read back into hidden_hc, so this session needs
+     * neither the GPU nor the shared prefill workspace until the remote result
+     * arrives: lend the executor out for the send and the wait. */
+    const bool lend = ds4_session_has_remote_yield(session);
+    if (lend) ds4_session_remote_yield(session, false);
     int rc = dist_coordinator_send_remote_work_on_fd(state,
                                                      plan,
                                                      fd,
@@ -2760,7 +2769,10 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      hidden_hc_bytes,
                                                      err,
                                                      errlen);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        if (lend) ds4_session_remote_yield(session, true);
+        return rc;
+    }
     return dist_coordinator_finish_remote_on_fd(state,
                                                 session,
                                                 fd,
@@ -2768,6 +2780,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                 request_id,
                                                 expected_result_hash,
                                                 hidden_hc_bytes,
+                                                lend,
                                                 logits,
                                                 err,
                                                 errlen);
@@ -6016,7 +6029,7 @@ int ds4_dist_sessions_eval(
         int rc = dist_coordinator_finish_remote_on_fd(
                 state, items[i].owner, items[i].dist->plan.entry[0].fd, 1,
                 members[i].request_id, members[i].result_hash, hidden_bytes,
-                items[i].logits, member_err, sizeof(member_err));
+                false, items[i].logits, member_err, sizeof(member_err));
         if (rc != 0) {
             members[i].rc = rc;
             if (!failed++) snprintf(report_err, sizeof(report_err), "%s", member_err);

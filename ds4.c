@@ -61274,6 +61274,8 @@ struct ds4_session {
     void *display_progress_ud;
     ds4_session_cancel_fn cancel;
     void *cancel_ud;
+    ds4_session_yield_fn remote_yield;
+    void *remote_yield_ud;
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
@@ -74922,6 +74924,20 @@ static bool ds4_session_cancelled(ds4_session *s) {
 
 static bool ds4_session_cancelled_cb(void *ud) {
     return ds4_session_cancelled(ud);
+}
+
+void ds4_session_set_remote_yield(ds4_session *s, ds4_session_yield_fn fn, void *ud) {
+    if (!s) return;
+    s->remote_yield = fn;
+    s->remote_yield_ud = ud;
+}
+
+bool ds4_session_has_remote_yield(const ds4_session *s) {
+    return s && s->remote_yield;
+}
+
+void ds4_session_remote_yield(ds4_session *s, bool acquire) {
+    if (s && s->remote_yield) s->remote_yield(s->remote_yield_ud, acquire);
 }
 
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {

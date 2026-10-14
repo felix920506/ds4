@@ -427,6 +427,19 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
+/* Lend the executor out while a distributed coordinator session waits on a
+ * remote stage.  During ds4_session_sync() the coordinator calls
+ * fn(ud, false) once its local layer slice has finished and been read back,
+ * and fn(ud, true) once the remote result has arrived; between the two calls
+ * the session issues no GPU work and does not touch the shared prefill
+ * workspace, so the caller may run other sessions on the GPU meanwhile.
+ * fn(ud, true) must not return until the caller again holds the executor. */
+typedef void (*ds4_session_yield_fn)(void *ud, bool acquire);
+void ds4_session_set_remote_yield(ds4_session *s, ds4_session_yield_fn fn, void *ud);
+/* Distributed code: true when a remote-yield hook is installed; then
+ * ds4_session_remote_yield() calls it. */
+bool ds4_session_has_remote_yield(const ds4_session *s);
+void ds4_session_remote_yield(ds4_session *s, bool acquire);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen);
