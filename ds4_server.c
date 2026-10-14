@@ -9886,6 +9886,23 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
     pthread_mutex_unlock(&server_log_mu);
 }
 
+/* Scheduling trace: millisecond timestamps relative to server start so the
+ * arrival, queueing and prefill-gate lines of concurrent requests can be
+ * lined up.  Request-level lines are always printed; per-chunk prefill gate
+ * lines need DS4_SERVER_SCHED_LOG. */
+static double g_sched_origin;
+static uint64_t g_next_request_id;
+
+static double sched_t(double t) {
+    return t - g_sched_origin;
+}
+
+static bool sched_chunk_log_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_SERVER_SCHED_LOG") != NULL;
+    return enabled;
+}
+
 typedef struct job job;
 typedef struct server_slot server_slot;
 
@@ -10029,6 +10046,12 @@ struct server_slot {
     bool busy;
     bool prefill_waiting;
 
+    /* Prefill gate accounting for the running job, owned by the slot thread. */
+    int prefill_chunks;
+    double prefill_gate_wait;   /* Seconds spent waiting at the gate. */
+    double prefill_compute;     /* Seconds spent holding the gate. */
+    double prefill_chunk_t0;    /* now_sec() when the current chunk got the gate. */
+
     bool decode_pending;
     bool decode_in_flight;
     bool decode_done;
@@ -10159,6 +10182,7 @@ struct server {
     pthread_mutex_t model_mu;
     pthread_cond_t model_cv;
     bool model_busy;
+    int model_holder; /* Slot id holding model_busy, or -1 for a decode batch. */
     bool qwen4_batch_mtp;
     bool model_stopping;
     int decode_pending;
@@ -10213,6 +10237,8 @@ static bool server_encode_image(server *s, const server_image_input *input,
 struct job {
     int fd;
     request req;
+    uint64_t id;      /* Request number for the scheduling trace. */
+    double t_arrive;  /* now_sec() when the HTTP request was read. */
     bool done;
     bool cancelled;
     pthread_mutex_t mu;
@@ -12364,20 +12390,77 @@ static int server_next_prefill_slot_locked(const server *s) {
     return -1;
 }
 
+/* Describe what is keeping a slot out of the prefill gate.  Caller holds
+ * model_mu. */
+static void server_prefill_blocker_locked(const server *s,
+                                          const server_slot *slot,
+                                          char *out, size_t outlen) {
+    if (s->model_busy) {
+        if (s->model_holder < 0) {
+            snprintf(out, outlen, "decode batch in flight");
+        } else {
+            const server_slot *h = &s->slots[s->model_holder];
+            snprintf(out, outlen, "slot %d prefill (req#%llu)",
+                     s->model_holder,
+                     h->running ? (unsigned long long)h->running->id : 0ull);
+        }
+    } else if (s->decode_pending > 0) {
+        snprintf(out, outlen, "%d decode token(s) pending", s->decode_pending);
+    } else {
+        int next = server_next_prefill_slot_locked(s);
+        if (next >= 0 && next != slot->id)
+            snprintf(out, outlen, "round-robin turn of slot %d", next);
+        else
+            snprintf(out, outlen, "none");
+    }
+}
+
+/* Account a gate acquisition: the first one of a job is the moment its
+ * prefill actually starts computing, which can be long after the request was
+ * assigned a slot and logged "prompt start". */
+static void server_prefill_acquired(server_slot *slot, double t_wait0,
+                                    const char *blocker) {
+    const double now = now_sec();
+    const double wait = now - t_wait0;
+    const job *j = slot->running;
+    slot->prefill_gate_wait += wait;
+    slot->prefill_chunk_t0 = now;
+    slot->prefill_chunks++;
+    if (slot->prefill_chunks == 1) {
+        server_log(DS4_LOG_PREFILL,
+                   "sched t=%.3f req#%llu slot %d: prefill compute START "
+                   "(%.1f ms after arrival, gate wait %.1f ms, blocked by: %s)",
+                   sched_t(now), j ? (unsigned long long)j->id : 0ull,
+                   slot->id, j ? (now - j->t_arrive) * 1000.0 : 0.0,
+                   wait * 1000.0, blocker);
+    } else if (sched_chunk_log_enabled()) {
+        server_log(DS4_LOG_PREFILL,
+                   "sched t=%.3f req#%llu slot %d: prefill chunk %d acquired "
+                   "gate (wait %.1f ms, blocked by: %s)",
+                   sched_t(now), j ? (unsigned long long)j->id : 0ull,
+                   slot->id, slot->prefill_chunks, wait * 1000.0, blocker);
+    }
+}
+
 static bool server_prefill_enter(server *s, server_slot *slot) {
     if (!s || !slot || slot_job_cancelled(slot)) return false;
+    const double t_wait0 = now_sec();
     if (!s->batched_mode) {
         pthread_mutex_lock(&s->inference_mu);
         if (slot_job_cancelled(slot)) {
             pthread_mutex_unlock(&s->inference_mu);
             return false;
         }
+        server_prefill_acquired(slot, t_wait0,
+                                "single-session mode (no --batched-session)");
         return true;
     }
 
+    char blocker[96];
     pthread_mutex_lock(&s->model_mu);
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
+    server_prefill_blocker_locked(s, slot, blocker, sizeof(blocker));
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || s->decode_pending > 0 ||
             server_next_prefill_slot_locked(s) != slot->id)) {
@@ -12392,19 +12475,49 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     slot->prefill_waiting = false;
     s->last_prefill_slot = slot->id;
     s->model_busy = true;
+    s->model_holder = slot->id;
     pthread_mutex_unlock(&s->model_mu);
     pthread_mutex_lock(&s->inference_mu);
+    server_prefill_acquired(slot, t_wait0, blocker);
     return true;
 }
 
-static void server_prefill_leave(server *s) {
+static void server_prefill_leave(server *s, server_slot *slot) {
     if (!s) return;
+    if (slot) {
+        const double held = now_sec() - slot->prefill_chunk_t0;
+        slot->prefill_compute += held;
+        if (sched_chunk_log_enabled()) {
+            const job *j = slot->running;
+            server_log(DS4_LOG_PREFILL,
+                       "sched t=%.3f req#%llu slot %d: prefill chunk %d "
+                       "released gate after %.1f ms",
+                       sched_t(now_sec()),
+                       j ? (unsigned long long)j->id : 0ull, slot->id,
+                       slot->prefill_chunks, held * 1000.0);
+        }
+    }
     pthread_mutex_unlock(&s->inference_mu);
     if (!s->batched_mode) return;
     pthread_mutex_lock(&s->model_mu);
     s->model_busy = false;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
+}
+
+/* Log the end of a prompt sync: compare its wall time against the time it
+ * actually held the gate to see how much it was serialized behind others. */
+static void server_prefill_finished(const server_slot *slot, int tokens) {
+    const job *j = slot->running;
+    const double now = now_sec();
+    server_log(DS4_LOG_PREFILL,
+               "sched t=%.3f req#%llu slot %d: prefill DONE tokens=%d "
+               "chunks=%d compute=%.1f ms gate_wait=%.1f ms "
+               "(%.1f ms after arrival)",
+               sched_t(now), j ? (unsigned long long)j->id : 0ull, slot->id,
+               tokens, slot->prefill_chunks, slot->prefill_compute * 1000.0,
+               slot->prefill_gate_wait * 1000.0,
+               j ? (now - j->t_arrive) * 1000.0 : 0.0);
 }
 
 static int server_prefill_quantum_for(const server *s,
@@ -12435,7 +12548,8 @@ static int server_session_sync(server *s, server_slot *slot,
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
-        server_prefill_leave(s);
+        server_prefill_leave(s, slot);
+        if (rc == 0) server_prefill_finished(slot, prompt->len);
         return rc;
     }
 
@@ -12458,10 +12572,13 @@ static int server_session_sync(server *s, server_slot *slot,
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
-        server_prefill_leave(s);
+        server_prefill_leave(s, slot);
         called = true;
         if (rc != 0) return rc;
-        if (done >= prompt->len) return 0;
+        if (done >= prompt->len) {
+            server_prefill_finished(slot, prompt->len);
+            return 0;
+        }
         if (done < target) {
             if (err && errlen) snprintf(err, errlen, "prefill made no progress");
             return 1;
@@ -12503,7 +12620,8 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         int rc = ds4_session_sync_multimodal(slot->session, prompt,
                                              images, image_count,
                                              err, errlen);
-        server_prefill_leave(s);
+        server_prefill_leave(s, slot);
+        if (rc == 0) server_prefill_finished(slot, prompt->len);
         return rc;
     }
 
@@ -12543,10 +12661,13 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
                                              images, prefix_images,
                                              err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
-        server_prefill_leave(s);
+        server_prefill_leave(s, slot);
         called = true;
         if (rc != 0) return rc;
-        if (done >= prompt->len) return 0;
+        if (done >= prompt->len) {
+            server_prefill_finished(slot, prompt->len);
+            return 0;
+        }
         if (done < target) {
             if (err && errlen) snprintf(err, errlen, "prefill made no progress");
             return 1;
@@ -13337,6 +13458,7 @@ static void *decode_worker_main(void *arg) {
         }
         if (count == 0) continue;
         s->model_busy = true;
+        s->model_holder = -1;
         pthread_mutex_unlock(&s->model_mu);
 
         char batch_err[160] = {0};
@@ -14755,10 +14877,26 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->model_mu);
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
+    slot->prefill_chunks = 0;
+    slot->prefill_gate_wait = 0.0;
+    slot->prefill_compute = 0.0;
+    server_log(DS4_LOG_DEFAULT,
+               "sched t=%.3f req#%llu slot %d: worker started job "
+               "(%.1f ms after arrival)",
+               sched_t(now_sec()), (unsigned long long)j->id, slot->id,
+               (now_sec() - j->t_arrive) * 1000.0);
 
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    server_log(DS4_LOG_DEFAULT,
+               "sched t=%.3f req#%llu slot %d: job finished "
+               "(%.1f ms after arrival, prefill chunks=%d compute=%.1f ms "
+               "gate_wait=%.1f ms)",
+               sched_t(now_sec()), (unsigned long long)j->id, slot->id,
+               (now_sec() - j->t_arrive) * 1000.0, slot->prefill_chunks,
+               slot->prefill_compute * 1000.0,
+               slot->prefill_gate_wait * 1000.0);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -14901,6 +15039,12 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        server_log(DS4_LOG_DEFAULT,
+                   "sched t=%.3f req#%llu: assigned slot %d "
+                   "(%.1f ms after arrival, route score=%d)",
+                   sched_t(now_sec()), (unsigned long long)chosen->id,
+                   chosen_slot->id, (now_sec() - chosen->t_arrive) * 1000.0,
+                   chosen_score);
         if (chosen_evict_live > 0) {
             server_log(DS4_LOG_KVCACHE,
                        "slot %d: request reuses nothing; evicting checkpoint "
@@ -14922,6 +15066,19 @@ static bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
+    {
+        int depth = 0, busy = 0;
+        for (const job *q = s->head; q; q = q->next) depth++;
+        for (int i = 0; i < s->slot_count; i++)
+            if (s->slots[i].busy || s->slots[i].assigned) busy++;
+        const double now = now_sec();
+        server_log(DS4_LOG_DEFAULT,
+                   "sched t=%.3f req#%llu: queued prompt=%d tokens "
+                   "(parse %.1f ms) queue_depth=%d slots_busy=%d/%d%s",
+                   sched_t(now), (unsigned long long)j->id, j->req.prompt.len,
+                   (now - j->t_arrive) * 1000.0, depth, busy, s->slot_count,
+                   s->batched_mode ? "" : " (single-session mode: requests run one at a time)");
+    }
     if (s->batched_mode) {
         dispatch_jobs_locked(s);
         pthread_cond_broadcast(&s->cv);
@@ -15289,6 +15446,15 @@ static void *client_main(void *arg) {
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
         goto done;
     }
+    const double t_arrive = now_sec();
+    uint64_t request_id = 0;
+    if (!strcmp(hr.method, "POST")) {
+        request_id = __atomic_add_fetch(&g_next_request_id, 1, __ATOMIC_RELAXED);
+        server_log(DS4_LOG_DEFAULT,
+                   "sched t=%.3f req#%llu: arrived POST %s body=%zu bytes",
+                   sched_t(t_arrive), (unsigned long long)request_id,
+                   hr.path, hr.body_len);
+    }
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
@@ -15354,6 +15520,8 @@ static void *client_main(void *arg) {
     memset(&j, 0, sizeof(j));
     j.fd = fd;
     j.req = req;
+    j.id = request_id;
+    j.t_arrive = t_arrive;
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
@@ -15972,6 +16140,7 @@ int main(int argc, char **argv) {
     pthread_mutexattr_destroy(&inference_attr);
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
+    g_sched_origin = now_sec();
     pthread_mutex_init(&s.trace_mu, NULL);
 
     for (int i = 0; i < slot_count; i++) {
