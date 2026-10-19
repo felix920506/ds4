@@ -267,6 +267,16 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
 bool ds4_engine_has_vision(ds4_engine *e);
+/* One past the largest prompt token id: the vocabulary, plus DeepSeek's typed
+ * image tokens when its vision encoder is loaded. */
+int ds4_engine_token_limit(ds4_engine *e);
+/* Length of the prefill chunk at pos, at most cap and never splitting a
+ * DeepSeek image block. Returns 0 for a malformed or oversized block. */
+uint32_t ds4_engine_prefill_span_chunk(ds4_engine *e,
+                                       const int *tokens,
+                                       uint32_t end,
+                                       uint32_t pos,
+                                       uint32_t cap);
 int ds4_engine_vision_encode_file(ds4_engine *e,
                                   const char *path,
                                   ds4_vision_embedding *out,

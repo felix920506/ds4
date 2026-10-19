@@ -169,6 +169,12 @@ If a worker drops out, the coordinator holds requests for up to 120 seconds
 while a replacement registers its range, then replays interrupted sessions
 into it. Requests fail only if the route is still incomplete after that.
 
+DeepSeek Flash Vision Experimental accepts images in pipeline mode. Pass the
+same `--vision FILE` to every stage: the coordinator encodes the image, and
+each stage applies the encoder's visual router bias for its own layers. A
+worker without the encoder rejects image prompts. Prefill chunks never split
+an image block, so an image must fit within one chunk.
+
 Long prefill chunks can occupy different stages simultaneously. A single
 generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and

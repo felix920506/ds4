@@ -434,7 +434,7 @@ typedef struct {
     uint64_t *expected_hashes;
     uint32_t count;
     uint32_t total_tokens;
-    uint32_t chunk_cap;
+    const uint32_t *chunk_offsets; /* count + 1 span-relative boundaries */
     uint32_t progress_base;
     uint32_t progress_total;
     uint32_t progress_completed;
@@ -3406,8 +3406,7 @@ static void dist_prefill_reader_emit_progress(
 
     while (*reported < completed) {
         (*reported)++;
-        uint32_t rel = (*reported) * reader->chunk_cap;
-        if (rel > reader->total_tokens) rel = reader->total_tokens;
+        uint32_t rel = reader->chunk_offsets[*reported];
         uint32_t current = reader->progress_base + rel;
         if (current > reader->progress_total) current = reader->progress_total;
         ds4_session_report_progress(reader->progress_session,
@@ -3501,9 +3500,7 @@ static void *dist_prefill_result_reader_main(void *arg) {
             dist_prefill_reader_signal_progress(reader, i, true);
             return NULL;
         }
-        const uint32_t pos0 = i * reader->chunk_cap;
-        const uint32_t remaining = reader->total_tokens - pos0;
-        const uint32_t chunk = remaining < reader->chunk_cap ? remaining : reader->chunk_cap;
+        const uint32_t chunk = reader->chunk_offsets[i + 1u] - reader->chunk_offsets[i];
         const uint64_t hidden_bytes64 = (uint64_t)chunk * reader->hc_values * sizeof(float);
         const bool final_chunk = i + 1u == reader->count;
         const bool valid_ack = !final_chunk &&
@@ -3629,7 +3626,7 @@ static void dist_report_prefill_progress(ds4_session *session, uint32_t current,
     ds4_session_report_progress(session, "prefill_chunk", (int)current, (int)total);
 }
 
-static int dist_coordinator_prefill_prompt_pipelined(
+static int dist_coordinator_prefill_prompt_pipelined_chunks(
         ds4_dist_coordinator_state *state,
         ds4_session *session,
         const ds4_dist_route_plan *plan,
@@ -3638,6 +3635,8 @@ static int dist_coordinator_prefill_prompt_pipelined(
         uint32_t n_tokens,
         bool reset_first_chunk,
         uint32_t chunk_cap,
+        const uint32_t *chunk_offsets,
+        uint32_t chunk_count,
         uint64_t session_id,
         uint64_t *request_id,
         float *logits,
@@ -3652,7 +3651,6 @@ static int dist_coordinator_prefill_prompt_pipelined(
         return 1;
     }
     const uint32_t span_end = span_start + n_tokens;
-    const uint32_t chunk_count = (total + chunk_cap - 1u) / chunk_cap;
     const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
     const uint64_t max_hidden_bytes64 = (uint64_t)chunk_cap * hc_values * sizeof(float);
     if (max_hidden_bytes64 > UINT32_MAX) {
@@ -3693,7 +3691,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     reader.first_request_id = *request_id;
     reader.count = chunk_count;
     reader.total_tokens = total;
-    reader.chunk_cap = chunk_cap;
+    reader.chunk_offsets = chunk_offsets;
     reader.progress_base = span_start;
     reader.progress_total = (uint32_t)prompt->len;
     reader.hc_values = hc_values;
@@ -3711,8 +3709,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     }
     uint64_t chunk_prefix_hash = dist_token_hash_prefix(prompt->v, span_start);
     for (uint32_t i = 0, hash_pos = span_start; i < chunk_count; i++) {
-        const uint32_t remaining = span_end - hash_pos;
-        const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+        const uint32_t chunk = chunk_offsets[i + 1u] - chunk_offsets[i];
         chunk_prefix_hash = dist_token_hash_update_span(chunk_prefix_hash,
                                                         prompt->v + hash_pos,
                                                         chunk);
@@ -3768,8 +3765,8 @@ static int dist_coordinator_prefill_prompt_pipelined(
             rc = 1;
             break;
         }
-        const uint32_t remaining = span_end - pos;
-        const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+        const uint32_t chunk = chunk_offsets[submitted_chunks + 1u] -
+                               chunk_offsets[submitted_chunks];
         const uint64_t hidden_bytes64 = (uint64_t)chunk * hc_values * sizeof(float);
         const uint32_t hidden_bytes = (uint32_t)hidden_bytes64;
         ds4_dist_prefill_send_slot *slot =
@@ -3880,8 +3877,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     }
     if (reader.final_kind == DS4_DIST_RESULT_HIDDEN_STATE &&
         reader.final_payload) {
-        const uint32_t last_pos = (chunk_count - 1u) * chunk_cap;
-        const uint32_t last_tokens = total - last_pos;
+        const uint32_t last_tokens = total - chunk_offsets[chunk_count - 1u];
         int head_rc = ds4_session_eval_output_head_from_hc(session,
                                                            reader.final_payload,
                                                            last_tokens,
@@ -3894,6 +3890,103 @@ static int dist_coordinator_prefill_prompt_pipelined(
     free(reader.final_payload);
     if (errlen) snprintf(err, errlen, "distributed pipelined prefill did not return a final result");
     return 1;
+}
+
+/* Every stage applies the visual router bias and in-block attention to a
+ * whole DeepSeek image block, so chunk boundaries must fall between blocks. */
+static uint32_t dist_prefill_next_chunk(
+        ds4_dist_coordinator_state *state,
+        const ds4_tokens *prompt,
+        uint32_t pos,
+        uint32_t span_end,
+        uint32_t chunk_cap,
+        char *err,
+        size_t errlen) {
+    const uint32_t chunk = ds4_engine_prefill_span_chunk(state->engine, prompt->v,
+                                                         span_end, pos, chunk_cap);
+    if (chunk == 0 && errlen) {
+        snprintf(err, errlen,
+                 "distributed prefill at token %u has a malformed image block or one longer than the %u-token chunk",
+                 pos, chunk_cap);
+    }
+    return chunk;
+}
+
+static int dist_prefill_plan_chunks(
+        ds4_dist_coordinator_state *state,
+        const ds4_tokens *prompt,
+        uint32_t span_start,
+        uint32_t span_end,
+        uint32_t chunk_cap,
+        uint32_t **offsets_out,
+        uint32_t *count_out,
+        char *err,
+        size_t errlen) {
+    uint32_t cap = 16, count = 0;
+    uint32_t *offsets = malloc(cap * sizeof(offsets[0]));
+    if (!offsets) {
+        if (errlen) snprintf(err, errlen, "out of memory planning distributed prefill");
+        return 1;
+    }
+    offsets[0] = 0;
+    for (uint32_t pos = span_start; pos < span_end;) {
+        const uint32_t chunk = dist_prefill_next_chunk(state, prompt, pos, span_end,
+                                                       chunk_cap, err, errlen);
+        if (chunk == 0) {
+            free(offsets);
+            return 1;
+        }
+        if (count + 2u > cap) {
+            cap *= 2u;
+            uint32_t *grown = realloc(offsets, cap * sizeof(offsets[0]));
+            if (!grown) {
+                free(offsets);
+                if (errlen) snprintf(err, errlen, "out of memory planning distributed prefill");
+                return 1;
+            }
+            offsets = grown;
+        }
+        pos += chunk;
+        offsets[++count] = pos - span_start;
+    }
+    *offsets_out = offsets;
+    *count_out = count;
+    return 0;
+}
+
+static int dist_coordinator_prefill_prompt_pipelined(
+        ds4_dist_coordinator_state *state,
+        ds4_session *session,
+        const ds4_dist_route_plan *plan,
+        const ds4_tokens *prompt,
+        uint32_t span_start,
+        uint32_t n_tokens,
+        bool reset_first_chunk,
+        uint32_t chunk_cap,
+        uint64_t session_id,
+        uint64_t *request_id,
+        float *logits,
+        char *err,
+        size_t errlen) {
+    if (!prompt ||
+        span_start > (uint32_t)prompt->len ||
+        n_tokens == 0 ||
+        n_tokens > (uint32_t)prompt->len - span_start) {
+        if (errlen) snprintf(err, errlen, "invalid distributed pipelined prefill span");
+        return 1;
+    }
+    uint32_t *chunk_offsets = NULL;
+    uint32_t chunk_count = 0;
+    if (dist_prefill_plan_chunks(state, prompt, span_start, span_start + n_tokens, chunk_cap,
+                                 &chunk_offsets, &chunk_count, err, errlen) != 0) {
+        return 1;
+    }
+    const int rc = dist_coordinator_prefill_prompt_pipelined_chunks(
+            state, session, plan, prompt, span_start, n_tokens, reset_first_chunk,
+            chunk_cap, chunk_offsets, chunk_count, session_id, request_id,
+            logits, err, errlen);
+    free(chunk_offsets);
+    return rc;
 }
 
 static int dist_coordinator_prefill_prompt(
@@ -3929,8 +4022,9 @@ static int dist_coordinator_prefill_prompt(
 
     uint32_t pos = 0;
     while (pos < prompt_len) {
-        uint32_t remaining = prompt_len - pos;
-        uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+        const uint32_t chunk = dist_prefill_next_chunk(state, prompt, pos, prompt_len,
+                                                       chunk_cap, err, errlen);
+        if (chunk == 0) return 1;
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
@@ -5756,8 +5850,10 @@ int ds4_dist_session_sync(
 
         uint32_t pos = pos0;
         while (pos < (uint32_t)prompt->len) {
-            const uint32_t remaining = (uint32_t)prompt->len - pos;
-            const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
+            const uint32_t chunk = dist_prefill_next_chunk(&d->coord->state, prompt,
+                                                           pos, (uint32_t)prompt->len,
+                                                           chunk_cap, err, errlen);
+            if (chunk == 0) return 1;
             int eval_rc = dist_coordinator_eval_span(&d->coord->state,
                                                      owner,
                                                      &d->plan,
@@ -7705,9 +7801,14 @@ static int dist_worker_process_work_payload(
             return -1;
         }
         uint32_t token = ntohl(wire_token);
-        if (token > (uint32_t)INT_MAX || token >= (uint32_t)ds4_engine_vocab_size(state->engine)) {
+        if (token > (uint32_t)INT_MAX || token >= (uint32_t)ds4_engine_token_limit(state->engine)) {
             free(tokens);
-            return dist_worker_upstream_send_work_error(upstream, request_id, "WORK token id is outside the model vocabulary");
+            return dist_worker_upstream_send_work_error(
+                    upstream, request_id,
+                    token >= (uint32_t)ds4_engine_vocab_size(state->engine) &&
+                    ds4_engine_token_limit(state->engine) == ds4_engine_vocab_size(state->engine) ?
+                    "WORK carries image tokens; start the worker with --vision" :
+                    "WORK token id is outside the model vocabulary");
         }
         tokens[i] = (int)token;
     }

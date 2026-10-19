@@ -30406,17 +30406,15 @@ static const float *metal_graph_visual_embedding_row(
 /* DeepSeek image prompts use typed synthetic token ids for routing and
  * attention. Seed those rows from the vision encoder output instead of the
  * vocabulary table; regular rows retain the ordinary token embedding. */
-static bool metal_graph_upload_visual_prompt_embeddings_hc(
+static bool metal_graph_upload_visual_token_embeddings_hc(
         ds4_gpu_graph        *g,
         ds4_gpu_tensor       *out_hc,
         const ds4_model      *model,
         const ds4_weights    *weights,
-        const token_vec      *prompt,
+        const int            *tokens,
         uint32_t              pos0,
         uint32_t              n_tokens) {
-    if (!g || !out_hc || !model || !weights || !prompt ||
-        pos0 > (uint32_t)prompt->len ||
-        n_tokens > (uint32_t)prompt->len - pos0) return false;
+    if (!g || !out_hc || !model || !weights || !tokens) return false;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t total = (uint64_t)n_tokens * hc_dim;
     if (total > SIZE_MAX / sizeof(float)) return false;
@@ -30425,7 +30423,7 @@ static bool metal_graph_upload_visual_prompt_embeddings_hc(
 
     bool ok = true;
     for (uint32_t t = 0; t < n_tokens; t++) {
-        const int token = prompt->v[pos0 + t];
+        const int token = tokens[t];
         const float *source = NULL;
         if (token >= 0 && token < (int)DS4_N_VOCAB) {
             embed_token_f16(model, weights, token, plain);
@@ -30451,6 +30449,20 @@ static bool metal_graph_upload_visual_prompt_embeddings_hc(
     free(plain);
     free(hc);
     return ok;
+}
+
+static bool metal_graph_upload_visual_prompt_embeddings_hc(
+        ds4_gpu_graph        *g,
+        ds4_gpu_tensor       *out_hc,
+        const ds4_model      *model,
+        const ds4_weights    *weights,
+        const token_vec      *prompt,
+        uint32_t              pos0,
+        uint32_t              n_tokens) {
+    if (!prompt || pos0 > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - pos0) return false;
+    return metal_graph_upload_visual_token_embeddings_hc(
+            g, out_hc, model, weights, prompt->v + pos0, pos0, n_tokens);
 }
 
 /* Seed the batched HC state from token ids: every HC stream starts as the same
@@ -73292,6 +73304,34 @@ bool ds4_engine_has_vision(ds4_engine *e) {
     return e && e->vision_ready;
 }
 
+/* Vision-Exp prompts carry typed image tokens just above the vocabulary. */
+static bool ds4_engine_has_deepseek4_image_tokens(const ds4_engine *e) {
+    return e && e->vision_ready && e->vision_kind == DS4_VISION_DEEPSEEK4 &&
+           DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41;
+}
+
+int ds4_engine_token_limit(ds4_engine *e) {
+    const int vocab = ds4_engine_vocab_size(e);
+    return ds4_engine_has_deepseek4_image_tokens(e) ?
+        vocab + DS4_DEEPSEEK4_IMAGE_END + 1 : vocab;
+}
+
+uint32_t ds4_engine_prefill_span_chunk(ds4_engine *e,
+                                       const int *tokens,
+                                       uint32_t end,
+                                       uint32_t pos,
+                                       uint32_t cap) {
+    if (!tokens || pos >= end || cap == 0) return 0;
+    const uint32_t remaining = end - pos;
+    if (!ds4_engine_has_deepseek4_image_tokens(e)) return remaining < cap ? remaining : cap;
+    uint32_t chunk = 0;
+    if (!ds4_deepseek4_prefill_chunk(tokens, end, (uint32_t)ds4_engine_vocab_size(e),
+                                     pos, cap, &chunk)) {
+        return 0;
+    }
+    return chunk;
+}
+
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
     if (!embedding) return;
     free(embedding->data);
@@ -76238,7 +76278,24 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         .cap = (int)n_tokens,
     };
 
+    /* Image rows route through the visual router bias and attend across their
+     * block on every stage, so each slice sees the typed image tokens. The
+     * stage that owns the embeddings seeds those rows from the encoder. */
+    g->prefill_host_tokens = (const int32_t *)tokens;
+    g->prefill_host_pos0 = pos0;
+    g->prefill_host_count = n_tokens;
+    g->prefill_has_visual = false;
+    if (g->deepseek4_vision_weights) {
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            if (tokens[i] >= (int)DS4_N_VOCAB) {
+                g->prefill_has_visual = true;
+                break;
+            }
+        }
+    }
+
     bool ok = true;
+    bool missing_image_embedding = false;
     if (g->ssd_streaming && !input_hc) {
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(&e->model, &e->weights);
@@ -76246,6 +76303,15 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (ok) ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), &span, 0, n_tokens);
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(metal_graph_batch_cur_hc(g), 0, input_hc, hc_bytes) != 0;
+    } else if (ok && g->prefill_has_visual) {
+        ok = metal_graph_upload_visual_token_embeddings_hc(g,
+                                                           metal_graph_batch_cur_hc(g),
+                                                           &e->model,
+                                                           &e->weights,
+                                                           tokens,
+                                                           pos0,
+                                                           n_tokens);
+        missing_image_embedding = !ok;
     } else if (ok) {
         ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                      metal_graph_prefill_tokens(g),
@@ -76324,12 +76390,19 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (ok && output_logits) {
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    g->prefill_host_tokens = NULL;
+    g->prefill_host_count = 0;
+    g->prefill_has_visual = false;
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: synchronize after layer-slice failure also failed\n");
         }
-        if (errlen) snprintf(err, errlen, "%s layer-slice failed",
-                             ds4_backend_name(e->backend));
+        if (errlen && missing_image_embedding) {
+            snprintf(err, errlen, "layer-slice image rows at pos %u have no vision embedding", pos0);
+        } else if (errlen) {
+            snprintf(err, errlen, "%s layer-slice failed",
+                     ds4_backend_name(e->backend));
+        }
         s->checkpoint_valid = false;
         return 1;
     }
