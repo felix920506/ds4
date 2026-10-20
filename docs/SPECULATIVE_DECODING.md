@@ -30,6 +30,8 @@ For the 0731 Q2 model:
 
 For Vision Experimental, substitute its matching main model and support file.
 Do not mix the two checkpoints. DSpark is not supported for PRO.
+For pipeline mode across machines, see
+[distributed inference](DISTRIBUTED.md#pipeline-parallelism).
 The same flags work in `ds4-agent` and non-batched `ds4-server` requests.
 
 The support file adds about 5.6 GiB of weights plus runtime state. The main

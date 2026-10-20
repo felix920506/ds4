@@ -8502,6 +8502,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
         uint32_t layer_start,
         uint32_t layer_end,
         bool include_output,
+        bool include_token,
         ds4_model_map_span_vec *spans) {
     if (!w || !spans) return false;
     if (layer_start >= DS4_N_LAYER) return false;
@@ -8509,7 +8510,9 @@ static DS4_MAYBE_UNUSED bool weights_model_map_spans(
     if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
 
     memset(spans, 0, sizeof(*spans));
-    if (layer_start == 0) model_map_span_vec_include_one(spans, w->token_embd);
+    if (layer_start == 0 || include_token) {
+        model_map_span_vec_include_one(spans, w->token_embd);
+    }
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         model_map_span_vec_include_layer(spans, &w->layer[il]);
     }
@@ -21224,7 +21227,7 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
     ds4_model_map_span_vec spans;
     const bool spans_ok = decode_only ?
         weights_model_map_decode_layer_spans(weights, il, &spans) :
-        weights_model_map_spans(weights, il, il, false, &spans);
+        weights_model_map_spans(weights, il, il, false, false, &spans);
     if (!spans_ok) return false;
     metal_graph_stream_pagein_range *ranges =
         xmalloc((size_t)spans.len * n_threads * sizeof(ranges[0]));
@@ -21489,7 +21492,7 @@ static void metal_graph_stream_readahead_layer(
         const ds4_weights *weights,
         uint32_t           il) {
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_spans(weights, il, il, false, &spans)) return;
+    if (!weights_model_map_spans(weights, il, il, false, false, &spans)) return;
     metal_graph_stream_readahead_spans(model, &spans);
     free(spans.v);
 }
@@ -21735,7 +21738,7 @@ static bool metal_graph_stream_map_layer(
         const ds4_weights *weights,
         uint32_t           il) {
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_spans(weights, il, il, false, &spans)) {
+    if (!weights_model_map_spans(weights, il, il, false, false, &spans)) {
         fprintf(stderr, "ds4: Metal SSD streaming could not build layer %u spans\n", il);
         return false;
     }
@@ -39493,6 +39496,121 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, flo
                                  row_bytes) != 0;
 }
 
+/* Verify a DSpark block on one pipeline stage.
+ *
+ * The full-model verifier above runs every layer from token embeddings to the
+ * output head.  A pipeline stage runs only its layer range: the first stage
+ * starts from embeddings and returns the block's hidden rows, later stages
+ * start from the rows they receive.  The final stage also runs the output head
+ * and returns each row's argmax.  Every stage captures the compressor prefixes,
+ * so all of them can commit the accepted length without replaying tokens. */
+static bool metal_graph_verify_slice(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *tokens,
+        uint32_t           start,
+        uint32_t           n_tokens,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        const float       *input_hc,
+        float             *output_hc,
+        int               *row_tops) {
+    const bool final_stage = row_tops != NULL;
+    if (n_tokens < 2u || n_tokens > g->prefill_cap) return false;
+    if (final_stage && (!g->spec_logits || !weights->output)) return false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = (uint64_t)n_tokens * hc_dim * sizeof(float);
+    ds4_tokens span = {
+        .v = (int *)tokens,
+        .len = (int)n_tokens,
+        .cap = (int)n_tokens,
+    };
+    bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g),
+                                               &span, 0, n_tokens);
+    if (ok && input_hc) {
+        ok = ds4_gpu_tensor_write(metal_graph_batch_cur_hc(g), 0,
+                                  input_hc, hc_bytes) != 0;
+    } else if (ok) {
+        ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
+                                                     metal_graph_prefill_tokens(g),
+                                                     model,
+                                                     weights,
+                                                     &span,
+                                                     0,
+                                                     n_tokens);
+    }
+    if (!ok) return false;
+
+    const bool saved_capture = g->spec_capture_prefixes;
+    g->spec_capture_prefixes = true;
+#ifdef DS4_ROCM_BUILD
+    const char *verify_fast_env = getenv("DS4_ROCM_DSPARK_VERIFY_FAST");
+    const bool rocm_dspark_fast =
+        n_tokens <= 6u &&
+        (verify_fast_env && verify_fast_env[0] ?
+             verify_fast_env[0] != '0' :
+             ds4_dspark_rocm_gfx1151_fast_path());
+    if (rocm_dspark_fast) ds4_gpu_set_dspark_verify_mode(true);
+#endif
+    ok = ds4_gpu_begin_commands() != 0;
+    const bool capture_active =
+        ok && final_stage && g->dspark_capture_enabled &&
+        metal_graph_dspark_capture_verified_suffix_begin(g, start, n_tokens, true);
+    for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
+        ok = metal_graph_encode_layer_batch(g,
+                                            model,
+                                            &weights->layer[il],
+                                            il,
+                                            start,
+                                            n_tokens);
+        if (ok && capture_active) {
+            ok = metal_graph_dspark_capture_verified_suffix_layer(g,
+                                                                  il,
+                                                                  start,
+                                                                  n_tokens);
+        }
+    }
+    const uint32_t top_rows = n_tokens - 1u;
+    if (ok && final_stage) {
+        ok = metal_graph_encode_output_head_batch(g,
+                                                  model,
+                                                  weights,
+                                                  n_tokens,
+                                                  0,
+                                                  weights->output->dim[1]);
+        if (ok && top_rows == 1u) {
+            ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
+                                       g->spec_logits,
+                                       DS4_N_VOCAB) != 0;
+        } else if (ok) {
+            ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
+                                             g->spec_logits,
+                                             DS4_N_VOCAB,
+                                             top_rows,
+                                             1) != 0;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+#ifdef DS4_ROCM_BUILD
+    if (rocm_dspark_fast) ds4_gpu_set_dspark_verify_mode(false);
+#endif
+    g->spec_capture_prefixes = saved_capture;
+    if (!ok && capture_active) metal_graph_dspark_capture_invalidate(g);
+    if (ok && final_stage) {
+        ok = ds4_gpu_tensor_read(metal_graph_comp_selected(g),
+                                 0,
+                                 row_tops,
+                                 (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
+    }
+    if (ok && output_hc) {
+        ok = ds4_gpu_tensor_read(metal_graph_batch_cur_hc(g), 0,
+                                 output_hc, hc_bytes) != 0;
+    }
+    return ok;
+}
+
 /* Exact N=2 target verifier for MTP.
  *
  * The generic batch prefill path is fast, but it is not a safe substitute for
@@ -46309,7 +46427,7 @@ static uint64_t glm_graph_streaming_active_model_bytes(
         free(spans.v);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (!weights_model_map_spans(weights, il, il, false, &spans)) {
+        if (!weights_model_map_spans(weights, il, il, false, false, &spans)) {
             continue;
         }
         const uint64_t bytes = model_map_span_vec_total_bytes(&spans);
@@ -46457,6 +46575,7 @@ static uint64_t glm_graph_model_bytes_for_guard(
                                          layer_start,
                                          layer_end,
                                          include_output,
+                                         include_token,
                                          &spans);
         }
         if (ok) {
@@ -61231,6 +61350,13 @@ struct ds4_session {
     int dspark_rewind_start;
     int dspark_rewind_end;
     uint32_t dspark_rewind_prefixes;
+    /* A DSpark block verified on this pipeline stage, waiting for the
+     * accepted length that the final stage decides. */
+    ds4_spec_frontier dist_spec_frontier;
+    bool dist_spec_pending;
+    uint32_t dist_spec_start;
+    uint32_t dist_spec_n;
+    int dist_spec_tokens[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -63201,6 +63327,17 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
            e->mtp_ready;
 }
 
+bool ds4_engine_dspark_drafts(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    return e && e->backend != DS4_BACKEND_CPU &&
+           e->support_kind == DS4_SUPPORT_DSPARK &&
+           e->dspark && !e->quality && !e->dspark_strict;
+#else
+    (void)e;
+    return false;
+#endif
+}
+
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
     return e && e->dspark_exact_sampling;
 }
@@ -63214,6 +63351,15 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
+    /* The pipeline's final stage drafts; the coordinator only needs to know
+     * that speculative cycles are wanted. */
+    if (e &&
+        e->backend != DS4_BACKEND_CPU &&
+        e->distributed.role == DS4_DISTRIBUTED_COORDINATOR &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+        e->dspark && !e->quality && !e->dspark_strict) {
+        return ds4_session_dspark_stage_max_block();
+    }
     if (e &&
         e->backend != DS4_BACKEND_CPU &&
         e->distributed.role == DS4_DISTRIBUTED_NONE &&
@@ -63271,6 +63417,8 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
         f->n_index_comp[il] = g->layer_n_index_comp[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        /* A pipeline stage holds state only for its own layers. */
+        if (!g->layer_attn_state_kv[il]) continue;
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         spans[n++] = (ds4_gpu_copy_span){g->spec_attn_state_kv[il], 0,
                                          g->layer_attn_state_kv[il], 0, ab};
@@ -63315,6 +63463,8 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
         g->layer_n_index_comp[il] = f->n_index_comp[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        /* A pipeline stage holds state only for its own layers. */
+        if (!g->layer_attn_state_kv[il]) continue;
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         spans[n++] = (ds4_gpu_copy_span){g->layer_attn_state_kv[il], 0,
                                          g->spec_attn_state_kv[il], 0, ab};
@@ -63350,6 +63500,8 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        /* A pipeline stage holds state only for its own layers. */
+        if (!g->layer_attn_state_kv[il]) continue;
 
         g->layer_n_comp[il] = g->spec_prefix_n_comp[slot][il];
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
@@ -71810,7 +71962,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (opt->dspark && (!opt->mtp_path || !opt->mtp_path[0])) {
+    /* A pipeline coordinator only orchestrates DSpark; the final stage loads
+     * the support model. */
+    if (opt->dspark && (!opt->mtp_path || !opt->mtp_path[0]) &&
+        opt->distributed.role != DS4_DISTRIBUTED_COORDINATOR) {
         fprintf(stderr, "ds4: --dspark requires --mtp-model FILE\n");
         free(e);
         *out = NULL;
@@ -72409,8 +72564,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
+    /* A pipeline worker that owns the DSpark target layers and the output
+     * head drafts for the whole route; other stages never need the file. */
+    const bool dist_dspark_stage =
+        opt->distributed.role == DS4_DISTRIBUTED_WORKER && opt->dspark;
     if (opt->mtp_path && opt->mtp_path[0] &&
-        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        (opt->distributed.role == DS4_DISTRIBUTED_NONE || dist_dspark_stage)) {
         if (e->ssd_streaming && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
             ds4_engine_close(e);
@@ -72451,6 +72610,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
+            }
+            if (dist_dspark_stage) {
+                bool stage_ok = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+                                !e->dspark_weights.v41 &&
+                                load_output &&
+                                weights_have_output_head(&e->weights) &&
+                                e->weights.token_embd &&
+                                e->dspark_weights.target_layer_count != 0;
+                for (uint32_t i = 0;
+                     stage_ok && i < e->dspark_weights.target_layer_count;
+                     i++) {
+                    const uint32_t il = e->dspark_weights.target_layers[i];
+                    stage_ok = il >= load_layer_start && il <= load_layer_end;
+                }
+                if (!stage_ok) {
+                    fprintf(stderr,
+                            "ds4: --dspark on a pipeline worker needs DeepSeek V4 Flash on the "
+                            "final stage: it must own the output head and every DSpark target layer\n");
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
             }
             fprintf(stderr,
                     "ds4: DSpark support model detected: %s "
@@ -72873,11 +73054,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 snprintf(load_end, sizeof(load_end), "%u", load_layer_end);
             }
 
+            /* A pipeline stage that drafts with DSpark embeds the seed and
+             * noise tokens itself, so it needs the token table too. */
+            const bool map_token = e->support_kind == DS4_SUPPORT_DSPARK &&
+                                   e->dspark && e->weights.token_embd;
             ds4_model_map_span_vec spans;
             if (!weights_model_map_spans(&e->weights,
                                          load_layer_start,
                                          load_layer_end,
                                          map_output,
+                                         map_token,
                                          &spans))
             {
                 fprintf(stderr, "ds4: invalid model load layer slice %u:%s\n",
@@ -74606,6 +74792,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     const bool need_spec_verifier =
         e->mtp_ready ||
         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) ||
+        /* A pipeline coordinator verifies DSpark blocks on its own slice
+         * while the final stage drafts them. */
+        (e->dspark && e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) ||
         e->tp.active; /* TP worker mirrors the leader's verify blocks */
     const int *placement = e->multi_tier ? e->placement : NULL;
     const ds4_gpu_graph *shared_prefill_workspace =
@@ -76223,6 +76412,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 if (ok) ok = ds4_gpu_end_commands() != 0;
             }
         } else {
+            /* The stage that owns the DSpark target layers keeps their
+             * features so it can draft the next block. */
+            metal_graph_dspark_capture_begin(g);
             for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
                 ok = metal_graph_encode_decode_layer(g,
                                                      &e->model,
@@ -76237,6 +76429,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                 ds4_gpu_tensor *tmp = metal_graph_cur_hc(g);
                 g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
                 g->after_ffn_hc_by_tier[g->active_tier] = tmp;
+                if (ok && g->hc_expand_pending &&
+                    metal_graph_dspark_target_slot(g, il) >= 0) {
+                    ok = metal_graph_flush_hc_expand(g);
+                }
+                if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
                 encoded_layers++;
                 if (ok &&
                     split_after_layers != 0 &&
@@ -76354,6 +76551,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
     } else {
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+        metal_graph_dspark_capture_begin_prefill(g);
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             ok = metal_graph_encode_layer_batch(g,
                                                 &e->model,
@@ -76361,6 +76559,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                 il,
                                                 pos0,
                                                 n_tokens);
+            if (ok) ok = metal_graph_dspark_capture_prefill_layer(g,
+                                                                  il,
+                                                                  pos0,
+                                                                  n_tokens);
         }
     }
     if (ok && output_logits) {
@@ -86357,6 +86559,333 @@ fail:
 }
 #endif
 
+/* =========================================================================
+ * DSpark Across Pipeline Stages
+ * =========================================================================
+ *
+ * In pipeline mode the final stage owns the DSpark target layers and the
+ * output head, so it drafts; every stage verifies the block on its own layers.
+ * A cycle is:
+ *
+ *   1. the coordinator sends the seed token to the final stage, which drafts;
+ *   2. each stage snapshots its frontier and verifies [seed, drafts...] on its
+ *      slice, the final stage ending with the row argmaxes;
+ *   3. the final stage picks the accepted length and commits it, and every
+ *      other stage commits the same length from its captured prefixes.
+ *
+ * Only token ids and the accepted row's logits cross the network beyond the
+ * usual hidden rows, so the cycle costs about one decode round trip. */
+
+int ds4_session_dspark_stage_draft(ds4_session *s, int seed,
+                                   int *drafts, int cap,
+                                   char *err, size_t errlen) {
+    if (!s || !drafts || cap <= 0) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark stage draft request");
+        return -1;
+    }
+#ifdef DS4_NO_GPU
+    (void)seed;
+    return 0;
+#else
+    ds4_engine *e = s->engine;
+    if (!e || e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark ||
+        e->quality || e->dspark_strict || ds4_session_is_cpu(s) ||
+        !s->checkpoint_valid || s->dist_spec_pending ||
+        seed < 0 || seed >= (int)DS4_N_VOCAB) {
+        return 0;
+    }
+    const bool stats_enabled = ds4_dspark_stats_enabled();
+    if (stats_enabled) s->dspark_stats.cycles++;
+    s->dspark_draft_valid = false;
+    s->dspark_draft_len = 0;
+    int n = 0;
+    if (ds4_session_prepare_dspark_draft(s, seed, (uint32_t)s->checkpoint.len) &&
+        s->dspark_draft_valid) {
+        n = (int)s->dspark_draft_len;
+        if (n > cap) n = cap;
+        for (int i = 0; i < n; i++) drafts[i] = s->dspark_draft_tokens[i];
+    }
+    if (n == 0) {
+        /* Mirrors the local seed-batch path: a declined proposal still
+         * counts toward the scheduler's back-off. */
+        ds4_session_dspark_scheduler_note(s, 0, true, s->dspark_last_propose_ms);
+        if (stats_enabled) {
+            s->dspark_stats.no_draft++;
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+        }
+    } else if (stats_enabled) {
+        s->dspark_stats.proposed_tokens += (uint64_t)n;
+        ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, (uint32_t)n);
+    }
+    s->dspark_draft_valid = false;
+    s->dspark_draft_len = 0;
+    return n;
+#endif
+}
+
+int ds4_session_dspark_stage_max_block(void) {
+#ifdef DS4_NO_GPU
+    return 0;
+#else
+    /* Seed plus drafts: every partial accept up to the prefix slots commits
+     * directly, and one more row commits after a single-token replay. */
+    const int max_block = (int)DS4_SPEC_PREFIX_SLOTS + 2;
+    return max_block < (int)DS4_DSPARK_MAX_BLOCK_SIZE + 1 ?
+        max_block : (int)DS4_DSPARK_MAX_BLOCK_SIZE + 1;
+#endif
+}
+
+int ds4_session_dspark_stage_verify(ds4_session *s,
+                                    const int *tokens,
+                                    uint32_t n_tokens,
+                                    uint32_t pos0,
+                                    uint32_t layer_start,
+                                    uint32_t layer_end,
+                                    const float *input_hc,
+                                    float *output_hc,
+                                    int *row_tops,
+                                    char *err,
+                                    size_t errlen) {
+    if (!s || !s->engine || !tokens || n_tokens < 2u ||
+        n_tokens > (uint32_t)ds4_session_dspark_stage_max_block()) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark stage verify block");
+        return 1;
+    }
+#ifdef DS4_NO_GPU
+    (void)pos0; (void)layer_start; (void)layer_end; (void)input_hc;
+    (void)output_hc; (void)row_tops;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return 1;
+#else
+    ds4_engine *e = s->engine;
+    ds4_gpu_graph *g = &s->graph;
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_qwen4(s) ||
+        g->ssd_streaming) {
+        if (errlen) snprintf(err, errlen, "DSpark stage verify needs the DeepSeek graph backend");
+        return 1;
+    }
+    if (s->dist_spec_pending) {
+        if (errlen) snprintf(err, errlen, "DSpark stage verify is already pending");
+        return 1;
+    }
+    if (!s->checkpoint_valid || pos0 == 0 ||
+        ds4_session_slice_check_timeline(s, tokens, n_tokens, pos0, err, errlen) != 0) {
+        if (errlen && (!s->checkpoint_valid || pos0 == 0)) {
+            snprintf(err, errlen, "DSpark stage verify needs a decoded prefix");
+        }
+        return 1;
+    }
+    if (layer_start > layer_end ||
+        layer_end >= ds4_model_normal_layer_count() ||
+        !weights_layers_bound(&e->weights, layer_start, layer_end) ||
+        (layer_start != 0 && !input_hc) ||
+        (!input_hc && !e->weights.token_embd) ||
+        (row_tops && (layer_end + 1u != (uint32_t)DS4_N_LAYER ||
+                      !weights_have_output_head(&e->weights)))) {
+        if (errlen) snprintf(err, errlen, "DSpark stage verify layer range %u:%u is not runnable here",
+                             layer_start, layer_end);
+        return 1;
+    }
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        if (ds4_layer_compress_ratio(il) == 0 || !g->layer_attn_state_kv[il]) continue;
+        if (!g->spec_attn_state_kv[il] || !g->spec_prefix1_attn_state_kv[il]) {
+            if (errlen) snprintf(err, errlen, "DSpark stage verify buffers are not allocated; pass --dspark");
+            return 1;
+        }
+    }
+    if (!spec_frontier_snapshot(&s->dist_spec_frontier, s)) {
+        if (errlen) snprintf(err, errlen, "DSpark stage frontier snapshot failed");
+        return 1;
+    }
+    const bool ok = metal_graph_verify_slice(g,
+                                             &e->model,
+                                             &e->weights,
+                                             tokens,
+                                             pos0,
+                                             n_tokens,
+                                             layer_start,
+                                             layer_end,
+                                             input_hc,
+                                             output_hc,
+                                             row_tops);
+    if (!ok) {
+        ds4_session_dspark_capture_invalidate(s);
+        const bool restored = spec_frontier_restore(&s->dist_spec_frontier, s);
+        spec_frontier_free(&s->dist_spec_frontier);
+        if (!restored) s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "%s DSpark stage verify failed",
+                             ds4_backend_name(e->backend));
+        return 1;
+    }
+    s->dist_spec_pending = true;
+    s->dist_spec_start = pos0;
+    s->dist_spec_n = n_tokens;
+    memcpy(s->dist_spec_tokens, tokens, (size_t)n_tokens * sizeof(tokens[0]));
+    return 0;
+#endif
+}
+
+int ds4_session_dspark_stage_commit(ds4_session *s,
+                                    uint32_t accepted,
+                                    float *logits,
+                                    char *err,
+                                    size_t errlen) {
+    if (!s || !s->engine) {
+        if (errlen) snprintf(err, errlen, "invalid DSpark stage commit");
+        return -1;
+    }
+#ifdef DS4_NO_GPU
+    (void)accepted; (void)logits;
+    if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
+    return -1;
+#else
+    if (!s->dist_spec_pending) {
+        if (errlen) snprintf(err, errlen, "no DSpark stage verify is pending");
+        return -1;
+    }
+    ds4_gpu_graph *g = &s->graph;
+    const uint32_t start = s->dist_spec_start;
+    const uint32_t n = s->dist_spec_n;
+    s->dist_spec_pending = false;
+    if (accepted > n) {
+        ds4_session_dspark_capture_invalidate(s);
+        if (!spec_frontier_restore(&s->dist_spec_frontier, s)) s->checkpoint_valid = false;
+        spec_frontier_free(&s->dist_spec_frontier);
+        if (errlen) snprintf(err, errlen, "DSpark stage commit of %u exceeds block %u",
+                             accepted, n);
+        return -1;
+    }
+
+    uint32_t applied = accepted;
+    if (applied < n && applied > DS4_SPEC_PREFIX_SLOTS) applied = DS4_SPEC_PREFIX_SLOTS;
+    bool ok = true;
+    if (applied == 0) {
+        ds4_session_dspark_capture_invalidate(s);
+        ok = spec_frontier_restore(&s->dist_spec_frontier, s);
+    } else if (applied < n) {
+        /* Rows past the accepted prefix stay in the append-only caches as
+         * invisible garbage; only compressor frontiers rewind. */
+        const bool preserve_capture = g->dspark_capture_enabled &&
+                                      ds4_session_dspark_seed_batch_enabled(s);
+        if (!preserve_capture) ds4_session_dspark_capture_invalidate(s);
+        ok = spec_frontier_commit_prefix(s, applied);
+        if (ok && preserve_capture &&
+            !metal_graph_dspark_capture_commit_prefix(g, applied)) {
+            ds4_session_dspark_capture_invalidate(s);
+        }
+    }
+    spec_frontier_free(&s->dist_spec_frontier);
+    if (!ok) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "DSpark stage commit failed");
+        return -1;
+    }
+    if (logits && applied != 0 && applied == accepted &&
+        !metal_graph_read_spec_logits_row(g, applied - 1u, logits)) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "DSpark stage logits read failed");
+        return -1;
+    }
+    s->checkpoint.len = (int)start;
+    ds4_session_slice_commit_timeline(s, s->dist_spec_tokens, applied);
+    if (applied == 0) s->checkpoint_valid = true;
+
+    if (s->engine->support_kind == DS4_SUPPORT_DSPARK && accepted != 0) {
+        /* The seed was the target's own token; only drafts count. */
+        const uint32_t drafts_accepted = accepted - 1u;
+        ds4_session_dspark_scheduler_note(s, drafts_accepted, false,
+                                          s->dspark_last_propose_ms);
+        if (ds4_dspark_stats_enabled()) {
+            s->dspark_stats.first_tokens++;
+            s->dspark_stats.accepted_draft_tokens += drafts_accepted;
+            if (accepted == n) s->dspark_stats.full_accepts++;
+            else s->dspark_stats.partial_accepts++;
+            if (applied == accepted) {
+                if (accepted == n) s->dspark_stats.direct_full_commits++;
+                else s->dspark_stats.direct_partial_commits++;
+            } else {
+                s->dspark_stats.replay_fallbacks++;
+            }
+            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
+                                      drafts_accepted);
+        }
+    }
+    return (int)applied;
+#endif
+}
+
+/* Coordinator half of a pipeline DSpark cycle.  Returns the number of tokens
+ * committed, 0 when this cycle should fall back to one ordinary decode, or -1
+ * on an error that leaves the session unusable. */
+static int ds4_session_dist_dspark_cycle(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        bool ignore_eos, ds4_think_mode think_mode,
+        int *accepted, int accepted_cap,
+        char *err, size_t errlen) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
+    (void)ignore_eos; (void)think_mode; (void)accepted; (void)accepted_cap;
+    (void)err; (void)errlen;
+    return 0;
+#else
+    ds4_engine *e = s->engine;
+    if (!e || !e->dspark || e->quality || e->dspark_strict ||
+        e->distributed.role != DS4_DISTRIBUTED_COORDINATOR ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 ||
+        first_token == eos_token || max_tokens < 2 || accepted_cap < 2) {
+        return 0;
+    }
+    if (ignore_eos && ds4_token_is_stop_for_think_mode(e, first_token, think_mode)) {
+        return 0;
+    }
+    int limit = ds4_session_dspark_stage_max_block();
+    if (limit > max_tokens) limit = max_tokens;
+    if (limit > accepted_cap) limit = accepted_cap;
+    const int room = s->ctx_size - s->checkpoint.len;
+    if (limit > room) limit = room;
+    if (limit < 2) return 0;
+
+    const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
+    int block[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
+    block[0] = first_token;
+    int n_draft = 0;
+    char draft_err[256] = {0};
+    if (ds4_dist_session_dspark_draft(s->distributed, s, first_token,
+                                      block + 1, limit - 1, &n_draft,
+                                      draft_err, sizeof(draft_err)) != 0) {
+        if (spec_log) fprintf(stderr, "ds4: DSpark pipeline draft failed: %s\n", draft_err);
+        return 0;
+    }
+    int n = 1;
+    for (int i = 0; i < n_draft; i++) {
+        const int t = block[1 + i];
+        if (t < 0 || t >= (int)DS4_N_VOCAB) break;
+        if (ignore_eos && ds4_token_is_stop_for_think_mode(e, t, think_mode)) break;
+        n++;
+        /* Keep the verified frontier at the returned tokens. */
+        if (!ignore_eos && t == eos_token) break;
+    }
+    if (n < 2) return 0;
+
+    uint32_t committed = 0;
+    const int rc = ds4_dist_session_dspark_verify(s->distributed, s, block,
+                                                  (uint32_t)n, &committed,
+                                                  s->logits, err, errlen);
+    if (rc < 0) return -1;
+    if (rc > 0) {
+        if (spec_log) fprintf(stderr, "ds4: DSpark pipeline verify fell back: %s\n", err);
+        if (errlen) err[0] = '\0';
+        return 0;
+    }
+    for (uint32_t i = 0; i < committed; i++) accepted[i] = block[i];
+    if (spec_log) {
+        fprintf(stderr, "ds4: DSpark pipeline cycle drafted=%d accepted=%u pos=%d\n",
+                n - 1, committed - 1u, s->checkpoint.len);
+    }
+    return (int)committed;
+#endif
+}
+
 static int ds4_session_eval_speculative_argmax_impl(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         bool ignore_eos, ds4_think_mode think_mode,
@@ -86375,6 +86904,10 @@ static int ds4_session_eval_speculative_argmax_impl(
 #endif
     if (s->distributed) {
         if (!accepted) return 0;
+        const int spec_n = ds4_session_dist_dspark_cycle(
+            s, first_token, max_tokens, eos_token, ignore_eos, think_mode,
+            accepted, accepted_cap, err, errlen);
+        if (spec_n != 0) return spec_n;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
@@ -87255,6 +87788,15 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         return ds41_session_speculate(s, first_token, accepted_cap, eos_token, false,
             DS4_THINK_HIGH, temperature, top_k, top_p, min_p, rng, accepted, err, errlen);
 #endif
+    if (s->distributed && s->engine->dspark && !s->engine->quality &&
+        !s->engine->dspark_strict && !s->engine->dspark_exact_sampling) {
+        /* Opportunistic DSpark, as on one machine: first_token was sampled
+         * at the requested temperature and drafts commit while they match
+         * the target's greedy path. */
+        return ds4_session_eval_speculative_argmax(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
+    }
     if (s->distributed || ds4_session_is_cpu(s)) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
@@ -87395,6 +87937,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
+    s->dist_spec_pending = false;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
 #endif

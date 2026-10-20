@@ -667,6 +667,33 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          char *err,
                                          size_t errlen);
 
+/* DSpark across pipeline stages.  The final stage drafts with
+ * ds4_session_dspark_stage_draft(); every stage verifies the seed-plus-drafts
+ * block on its layer slice and then commits the accepted length, which may be
+ * one token short of the request after the prefix slots run out (the caller
+ * then decodes that token normally).  Only the final stage passes row_tops. */
+bool ds4_engine_dspark_drafts(ds4_engine *e);
+int ds4_session_dspark_stage_max_block(void);
+int ds4_session_dspark_stage_draft(ds4_session *s, int seed,
+                                   int *drafts, int cap,
+                                   char *err, size_t errlen);
+int ds4_session_dspark_stage_verify(ds4_session *s,
+                                    const int *tokens,
+                                    uint32_t n_tokens,
+                                    uint32_t pos0,
+                                    uint32_t layer_start,
+                                    uint32_t layer_end,
+                                    const float *input_hc,
+                                    float *output_hc,
+                                    int *row_tops,
+                                    char *err,
+                                    size_t errlen);
+int ds4_session_dspark_stage_commit(ds4_session *s,
+                                    uint32_t accepted,
+                                    float *logits,
+                                    char *err,
+                                    size_t errlen);
+
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */

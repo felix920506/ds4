@@ -175,6 +175,16 @@ each stage applies the encoder's visual router bias for its own layers. A
 worker without the encoder rejects image prompts. Prefill chunks never split
 an image block, so an image must fit within one chunk.
 
+DSpark speculative decoding also works in pipeline mode when a single remote
+worker owns the output head and every DSpark target layer, as `20:output` or
+`21:output` does for Flash. Give that worker `--dspark --mtp-model FILE` with
+any `--dspark-confidence`, and give the coordinator `--dspark`; the coordinator
+does not load the support file. The final worker drafts from its own layers,
+every stage verifies the seed-plus-drafts block on its slice, and each commits
+the accepted length, so a cycle costs about one decode round trip. Routes with
+more than one remote stage decode without DSpark. As on one machine,
+session-batched serving uses ordinary decoding.
+
 Long prefill chunks can occupy different stages simultaneously. A single
 generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and

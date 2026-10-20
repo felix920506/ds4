@@ -64,12 +64,20 @@
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
 #define DS4_DIST_WORK_F_RESET_SESSION 0x00000004u
 #define DS4_DIST_WORK_F_ACK_ONLY 0x00000008u
+/* DSpark over a pipeline: the final stage drafts from a seed token, then every
+ * stage verifies the seed-plus-drafts block and commits the accepted length. */
+#define DS4_DIST_WORK_F_DSPARK_DRAFT 0x00000010u
+#define DS4_DIST_WORK_F_DSPARK_VERIFY 0x00000020u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
-     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY)
+     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
+     DS4_DIST_WORK_F_DSPARK_DRAFT | DS4_DIST_WORK_F_DSPARK_VERIFY)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
+#define DS4_DIST_RESULT_DSPARK_DRAFT 3u
+#define DS4_DIST_RESULT_DSPARK_VERIFY 4u
+#define DS4_DIST_DSPARK_MAX_DRAFTS 16u
 #define DS4_DIST_ACTIVATION_BITS_DEFAULT 32u
 #define DS4_DIST_ROUTE_F_OUTPUT_LOGITS 0x00000001u
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
@@ -418,6 +426,9 @@ struct ds4_dist_session {
     uint64_t session_id;
     uint64_t request_id;
     uint64_t snapshot_request_id;
+    /* Set once the route shows it cannot draft, so later cycles skip the
+     * round trip. */
+    bool dspark_unavailable;
 };
 
 typedef struct {
@@ -2603,6 +2614,7 @@ static int dist_coordinator_send_remote_work_on_fd(
         uint64_t result_hash,
         bool reset_session,
         bool ack_only,
+        uint32_t extra_flags,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         char *err,
@@ -2624,7 +2636,12 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.n_tokens = n_tokens;
     work.layer_start = first->layer_start;
     work.layer_end = first->layer_end;
-    work.flags = DS4_DIST_WORK_F_INPUT_HC;
+    work.flags = extra_flags;
+    /* A draft request carries only the seed token: the final stage drafts
+     * from its own captured features. */
+    if ((extra_flags & DS4_DIST_WORK_F_DSPARK_DRAFT) == 0) {
+        work.flags |= DS4_DIST_WORK_F_INPUT_HC;
+    }
     if (reset_session) work.flags |= DS4_DIST_WORK_F_RESET_SESSION;
     if (ack_only) work.flags |= DS4_DIST_WORK_F_ACK_ONLY;
     if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
@@ -2765,6 +2782,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      expected_result_hash,
                                                      reset_session,
                                                      false,
+                                                     0,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
                                                      err,
@@ -3350,6 +3368,7 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->result_hash,
                                                          slot->reset_session,
                                                          slot->ack_only,
+                                                         0,
                                                          slot->hidden,
                                                          slot->hidden_bytes,
                                                          send_err,
@@ -6010,7 +6029,7 @@ static int dist_batch_submit_member(
     if (dist_coordinator_send_remote_work_on_fd(
             state, &d->plan, d->plan.entry[0].fd, &item->token, 1, pos0,
             d->session_id, member->request_id, prefix_hash, member->result_hash,
-            false, false, hidden, hidden_bytes, err, errlen) != 0) {
+            false, false, 0, hidden, hidden_bytes, err, errlen) != 0) {
         return 1;
     }
     member->submitted = true;
@@ -6212,6 +6231,256 @@ int ds4_dist_session_eval(
         rc = 0;
     }
     return rc;
+}
+
+/* =========================================================================
+ * DSpark Over The Pipeline
+ * ========================================================================= */
+
+/* The final stage owns the DSpark target layers and the output head, so the
+ * coordinator talks to it directly: the route must be one remote stage. */
+static bool dist_session_dspark_route_ok(ds4_dist_session *d) {
+    return d->plan.count == 1 &&
+           d->plan.entry[0].fd >= 0 &&
+           (d->plan.entry[0].flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0;
+}
+
+static int dist_session_dspark_exchange(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        uint32_t flags,
+        const int *tokens,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint64_t prefix_hash,
+        uint64_t result_hash,
+        const float *hidden,
+        uint32_t hidden_bytes,
+        uint32_t want_kind,
+        uint64_t *got_hash,
+        void **payload,
+        uint32_t *payload_bytes,
+        char *err,
+        size_t errlen) {
+    ds4_dist_coordinator_state *state = &d->coord->state;
+    (void)owner;
+    const uint64_t request_id = d->request_id++;
+    const int fd = d->plan.entry[0].fd;
+    if (dist_coordinator_send_remote_work_on_fd(state, &d->plan, fd,
+                                                tokens, n_tokens, pos0,
+                                                d->session_id, request_id,
+                                                prefix_hash, result_hash,
+                                                false, false, flags,
+                                                hidden, hidden_bytes,
+                                                err, errlen) != 0) {
+        return DS4_DIST_RECV_TRANSPORT_ERROR;
+    }
+    uint32_t kind = 0;
+    int rc = dist_recv_result_alloc(fd, state, request_id, &kind, got_hash,
+                                    payload, payload_bytes, err, errlen);
+    if (rc != 0) return rc == DS4_DIST_RECV_REMOTE_ERROR ? rc : DS4_DIST_RECV_TRANSPORT_ERROR;
+    if (kind != want_kind) {
+        free(*payload);
+        *payload = NULL;
+        if (errlen) snprintf(err, errlen, "distributed worker returned the wrong DSpark result");
+        return DS4_DIST_RECV_TRANSPORT_ERROR;
+    }
+    return 0;
+}
+
+int ds4_dist_session_dspark_draft(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        int seed,
+        int *drafts,
+        int cap,
+        int *n_drafts,
+        char *err,
+        size_t errlen) {
+    if (n_drafts) *n_drafts = 0;
+    if (!d || !owner || !drafts || cap <= 0 || !n_drafts) {
+        if (errlen) snprintf(err, errlen, "invalid distributed DSpark draft request");
+        return 1;
+    }
+    if (d->dspark_unavailable) return 0;
+    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (!dist_session_dspark_route_ok(d)) {
+        fprintf(stderr,
+                "ds4: distributed DSpark needs exactly one remote stage that owns the "
+                "output head; decoding without it\n");
+        d->dspark_unavailable = true;
+        return 0;
+    }
+    const ds4_tokens *checkpoint = ds4_session_tokens(owner);
+    if (!checkpoint || checkpoint->len <= 0) return 0;
+    const uint32_t pos0 = (uint32_t)checkpoint->len;
+    uint64_t prefix_hash = 0;
+    if (dist_session_token_hash_prefix(owner, pos0, &prefix_hash, err, errlen) != 0) return 1;
+
+    void *payload = NULL;
+    uint32_t payload_bytes = 0;
+    uint64_t got_hash = 0;
+    int rc = dist_session_dspark_exchange(d, owner,
+                                          DS4_DIST_WORK_F_DSPARK_DRAFT,
+                                          &seed, 1, pos0,
+                                          prefix_hash, prefix_hash,
+                                          NULL, 0,
+                                          DS4_DIST_RESULT_DSPARK_DRAFT,
+                                          &got_hash, &payload, &payload_bytes,
+                                          err, errlen);
+    if (rc != 0) {
+        /* A transport failure leaves the route suspect; the ordinary decode
+         * that follows rebuilds it. */
+        if (rc != DS4_DIST_RECV_REMOTE_ERROR) d->plan_ready = false;
+        return 1;
+    }
+    uint32_t header[2];
+    if (got_hash != prefix_hash || payload_bytes < sizeof(header)) {
+        free(payload);
+        d->plan_ready = false;
+        if (errlen) snprintf(err, errlen, "malformed distributed DSpark draft result");
+        return 1;
+    }
+    memcpy(header, payload, sizeof(header));
+    const uint32_t supported = ntohl(header[0]);
+    const uint32_t n = ntohl(header[1]);
+    if (payload_bytes != sizeof(header) + (uint64_t)n * sizeof(uint32_t) ||
+        n > DS4_DIST_DSPARK_MAX_DRAFTS) {
+        free(payload);
+        d->plan_ready = false;
+        if (errlen) snprintf(err, errlen, "malformed distributed DSpark draft result");
+        return 1;
+    }
+    if (!supported) {
+        fprintf(stderr,
+                "ds4: distributed DSpark: the final stage has no DSpark support "
+                "(start it with --dspark --mtp-model FILE); decoding without it\n");
+        d->dspark_unavailable = true;
+    }
+    const int vocab = ds4_engine_vocab_size(d->coord->state.engine);
+    int out = 0;
+    for (uint32_t i = 0; i < n && out < cap; i++) {
+        uint32_t t;
+        memcpy(&t, (const uint8_t *)payload + sizeof(header) + (size_t)i * sizeof(t), sizeof(t));
+        t = ntohl(t);
+        if (t >= (uint32_t)vocab) break;
+        drafts[out++] = (int)t;
+    }
+    free(payload);
+    *n_drafts = out;
+    return 0;
+}
+
+int ds4_dist_session_dspark_verify(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const int *block,
+        uint32_t n_tokens,
+        uint32_t *committed,
+        float *logits,
+        char *err,
+        size_t errlen) {
+    if (committed) *committed = 0;
+    if (!d || !owner || !block || n_tokens < 2u || !committed || !logits) {
+        if (errlen) snprintf(err, errlen, "invalid distributed DSpark verify request");
+        return 1;
+    }
+    ds4_dist_coordinator_state *state = &d->coord->state;
+    if (!d->plan_ready || !dist_session_dspark_route_ok(d)) return 1;
+    const ds4_tokens *checkpoint = ds4_session_tokens(owner);
+    if (!checkpoint || checkpoint->len <= 0) return 1;
+    const uint32_t pos0 = (uint32_t)checkpoint->len;
+    uint64_t prefix_hash = 0;
+    if (dist_session_token_hash_prefix(owner, pos0, &prefix_hash, err, errlen) != 0) return 1;
+    const uint64_t block_hash = dist_token_hash_update_span(prefix_hash, block, n_tokens);
+
+    const uint64_t hidden_bytes64 =
+        (uint64_t)n_tokens * ds4_engine_hidden_f32_values(state->engine) * sizeof(float);
+    float *hidden = hidden_bytes64 <= UINT32_MAX ? malloc((size_t)hidden_bytes64) : NULL;
+    if (!hidden) {
+        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark verify rows");
+        return 1;
+    }
+    if (ds4_session_dspark_stage_verify(owner, block, n_tokens, pos0,
+                                        state->local_start, state->local_end,
+                                        NULL, hidden, NULL, err, errlen) != 0) {
+        free(hidden);
+        return 1;
+    }
+
+    void *payload = NULL;
+    uint32_t payload_bytes = 0;
+    uint64_t got_hash = 0;
+    int rc = dist_session_dspark_exchange(d, owner,
+                                          DS4_DIST_WORK_F_DSPARK_VERIFY |
+                                              DS4_DIST_WORK_F_OUTPUT_LOGITS,
+                                          block, n_tokens, pos0,
+                                          prefix_hash, block_hash,
+                                          hidden, (uint32_t)hidden_bytes64,
+                                          DS4_DIST_RESULT_DSPARK_VERIFY,
+                                          &got_hash, &payload, &payload_bytes,
+                                          err, errlen);
+    free(hidden);
+    char local_err[256];
+    if (rc != 0) {
+        /* Nothing is committed here; the worker either never saw the block
+         * or rolled it back itself.  The next ordinary decode re-checks the
+         * worker's prefix hash and rebuilds the route if they diverged. */
+        (void)ds4_session_dspark_stage_commit(owner, 0, NULL, local_err, sizeof(local_err));
+        if (rc != DS4_DIST_RECV_REMOTE_ERROR) d->plan_ready = false;
+        return 1;
+    }
+
+    uint32_t header[2];
+    const uint32_t logits_bytes =
+        (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
+    uint32_t accepted = 0, applied = 0;
+    bool ok = payload_bytes >= sizeof(header);
+    if (ok) {
+        memcpy(header, payload, sizeof(header));
+        accepted = ntohl(header[0]);
+        applied = ntohl(header[1]);
+        ok = accepted >= 1u && accepted <= n_tokens &&
+             applied >= 1u && applied <= accepted &&
+             payload_bytes == sizeof(header) + (applied == accepted ? logits_bytes : 0u) &&
+             got_hash == dist_token_hash_update_span(prefix_hash, block, applied);
+    }
+    if (!ok) {
+        free(payload);
+        (void)ds4_session_dspark_stage_commit(owner, 0, NULL, local_err, sizeof(local_err));
+        d->plan_ready = false;
+        if (errlen) snprintf(err, errlen, "malformed distributed DSpark verify result");
+        return 1;
+    }
+    const int local_applied =
+        ds4_session_dspark_stage_commit(owner, accepted, NULL, err, errlen);
+    if (local_applied != (int)applied) {
+        free(payload);
+        /* The stages now disagree about the timeline.  Drop the route so the
+         * next request rebuilds every stage from the transcript. */
+        ds4_session_invalidate(owner);
+        d->plan_ready = false;
+        if (errlen && local_applied >= 0) {
+            snprintf(err, errlen, "distributed DSpark stages committed %d and %u tokens",
+                     local_applied, applied);
+        }
+        return -1;
+    }
+    if (applied == accepted) {
+        memcpy(logits, (const uint8_t *)payload + sizeof(header), logits_bytes);
+        free(payload);
+        *committed = accepted;
+        return 0;
+    }
+    free(payload);
+    /* The prefix slots ran out one token short: decode that token normally,
+     * which also brings back the logits that follow it. */
+    if (ds4_dist_session_eval(d, owner, ds4_session_tokens(owner),
+                              block[applied], logits, err, errlen) != 0) {
+        return -1;
+    }
+    *committed = applied + 1u;
+    return 0;
 }
 
 /* =========================================================================
@@ -7697,6 +7966,186 @@ static int dist_worker_handle_snapshot_load(
  * Worker Layer Execution
  * ========================================================================= */
 
+/* DSpark on the final pipeline stage.  A draft request carries the seed token
+ * and returns the proposed continuation; a verify request carries the
+ * seed-plus-drafts block with its hidden rows, and the reply names the
+ * accepted length this stage committed plus the logits that follow it. */
+static int dist_worker_process_dspark(
+        ds4_dist_worker_state *state,
+        ds4_dist_worker_upstream *upstream,
+        const ds4_dist_work_fixed *work,
+        uint64_t session_id,
+        uint64_t request_id,
+        uint64_t prefix_hash,
+        const int *tokens,
+        const void *input_hc_wire,
+        uint32_t input_hc_bits,
+        uint32_t expected_hc_bytes) {
+    char err[256] = {0};
+    const bool draft = (work->flags & DS4_DIST_WORK_F_DSPARK_DRAFT) != 0;
+    const bool verify = (work->flags & DS4_DIST_WORK_F_DSPARK_VERIFY) != 0;
+    if (draft == verify ||
+        (draft && (work->n_tokens != 1 || input_hc_wire)) ||
+        (verify && (!input_hc_wire ||
+                    work->n_tokens < 2u ||
+                    work->n_tokens > (uint32_t)ds4_session_dspark_stage_max_block()))) {
+        return dist_worker_upstream_send_work_error(upstream, request_id, "invalid DSpark WORK frame");
+    }
+    if (!state->has_output || (work->flags & DS4_DIST_WORK_F_OUTPUT_LOGITS) == 0) {
+        return dist_worker_upstream_send_work_error(upstream, request_id,
+                                                    "DSpark WORK needs the final stage");
+    }
+
+    float *input_hc = NULL;
+    bool input_hc_uses_wire = false;
+    if (verify) {
+        uint32_t decoded_bytes = 0;
+        if (dist_decode_activation_payload(input_hc_wire,
+                                           input_hc_bits,
+                                           work->input_hc_bytes,
+                                           &input_hc,
+                                           &decoded_bytes,
+                                           &input_hc_uses_wire,
+                                           err,
+                                           sizeof(err)) != 0) {
+            return dist_worker_upstream_send_work_error(upstream, request_id, err);
+        }
+        if (decoded_bytes != expected_hc_bytes) {
+            if (!input_hc_uses_wire) free(input_hc);
+            return dist_worker_upstream_send_work_error(upstream, request_id,
+                                                        "decoded input hidden-state size does not match token span");
+        }
+    }
+
+    const uint32_t vocab = (uint32_t)ds4_engine_vocab_size(state->engine);
+    const uint32_t draft_cap = DS4_DIST_DSPARK_MAX_DRAFTS;
+    const uint32_t payload_cap = draft ?
+        (2u + draft_cap) * (uint32_t)sizeof(uint32_t) :
+        2u * (uint32_t)sizeof(uint32_t) + vocab * (uint32_t)sizeof(float);
+    uint8_t *payload = malloc(payload_cap);
+    if (!payload) {
+        if (!input_hc_uses_wire) free(input_hc);
+        return dist_worker_upstream_send_work_error(upstream, request_id,
+                                                    "out of memory allocating DSpark result");
+    }
+    uint32_t payload_bytes = 0;
+    uint64_t result_hash = prefix_hash;
+    uint32_t header[2] = {0, 0};
+
+    const double eval_t0 = dist_now_sec();
+    pthread_mutex_lock(&state->mu);
+    int rc = 0;
+    ds4_dist_worker_session *session =
+        dist_worker_get_session_locked(state, session_id, err, sizeof(err));
+    if (!session) rc = 1;
+    if (rc == 0 && !session->token_hash_valid) {
+        const ds4_tokens *timeline = ds4_session_tokens(session->session);
+        if (!timeline || timeline->len < 0) {
+            snprintf(err, sizeof(err), "worker session has no token timeline");
+            rc = 1;
+        } else {
+            session->token_hash = dist_token_hash_prefix(timeline->v, (uint32_t)timeline->len);
+            session->token_hash_valid = true;
+        }
+    }
+    if (rc == 0 && session->token_hash != prefix_hash) {
+        snprintf(err, sizeof(err), "worker KV prefix hash mismatch");
+        rc = 1;
+    }
+    if (rc == 0 && draft) {
+        int drafts[DS4_DIST_DSPARK_MAX_DRAFTS];
+        const int n = ds4_session_dspark_stage_draft(session->session, tokens[0],
+                                                     drafts, (int)draft_cap,
+                                                     err, sizeof(err));
+        if (n < 0) {
+            rc = 1;
+        } else {
+            header[0] = htonl(ds4_engine_dspark_drafts(state->engine) ? 1u : 0u);
+            header[1] = htonl((uint32_t)n);
+            memcpy(payload, header, sizeof(header));
+            for (int i = 0; i < n; i++) {
+                const uint32_t t = htonl((uint32_t)drafts[i]);
+                memcpy(payload + sizeof(header) + (size_t)i * sizeof(t), &t, sizeof(t));
+            }
+            payload_bytes = (uint32_t)sizeof(header) + (uint32_t)n * (uint32_t)sizeof(uint32_t);
+        }
+    } else if (rc == 0) {
+        int row_tops[DS4_DIST_DSPARK_MAX_DRAFTS + 1];
+        rc = ds4_session_dspark_stage_verify(session->session,
+                                             tokens,
+                                             work->n_tokens,
+                                             work->pos0,
+                                             work->layer_start,
+                                             work->layer_end,
+                                             input_hc,
+                                             NULL,
+                                             row_tops,
+                                             err,
+                                             sizeof(err));
+        if (rc == 0) {
+            /* Row i predicts the token after block[i]; the seed itself is
+             * always accepted because the target already chose it. */
+            uint32_t accepted = 1;
+            while (accepted < work->n_tokens &&
+                   row_tops[accepted - 1u] == tokens[accepted]) {
+                accepted++;
+            }
+            float *logits = (float *)(void *)(payload + sizeof(header));
+            const int applied = ds4_session_dspark_stage_commit(session->session,
+                                                                accepted,
+                                                                logits,
+                                                                err,
+                                                                sizeof(err));
+            if (applied < 0) {
+                rc = 1;
+            } else {
+                result_hash = dist_token_hash_update_span(prefix_hash, tokens,
+                                                          (uint32_t)applied);
+                session->token_hash = result_hash;
+                header[0] = htonl(accepted);
+                header[1] = htonl((uint32_t)applied);
+                memcpy(payload, header, sizeof(header));
+                payload_bytes = (uint32_t)sizeof(header) +
+                                ((uint32_t)applied == accepted ? vocab * (uint32_t)sizeof(float) : 0u);
+            }
+        }
+        if (rc != 0) session->token_hash_valid = false;
+    }
+    pthread_mutex_unlock(&state->mu);
+    const double eval_t1 = dist_now_sec();
+    if (!input_hc_uses_wire) free(input_hc);
+    if (rc != 0) {
+        free(payload);
+        return dist_worker_upstream_send_work_error(upstream, request_id, err);
+    }
+
+    ds4_dist_telemetry_fixed telemetry = {
+        .layer_start = work->layer_start,
+        .layer_end = work->layer_end,
+        .route_index = work->route_index,
+        .pos0 = work->pos0,
+        .n_tokens = work->n_tokens,
+        .eval_usec = dist_usec_since(eval_t0, eval_t1),
+        .downstream_wait_usec = 0,
+        .forward_send_usec = 0,
+        .input_bytes = work->token_bytes + work->input_hc_bytes,
+        .output_bytes = payload_bytes,
+    };
+    const int send_rc = dist_worker_upstream_send_work_result(
+            upstream,
+            request_id,
+            result_hash,
+            0,
+            draft ? DS4_DIST_RESULT_DSPARK_DRAFT : DS4_DIST_RESULT_DSPARK_VERIFY,
+            32u,
+            &telemetry,
+            1,
+            payload,
+            payload_bytes);
+    free(payload);
+    return send_rc;
+}
+
 static int dist_worker_process_work_payload(
         ds4_dist_worker_state *state,
         ds4_dist_worker_upstream *upstream,
@@ -7778,7 +8227,10 @@ static int dist_worker_process_work_payload(
     if (input_hc_present && work.layer_start == 0) {
         return dist_worker_upstream_send_work_error(upstream, request_id, "layer 0 WORK must not provide input hidden-state");
     }
-    if (!input_hc_present && work.layer_start != 0) {
+    const bool dspark_work =
+        (work.flags & (DS4_DIST_WORK_F_DSPARK_DRAFT | DS4_DIST_WORK_F_DSPARK_VERIFY)) != 0;
+    const bool dspark_draft = (work.flags & DS4_DIST_WORK_F_DSPARK_DRAFT) != 0;
+    if (!input_hc_present && work.layer_start != 0 && !dspark_draft) {
         return dist_worker_upstream_send_work_error(upstream, request_id, "nonzero layer WORK requires input hidden-state");
     }
     if (output_logits && !state->has_output) {
@@ -7812,7 +8264,10 @@ static int dist_worker_process_work_payload(
         }
         tokens[i] = (int)token;
     }
-    if (dist_token_hash_update_span(work_prefix_hash, tokens, work.n_tokens) !=
+    /* A draft adds nothing to the timeline, so its result hash is the
+     * prefix hash. */
+    if ((dspark_draft ? work_prefix_hash :
+         dist_token_hash_update_span(work_prefix_hash, tokens, work.n_tokens)) !=
         work_result_hash) {
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "WORK token prefix hash metadata mismatch");
@@ -7940,6 +8395,28 @@ static int dist_worker_process_work_payload(
             free(tokens);
             return dist_worker_upstream_send_work_error(upstream, request_id, "unsupported final result destination");
         }
+    }
+
+    if (dspark_work) {
+        if (has_next || ack_only) {
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id,
+                                                        "DSpark WORK needs the final stage as the only remote stage");
+        }
+        rc = dist_worker_process_dspark(state,
+                                        upstream,
+                                        &work,
+                                        session_id,
+                                        request_id,
+                                        work_prefix_hash,
+                                        tokens,
+                                        input_hc_wire,
+                                        input_hc_bits,
+                                        expected_hc_bytes);
+        free(route_blob);
+        free(tokens);
+        return rc;
     }
 
     const bool final_ack_only = ack_only && !has_next;

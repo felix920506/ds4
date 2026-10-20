@@ -112,6 +112,33 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
+/* DSpark over a pipeline.  The final stage drafts from the seed token; the
+ * draft call fills up to cap tokens and sets *n_drafts (0 when the final stage
+ * has no DSpark support or declined).  The verify call runs the seed-plus-drafts
+ * block through every stage and commits the accepted length everywhere,
+ * filling logits for the last committed token.  It returns 0 on success, 1
+ * when nothing was committed and the caller should decode normally, and -1 on
+ * an unrecoverable error.
+ */
+int ds4_dist_session_dspark_draft(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        int seed,
+        int *drafts,
+        int cap,
+        int *n_drafts,
+        char *err,
+        size_t errlen);
+int ds4_dist_session_dspark_verify(
+        ds4_dist_session *d,
+        ds4_session *owner,
+        const int *block,
+        uint32_t n_tokens,
+        uint32_t *committed,
+        float *logits,
+        char *err,
+        size_t errlen);
+
 /* Decode one token on each of several coordinator sessions, overlapping their
  * remote waits. Every member's frame is submitted before any result is
  * collected, so the batch costs the longest wait rather than their sum.
