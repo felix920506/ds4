@@ -6292,74 +6292,52 @@ static int dist_session_dspark_exchange(
     return 0;
 }
 
-int ds4_dist_session_dspark_draft(
+/* A failure after this stage already committed the seed: rebuild every stage
+ * from the transcript, which also yields the logits after the seed. */
+static int dist_session_dspark_recover(
         ds4_dist_session *d,
         ds4_session *owner,
+        uint32_t pos0,
         int seed,
-        bool new_request,
-        int *drafts,
-        int cap,
-        int *n_drafts,
+        bool forget_route,
+        float *logits,
         char *err,
         size_t errlen) {
-    if (n_drafts) *n_drafts = 0;
-    if (!d || !owner || !drafts || cap <= 0 || !n_drafts) {
-        if (errlen) snprintf(err, errlen, "invalid distributed DSpark draft request");
-        return 1;
-    }
-    if (d->dspark_unavailable) return 0;
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
-    if (!dist_session_dspark_route_ok(d)) {
-        fprintf(stderr,
-                "ds4: distributed DSpark needs exactly one remote stage that owns the "
-                "output head; decoding without it\n");
-        d->dspark_unavailable = true;
-        return 0;
-    }
-    const ds4_tokens *checkpoint = ds4_session_tokens(owner);
-    if (!checkpoint || checkpoint->len <= 0) return 0;
-    const uint32_t pos0 = (uint32_t)checkpoint->len;
-    uint64_t prefix_hash = 0;
-    if (dist_session_token_hash_prefix(owner, pos0, &prefix_hash, err, errlen) != 0) return 1;
+    ds4_tokens transcript = {0};
+    dist_recovery_transcript(&transcript, ds4_session_tokens(owner), pos0, seed);
+    const int rc = dist_coordinator_rebuild_from_transcript(&d->coord->state,
+                                                            owner,
+                                                            &d->plan,
+                                                            &transcript,
+                                                            d->session_id,
+                                                            &d->request_id,
+                                                            logits,
+                                                            &d->plan_generation,
+                                                            forget_route,
+                                                            err,
+                                                            errlen);
+    ds4_tokens_free(&transcript);
+    d->plan_ready = rc == 0;
+    if (rc != 0) d->plan_generation = 0;
+    return rc;
+}
 
-    void *payload = NULL;
-    uint32_t payload_bytes = 0;
-    uint64_t got_hash = 0;
-    int rc = dist_session_dspark_exchange(d, owner,
-                                          DS4_DIST_WORK_F_DSPARK_DRAFT |
-                                              DS4_DIST_WORK_F_OUTPUT_LOGITS |
-                                              (new_request ?
-                                                   DS4_DIST_WORK_F_DSPARK_NEW_REQUEST : 0u),
-                                          &seed, 1, pos0,
-                                          prefix_hash, prefix_hash,
-                                          NULL, 0,
-                                          DS4_DIST_RESULT_DSPARK_DRAFT,
-                                          &got_hash, &payload, &payload_bytes,
-                                          err, errlen);
-    if (rc != 0) {
-        /* A transport failure leaves the route suspect; the ordinary decode
-         * that follows rebuilds it. */
-        if (rc != DS4_DIST_RECV_REMOTE_ERROR) d->plan_ready = false;
-        return 1;
-    }
+static int dist_session_dspark_parse_drafts(
+        ds4_dist_session *d,
+        const void *payload,
+        uint32_t payload_bytes,
+        int *drafts,
+        int cap) {
     uint32_t header[2];
-    if (got_hash != prefix_hash || payload_bytes < sizeof(header)) {
-        free(payload);
-        d->plan_ready = false;
-        if (errlen) snprintf(err, errlen, "malformed distributed DSpark draft result");
-        return 1;
-    }
+    if (payload_bytes < sizeof(header)) return -1;
     memcpy(header, payload, sizeof(header));
     const uint32_t supported = ntohl(header[0]);
     const uint32_t n = ntohl(header[1]);
-    if (payload_bytes != sizeof(header) + (uint64_t)n * sizeof(uint32_t) ||
-        n > DS4_DIST_DSPARK_MAX_DRAFTS) {
-        free(payload);
-        d->plan_ready = false;
-        if (errlen) snprintf(err, errlen, "malformed distributed DSpark draft result");
-        return 1;
+    if (n > DS4_DIST_DSPARK_MAX_DRAFTS ||
+        payload_bytes != sizeof(header) + (uint64_t)n * sizeof(uint32_t)) {
+        return -1;
     }
-    if (!supported) {
+    if (!supported && !d->dspark_unavailable) {
         fprintf(stderr,
                 "ds4: distributed DSpark: the final stage has no DSpark support "
                 "(start it with --dspark --mtp-model FILE); decoding without it\n");
@@ -6374,86 +6352,175 @@ int ds4_dist_session_dspark_draft(
         if (t >= (uint32_t)vocab) break;
         drafts[out++] = (int)t;
     }
-    free(payload);
-    *n_drafts = out;
-    return 0;
+    return out;
 }
 
-int ds4_dist_session_dspark_verify(
+int ds4_dist_session_dspark_cycle(
         ds4_dist_session *d,
         ds4_session *owner,
-        const int *block,
-        uint32_t n_tokens,
+        int seed,
+        bool new_request,
+        int max_block,
+        ds4_dist_dspark_trim_fn trim,
+        void *trim_ud,
+        int *block,
         uint32_t *committed,
         float *logits,
         char *err,
         size_t errlen) {
     if (committed) *committed = 0;
-    if (!d || !owner || !block || n_tokens < 2u || !committed || !logits) {
-        if (errlen) snprintf(err, errlen, "invalid distributed DSpark verify request");
+    if (!d || !owner || !block || !committed || !logits || max_block < 2) {
+        if (errlen) snprintf(err, errlen, "invalid distributed DSpark cycle");
+        return 1;
+    }
+    if (d->dspark_unavailable) return 1;
+    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (!dist_session_dspark_route_ok(d)) {
+        fprintf(stderr,
+                "ds4: distributed DSpark needs exactly one remote stage that owns the "
+                "output head; decoding without it\n");
+        d->dspark_unavailable = true;
         return 1;
     }
     ds4_dist_coordinator_state *state = &d->coord->state;
-    if (!d->plan_ready || !dist_session_dspark_route_ok(d)) return 1;
     const ds4_tokens *checkpoint = ds4_session_tokens(owner);
     if (!checkpoint || checkpoint->len <= 0) return 1;
     const uint32_t pos0 = (uint32_t)checkpoint->len;
     uint64_t prefix_hash = 0;
     if (dist_session_token_hash_prefix(owner, pos0, &prefix_hash, err, errlen) != 0) return 1;
-    const uint64_t block_hash = dist_token_hash_update_span(prefix_hash, block, n_tokens);
-
-    const uint64_t hidden_bytes64 =
-        (uint64_t)n_tokens * ds4_engine_hidden_f32_values(state->engine) * sizeof(float);
-    float *hidden = hidden_bytes64 <= UINT32_MAX ? malloc((size_t)hidden_bytes64) : NULL;
+    const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
+    const uint64_t row_bytes = hc_values * sizeof(float);
+    const uint64_t hidden_bytes64 = (uint64_t)max_block * row_bytes;
+    if (hidden_bytes64 > UINT32_MAX) return 1;
+    float *hidden = malloc((size_t)hidden_bytes64);
     if (!hidden) {
-        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark verify rows");
+        if (errlen) snprintf(err, errlen, "out of memory allocating DSpark rows");
         return 1;
     }
     const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
-    const double local_t0 = spec_log ? dist_now_sec() : 0.0;
-    if (ds4_session_dspark_stage_verify(owner, block, n_tokens, pos0,
-                                        state->local_start, state->local_end,
-                                        NULL, hidden, NULL, err, errlen) != 0) {
-        free(hidden);
-        return 1;
-    }
-    const double remote_t0 = spec_log ? dist_now_sec() : 0.0;
+    const double t0 = spec_log ? dist_now_sec() : 0.0;
+    const int fd = d->plan.entry[0].fd;
+    block[0] = seed;
 
-    void *payload = NULL;
-    uint32_t payload_bytes = 0;
-    uint64_t got_hash = 0;
-    int rc = dist_session_dspark_exchange(d, owner,
-                                          DS4_DIST_WORK_F_DSPARK_VERIFY |
-                                              DS4_DIST_WORK_F_OUTPUT_LOGITS,
-                                          block, n_tokens, pos0,
-                                          prefix_hash, block_hash,
-                                          hidden, (uint32_t)hidden_bytes64,
-                                          DS4_DIST_RESULT_DSPARK_VERIFY,
-                                          &got_hash, &payload, &payload_bytes,
-                                          err, errlen);
-    free(hidden);
-    if (spec_log) {
-        fprintf(stderr,
-                "ds4: DSpark pipeline verify rows=%u local=%.1fms remote=%.1fms\n",
-                n_tokens,
-                (remote_t0 - local_t0) * 1000.0,
-                (dist_now_sec() - remote_t0) * 1000.0);
-    }
-    char local_err[256];
-    if (rc != 0) {
-        /* Nothing is committed here; the worker either never saw the block
-         * or rolled it back itself.  The next ordinary decode re-checks the
-         * worker's prefix hash and rebuilds the route if they diverged. */
-        (void)ds4_session_dspark_stage_commit(owner, 0, NULL, local_err, sizeof(local_err));
-        if (rc != DS4_DIST_RECV_REMOTE_ERROR) d->plan_ready = false;
+    /* Ask for drafts first, then run this stage's layers on the seed while
+     * the final stage drafts.  Without usable drafts the seed's rows go on
+     * as an ordinary decode, so the draft costs no extra wall time. */
+    const uint64_t draft_request = d->request_id++;
+    const uint32_t draft_flags = DS4_DIST_WORK_F_DSPARK_DRAFT |
+                                 (new_request ? DS4_DIST_WORK_F_DSPARK_NEW_REQUEST : 0u);
+    if (dist_coordinator_send_remote_work_on_fd(state, &d->plan, fd,
+                                                &seed, 1, pos0,
+                                                d->session_id, draft_request,
+                                                prefix_hash, prefix_hash,
+                                                false, false, draft_flags,
+                                                NULL, 0, err, errlen) != 0) {
+        free(hidden);
+        d->plan_ready = false;
         return 1;
     }
+    if (ds4_session_eval_layer_slice(owner, &seed, 1, pos0,
+                                     state->local_start, state->local_end,
+                                     NULL, hidden, false, NULL,
+                                     err, errlen) != 0) {
+        /* The draft reply is still on the wire; drop the route so the
+         * caller's ordinary decode rebuilds it from a clean state. */
+        free(hidden);
+        d->plan_ready = false;
+        return 1;
+    }
+    const double t1 = spec_log ? dist_now_sec() : 0.0;
+
+    uint32_t kind = 0, payload_bytes = 0;
+    uint64_t got_hash = 0;
+    void *payload = NULL;
+    int rc = dist_recv_result_alloc(fd, state, draft_request, &kind, &got_hash,
+                                    &payload, &payload_bytes, err, errlen);
+    int n_drafts = -1;
+    if (rc == 0 && kind == DS4_DIST_RESULT_DSPARK_DRAFT && got_hash == prefix_hash) {
+        n_drafts = dist_session_dspark_parse_drafts(d, payload, payload_bytes,
+                                                    block + 1, max_block - 1);
+    }
+    free(payload);
+    if (n_drafts < 0) {
+        free(hidden);
+        return dist_session_dspark_recover(d, owner, pos0, seed,
+                                           rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                           logits, err, errlen) == 0 ?
+            (*committed = 1, 0) : -1;
+    }
+    if (n_drafts > 0 && trim) n_drafts = trim(trim_ud, block + 1, n_drafts);
+    const double t2 = spec_log ? dist_now_sec() : 0.0;
+
+    if (n_drafts < 2) {
+        const uint64_t result_hash = dist_token_hash_update(prefix_hash, seed);
+        rc = dist_coordinator_eval_remote_on_fd(state, owner, &d->plan, fd,
+                                                &seed, 1, pos0,
+                                                d->session_id, d->request_id++,
+                                                prefix_hash, result_hash, false,
+                                                hidden, (uint32_t)row_bytes,
+                                                logits, err, errlen);
+        free(hidden);
+        if (rc != 0 &&
+            dist_session_dspark_recover(d, owner, pos0, seed,
+                                        rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                        logits, err, errlen) != 0) {
+            return -1;
+        }
+        if (spec_log) {
+            fprintf(stderr,
+                    "ds4: DSpark pipeline seed-only drafts=%d local=%.1fms draft_wait=%.1fms total=%.1fms\n",
+                    n_drafts, (t1 - t0) * 1000.0, (t2 - t1) * 1000.0,
+                    (dist_now_sec() - t0) * 1000.0);
+        }
+        *committed = 1;
+        return 0;
+    }
+
+    /* This stage already holds the seed; it verifies only the drafts.  The
+     * final stage verifies seed plus drafts from the rows sent here. */
+    const uint32_t n_tokens = 1u + (uint32_t)n_drafts;
+    char local_err[256];
+    if (ds4_session_dspark_stage_verify(owner, block + 1, (uint32_t)n_drafts, pos0 + 1u,
+                                        state->local_start, state->local_end,
+                                        NULL, hidden + hc_values, NULL,
+                                        local_err, sizeof(local_err)) != 0) {
+        const uint64_t result_hash = dist_token_hash_update(prefix_hash, seed);
+        rc = dist_coordinator_eval_remote_on_fd(state, owner, &d->plan, fd,
+                                                &seed, 1, pos0,
+                                                d->session_id, d->request_id++,
+                                                prefix_hash, result_hash, false,
+                                                hidden, (uint32_t)row_bytes,
+                                                logits, err, errlen);
+        free(hidden);
+        if (rc != 0 &&
+            dist_session_dspark_recover(d, owner, pos0, seed,
+                                        rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                        logits, err, errlen) != 0) {
+            return -1;
+        }
+        *committed = 1;
+        return 0;
+    }
+    const double t3 = spec_log ? dist_now_sec() : 0.0;
+    const uint64_t block_hash = dist_token_hash_update_span(prefix_hash, block, n_tokens);
+    payload = NULL;
+    rc = dist_session_dspark_exchange(d, owner,
+                                      DS4_DIST_WORK_F_DSPARK_VERIFY |
+                                          DS4_DIST_WORK_F_OUTPUT_LOGITS,
+                                      block, n_tokens, pos0,
+                                      prefix_hash, block_hash,
+                                      hidden, (uint32_t)((uint64_t)n_tokens * row_bytes),
+                                      DS4_DIST_RESULT_DSPARK_VERIFY,
+                                      &got_hash, &payload, &payload_bytes,
+                                      err, errlen);
+    free(hidden);
+    const double t4 = spec_log ? dist_now_sec() : 0.0;
 
     uint32_t header[2];
     const uint32_t logits_bytes =
         (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
     uint32_t accepted = 0, applied = 0;
-    bool ok = payload_bytes >= sizeof(header);
+    bool ok = rc == 0 && payload_bytes >= sizeof(header);
     if (ok) {
         memcpy(header, payload, sizeof(header));
         accepted = ntohl(header[0]);
@@ -6463,41 +6530,50 @@ int ds4_dist_session_dspark_verify(
              payload_bytes == sizeof(header) + (applied == accepted ? logits_bytes : 0u) &&
              got_hash == dist_token_hash_update_span(prefix_hash, block, applied);
     }
-    if (!ok) {
-        free(payload);
-        (void)ds4_session_dspark_stage_commit(owner, 0, NULL, local_err, sizeof(local_err));
-        d->plan_ready = false;
-        if (errlen) snprintf(err, errlen, "malformed distributed DSpark verify result");
-        return 1;
-    }
+    /* This stage's pending block starts after the seed. */
     const int local_applied =
-        ds4_session_dspark_stage_commit(owner, accepted, NULL, err, errlen);
-    if (local_applied != (int)applied) {
+        ds4_session_dspark_stage_commit(owner, ok ? applied - 1u : 0u, NULL,
+                                        local_err, sizeof(local_err));
+    if (!ok || local_applied != (int)applied - 1) {
         free(payload);
-        /* The stages now disagree about the timeline.  Drop the route so the
-         * next request rebuilds every stage from the transcript. */
-        ds4_session_invalidate(owner);
-        d->plan_ready = false;
-        if (errlen && local_applied >= 0) {
-            snprintf(err, errlen, "distributed DSpark stages committed %d and %u tokens",
-                     local_applied, applied);
+        if (local_applied < 0) {
+            ds4_session_invalidate(owner);
+            d->plan_ready = false;
+            if (errlen) snprintf(err, errlen, "%s", local_err);
+            return -1;
         }
-        return -1;
+        /* The worker either rolled back or answered badly: rebuild both
+         * stages to the seed. */
+        if (dist_session_dspark_recover(d, owner, pos0, seed,
+                                        rc != DS4_DIST_RECV_REMOTE_ERROR,
+                                        logits, err, errlen) != 0) {
+            return -1;
+        }
+        *committed = 1;
+        return 0;
     }
     if (applied == accepted) {
         memcpy(logits, (const uint8_t *)payload + sizeof(header), logits_bytes);
         free(payload);
         *committed = accepted;
-        return 0;
+    } else {
+        free(payload);
+        /* The prefix slots ran out one token short: decode that token
+         * normally, which also brings back the logits that follow it. */
+        if (ds4_dist_session_eval(d, owner, ds4_session_tokens(owner),
+                                  block[applied], logits, err, errlen) != 0) {
+            return -1;
+        }
+        *committed = applied + 1u;
     }
-    free(payload);
-    /* The prefix slots ran out one token short: decode that token normally,
-     * which also brings back the logits that follow it. */
-    if (ds4_dist_session_eval(d, owner, ds4_session_tokens(owner),
-                              block[applied], logits, err, errlen) != 0) {
-        return -1;
+    if (spec_log) {
+        fprintf(stderr,
+                "ds4: DSpark pipeline cycle drafted=%d accepted=%u seed=%.1fms "
+                "draft_wait=%.1fms verify_local=%.1fms verify_remote=%.1fms total=%.1fms\n",
+                n_drafts, *committed - 1u,
+                (t1 - t0) * 1000.0, (t2 - t1) * 1000.0, (t3 - t2) * 1000.0,
+                (t4 - t3) * 1000.0, (dist_now_sec() - t0) * 1000.0);
     }
-    *committed = applied + 1u;
     return 0;
 }
 

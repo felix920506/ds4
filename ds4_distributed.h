@@ -112,29 +112,25 @@ int ds4_dist_session_eval(
         char *err,
         size_t errlen);
 
-/* DSpark over a pipeline.  The final stage drafts from the seed token; the
- * draft call fills up to cap tokens and sets *n_drafts (0 when the final stage
- * has no DSpark support or declined).  The verify call runs the seed-plus-drafts
- * block through every stage and commits the accepted length everywhere,
- * filling logits for the last committed token.  It returns 0 on success, 1
- * when nothing was committed and the caller should decode normally, and -1 on
- * an unrecoverable error.
+/* DSpark over a pipeline: one cycle from a sampled seed token.  The final
+ * stage drafts while this stage runs its layers on the seed; usable drafts
+ * (after trim, which may shorten them for stop tokens) are verified on every
+ * stage, otherwise the seed finishes as an ordinary decode.  On success
+ * block[0..*committed) holds the committed tokens (seed first) and logits
+ * follow the last of them.  Returns 0 on success, 1 when nothing was
+ * committed and the caller should decode normally, and -1 on an
+ * unrecoverable error.
  */
-int ds4_dist_session_dspark_draft(
+typedef int (*ds4_dist_dspark_trim_fn)(void *ud, const int *drafts, int n);
+int ds4_dist_session_dspark_cycle(
         ds4_dist_session *d,
         ds4_session *owner,
         int seed,
         bool new_request,
-        int *drafts,
-        int cap,
-        int *n_drafts,
-        char *err,
-        size_t errlen);
-int ds4_dist_session_dspark_verify(
-        ds4_dist_session *d,
-        ds4_session *owner,
-        const int *block,
-        uint32_t n_tokens,
+        int max_block,
+        ds4_dist_dspark_trim_fn trim,
+        void *trim_ud,
+        int *block,
         uint32_t *committed,
         float *logits,
         char *err,
