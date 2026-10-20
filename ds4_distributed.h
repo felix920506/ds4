@@ -124,6 +124,7 @@ int ds4_dist_session_dspark_draft(
         ds4_dist_session *d,
         ds4_session *owner,
         int seed,
+        bool new_request,
         int *drafts,
         int cap,
         int *n_drafts,

@@ -61354,6 +61354,9 @@ struct ds4_session {
      * accepted length that the final stage decides. */
     ds4_spec_frontier dist_spec_frontier;
     bool dist_spec_pending;
+    /* A new request began; the next pipeline draft resets the final stage's
+     * DSpark scheduler, which never sees the request itself. */
+    bool dist_spec_new_request;
     uint32_t dist_spec_start;
     uint32_t dist_spec_n;
     int dist_spec_tokens[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
@@ -61562,6 +61565,17 @@ static uint32_t ds4_dspark_scheduler_min_avg_milli(const ds4_session *s) {
             "DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", fallback);
 }
 
+/* A pipeline cycle costs one draft round trip plus a verify that runs on
+ * every stage in turn, measured at about 3.5 ordinary decodes for a six-row
+ * block over 1 GbE on Strix Halo.  It pays off at a lower acceptance than the
+ * single-machine fast path, whose decode is cheaper relative to its verify. */
+static uint32_t ds4_session_dspark_scheduler_min_avg_milli(const ds4_session *s) {
+    const uint32_t fallback =
+        s && s->engine && s->engine->distributed.role == DS4_DISTRIBUTED_WORKER ?
+            2500u : ds4_dspark_scheduler_min_avg_milli(s);
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MIN_AVG_MILLI", fallback);
+}
+
 static uint32_t ds4_dspark_scheduler_max_ms_per_accept_milli(void) {
     return ds4_dspark_env_u32(
             "DS4_DSPARK_SCHEDULER_MAX_MS_PER_ACCEPT_MILLI", 0);
@@ -61619,6 +61633,7 @@ static void ds4_session_dspark_scheduler_reset(ds4_session *s) {
 
 static void ds4_session_dspark_scheduler_begin_request(ds4_session *s) {
     if (!s) return;
+    s->dist_spec_new_request = true;
     ds4_session_dspark_scheduler_reset(s);
     s->dspark_sched_skip = 0;
     s->dspark_sched_lifetime_accepted = 0;
@@ -61758,7 +61773,7 @@ static void ds4_session_dspark_scheduler_note(
         ((uint64_t)s->dspark_sched_accepted * 1000ull) /
         (uint64_t)s->dspark_sched_cycles;
     const uint32_t min_avg_milli =
-        ds4_dspark_scheduler_min_avg_milli(s);
+        ds4_session_dspark_scheduler_min_avg_milli(s);
     const bool low_accept = avg_milli < min_avg_milli;
     const bool many_no_draft =
         s->dspark_sched_no_draft * 2u >= s->dspark_sched_cycles;
@@ -86577,6 +86592,7 @@ fail:
  * usual hidden rows, so the cycle costs about one decode round trip. */
 
 int ds4_session_dspark_stage_draft(ds4_session *s, int seed,
+                                   bool new_request,
                                    int *drafts, int cap,
                                    char *err, size_t errlen) {
     if (!s || !drafts || cap <= 0) {
@@ -86584,10 +86600,11 @@ int ds4_session_dspark_stage_draft(ds4_session *s, int seed,
         return -1;
     }
 #ifdef DS4_NO_GPU
-    (void)seed;
+    (void)seed; (void)new_request;
     return 0;
 #else
     ds4_engine *e = s->engine;
+    if (new_request) ds4_session_dspark_scheduler_begin_request(s);
     if (!e || e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark ||
         e->quality || e->dspark_strict || ds4_session_is_cpu(s) ||
         !s->checkpoint_valid || s->dist_spec_pending ||
@@ -86605,6 +86622,11 @@ int ds4_session_dspark_stage_draft(ds4_session *s, int seed,
         if (n > cap) n = cap;
         for (int i = 0; i < n; i++) drafts[i] = s->dspark_draft_tokens[i];
     }
+    /* Every stage verifies in turn, so a block costs several ordinary
+     * decodes; a short confident prefix cannot repay it. */
+    const int min_drafts =
+        (int)ds4_dspark_env_u32("DS4_DSPARK_STAGE_MIN_DRAFTS", 3u);
+    if (n < min_drafts) n = 0;
     if (n == 0) {
         /* Mirrors the local seed-batch path: a declined proposal still
          * counts toward the scheduler's back-off. */
@@ -86846,11 +86868,14 @@ static int ds4_session_dist_dspark_cycle(
     if (limit < 2) return 0;
 
     const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
+    const double t0 = spec_log ? now_sec() : 0.0;
     int block[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
     block[0] = first_token;
     int n_draft = 0;
     char draft_err[256] = {0};
-    if (ds4_dist_session_dspark_draft(s->distributed, s, first_token,
+    const bool new_request = s->dist_spec_new_request;
+    s->dist_spec_new_request = false;
+    if (ds4_dist_session_dspark_draft(s->distributed, s, first_token, new_request,
                                       block + 1, limit - 1, &n_draft,
                                       draft_err, sizeof(draft_err)) != 0) {
         if (spec_log) fprintf(stderr, "ds4: DSpark pipeline draft failed: %s\n", draft_err);
@@ -86867,6 +86892,7 @@ static int ds4_session_dist_dspark_cycle(
     }
     if (n < 2) return 0;
 
+    const double t1 = spec_log ? now_sec() : 0.0;
     uint32_t committed = 0;
     const int rc = ds4_dist_session_dspark_verify(s->distributed, s, block,
                                                   (uint32_t)n, &committed,
@@ -86879,8 +86905,11 @@ static int ds4_session_dist_dspark_cycle(
     }
     for (uint32_t i = 0; i < committed; i++) accepted[i] = block[i];
     if (spec_log) {
-        fprintf(stderr, "ds4: DSpark pipeline cycle drafted=%d accepted=%u pos=%d\n",
-                n - 1, committed - 1u, s->checkpoint.len);
+        fprintf(stderr,
+                "ds4: DSpark pipeline cycle drafted=%d accepted=%u pos=%d "
+                "draft=%.1fms verify=%.1fms\n",
+                n - 1, committed - 1u, s->checkpoint.len,
+                (t1 - t0) * 1000.0, (now_sec() - t1) * 1000.0);
     }
     return (int)committed;
 #endif

@@ -68,10 +68,14 @@
  * stage verifies the seed-plus-drafts block and commits the accepted length. */
 #define DS4_DIST_WORK_F_DSPARK_DRAFT 0x00000010u
 #define DS4_DIST_WORK_F_DSPARK_VERIFY 0x00000020u
+/* Set on the first draft of a request so the final stage restarts its DSpark
+ * scheduler, as a local session does when a request begins. */
+#define DS4_DIST_WORK_F_DSPARK_NEW_REQUEST 0x00000040u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
      DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
-     DS4_DIST_WORK_F_DSPARK_DRAFT | DS4_DIST_WORK_F_DSPARK_VERIFY)
+     DS4_DIST_WORK_F_DSPARK_DRAFT | DS4_DIST_WORK_F_DSPARK_VERIFY | \
+     DS4_DIST_WORK_F_DSPARK_NEW_REQUEST)
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
@@ -6292,6 +6296,7 @@ int ds4_dist_session_dspark_draft(
         ds4_dist_session *d,
         ds4_session *owner,
         int seed,
+        bool new_request,
         int *drafts,
         int cap,
         int *n_drafts,
@@ -6321,7 +6326,10 @@ int ds4_dist_session_dspark_draft(
     uint32_t payload_bytes = 0;
     uint64_t got_hash = 0;
     int rc = dist_session_dspark_exchange(d, owner,
-                                          DS4_DIST_WORK_F_DSPARK_DRAFT,
+                                          DS4_DIST_WORK_F_DSPARK_DRAFT |
+                                              DS4_DIST_WORK_F_OUTPUT_LOGITS |
+                                              (new_request ?
+                                                   DS4_DIST_WORK_F_DSPARK_NEW_REQUEST : 0u),
                                           &seed, 1, pos0,
                                           prefix_hash, prefix_hash,
                                           NULL, 0,
@@ -6401,12 +6409,15 @@ int ds4_dist_session_dspark_verify(
         if (errlen) snprintf(err, errlen, "out of memory allocating DSpark verify rows");
         return 1;
     }
+    const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
+    const double local_t0 = spec_log ? dist_now_sec() : 0.0;
     if (ds4_session_dspark_stage_verify(owner, block, n_tokens, pos0,
                                         state->local_start, state->local_end,
                                         NULL, hidden, NULL, err, errlen) != 0) {
         free(hidden);
         return 1;
     }
+    const double remote_t0 = spec_log ? dist_now_sec() : 0.0;
 
     void *payload = NULL;
     uint32_t payload_bytes = 0;
@@ -6421,6 +6432,13 @@ int ds4_dist_session_dspark_verify(
                                           &got_hash, &payload, &payload_bytes,
                                           err, errlen);
     free(hidden);
+    if (spec_log) {
+        fprintf(stderr,
+                "ds4: DSpark pipeline verify rows=%u local=%.1fms remote=%.1fms\n",
+                n_tokens,
+                (remote_t0 - local_t0) * 1000.0,
+                (dist_now_sec() - remote_t0) * 1000.0);
+    }
     char local_err[256];
     if (rc != 0) {
         /* Nothing is committed here; the worker either never saw the block
@@ -8054,7 +8072,10 @@ static int dist_worker_process_dspark(
     }
     if (rc == 0 && draft) {
         int drafts[DS4_DIST_DSPARK_MAX_DRAFTS];
+        const bool new_request =
+            (work->flags & DS4_DIST_WORK_F_DSPARK_NEW_REQUEST) != 0;
         const int n = ds4_session_dspark_stage_draft(session->session, tokens[0],
+                                                     new_request,
                                                      drafts, (int)draft_cap,
                                                      err, sizeof(err));
         if (n < 0) {
@@ -8113,6 +8134,11 @@ static int dist_worker_process_dspark(
     }
     pthread_mutex_unlock(&state->mu);
     const double eval_t1 = dist_now_sec();
+    if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
+        fprintf(stderr, "ds4: DSpark stage %s rows=%u eval=%.1fms rc=%d\n",
+                draft ? "draft" : "verify", work->n_tokens,
+                (eval_t1 - eval_t0) * 1000.0, rc);
+    }
     if (!input_hc_uses_wire) free(input_hc);
     if (rc != 0) {
         free(payload);

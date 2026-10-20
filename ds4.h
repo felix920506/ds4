@@ -675,6 +675,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 bool ds4_engine_dspark_drafts(ds4_engine *e);
 int ds4_session_dspark_stage_max_block(void);
 int ds4_session_dspark_stage_draft(ds4_session *s, int seed,
+                                   bool new_request,
                                    int *drafts, int cap,
                                    char *err, size_t errlen);
 int ds4_session_dspark_stage_verify(ds4_session *s,
