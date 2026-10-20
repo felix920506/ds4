@@ -433,6 +433,14 @@ struct ds4_dist_session {
     /* Set once the route shows it cannot draft, so later cycles skip the
      * round trip. */
     bool dspark_unavailable;
+    /* DSpark gate: the measured cost of an ordinary decode, the verify
+     * cycles in the current window, and how many cycles to ignore drafts. */
+    double dspark_seed_ms;
+    double dspark_window_ms;
+    uint32_t dspark_window_cycles;
+    uint32_t dspark_window_tokens;
+    uint32_t dspark_pause;
+    uint32_t dspark_pause_len;
 };
 
 typedef struct {
@@ -785,6 +793,17 @@ static uint32_t dist_worker_forward_window(void) {
         }
     }
     return depth;
+}
+
+/* An unsigned tuning knob from the environment; 0 is allowed. */
+static uint32_t dist_env_u32(const char *name, uint32_t fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    errno = 0;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (errno != 0 || *end != '\0' || v > UINT32_MAX) return fallback;
+    return (uint32_t)v;
 }
 
 static bool dist_decode_profile_enabled(void) {
@@ -6449,6 +6468,19 @@ int ds4_dist_session_dspark_cycle(
             (*committed = 1, 0) : -1;
     }
     if (n_drafts > 0 && trim) n_drafts = trim(trim_ud, block + 1, n_drafts);
+    if (new_request) {
+        d->dspark_pause = 0;
+        d->dspark_pause_len = 0;
+        d->dspark_window_cycles = 0;
+        d->dspark_window_tokens = 0;
+        d->dspark_window_ms = 0.0;
+    }
+    if (d->dspark_pause != 0) {
+        /* Drafting stays on, since it overlaps the seed decode for free;
+         * only the verify is skipped. */
+        d->dspark_pause--;
+        n_drafts = 0;
+    }
     const double t2 = spec_log ? dist_now_sec() : 0.0;
 
     if (n_drafts < 2) {
@@ -6466,11 +6498,15 @@ int ds4_dist_session_dspark_cycle(
                                         logits, err, errlen) != 0) {
             return -1;
         }
+        const double seed_ms = (dist_now_sec() - t0) * 1000.0;
+        if (rc == 0) {
+            d->dspark_seed_ms = d->dspark_seed_ms > 0.0 ?
+                0.9 * d->dspark_seed_ms + 0.1 * seed_ms : seed_ms;
+        }
         if (spec_log) {
             fprintf(stderr,
                     "ds4: DSpark pipeline seed-only drafts=%d local=%.1fms draft_wait=%.1fms total=%.1fms\n",
-                    n_drafts, (t1 - t0) * 1000.0, (t2 - t1) * 1000.0,
-                    (dist_now_sec() - t0) * 1000.0);
+                    n_drafts, (t1 - t0) * 1000.0, (t2 - t1) * 1000.0, seed_ms);
         }
         *committed = 1;
         return 0;
@@ -6565,6 +6601,33 @@ int ds4_dist_session_dspark_cycle(
             return -1;
         }
         *committed = applied + 1u;
+    }
+    /* A verify runs on every stage in turn, so whether it pays depends on the
+     * model, quant and link.  Compare a window of verify cycles with the
+     * measured ordinary decode and skip verifies while they lose, doubling
+     * the pause while they keep losing. */
+    d->dspark_window_cycles++;
+    d->dspark_window_tokens += *committed;
+    d->dspark_window_ms += (dist_now_sec() - t0) * 1000.0;
+    const uint32_t window = dist_env_u32("DS4_DSPARK_PIPELINE_WINDOW", 8u);
+    if (window != 0 && d->dspark_window_cycles >= window && d->dspark_seed_ms > 0.0) {
+        const double verify_ms_per_token =
+            d->dspark_window_ms / (double)d->dspark_window_tokens;
+        if (verify_ms_per_token > d->dspark_seed_ms) {
+            d->dspark_pause_len = d->dspark_pause_len == 0 ? 16u :
+                (d->dspark_pause_len >= 256u ? 256u : d->dspark_pause_len * 2u);
+            d->dspark_pause = d->dspark_pause_len;
+        } else {
+            d->dspark_pause_len = 0;
+        }
+        if (spec_log) {
+            fprintf(stderr,
+                    "ds4: DSpark pipeline gate verify=%.1fms/token decode=%.1fms/token pause=%u\n",
+                    verify_ms_per_token, d->dspark_seed_ms, d->dspark_pause);
+        }
+        d->dspark_window_cycles = 0;
+        d->dspark_window_tokens = 0;
+        d->dspark_window_ms = 0.0;
     }
     if (spec_log) {
         fprintf(stderr,

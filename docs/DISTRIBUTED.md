@@ -179,11 +179,16 @@ DSpark speculative decoding also works in pipeline mode when a single remote
 worker owns the output head and every DSpark target layer, as `20:output` or
 `21:output` does for Flash. Give that worker `--dspark --mtp-model FILE` with
 any `--dspark-confidence`, and give the coordinator `--dspark`; the coordinator
-does not load the support file. The final worker drafts from its own layers,
-every stage verifies the seed-plus-drafts block on its slice, and each commits
-the accepted length, so a cycle costs about one decode round trip. Routes with
-more than one remote stage decode without DSpark. As on one machine,
-session-batched serving uses ordinary decoding.
+does not load the support file. The final worker drafts while the coordinator
+runs its own layers on the seed token, so a declined draft costs nothing.
+Accepted drafts are verified on every stage in turn and each commits the
+accepted length. A verify costs several ordinary decodes, so the coordinator
+compares recent verify cycles with its measured decode time and skips verifies
+while they lose. Over 1 GbE on Strix Halo this gave Flash 0731 Q4 about 15-20%
+more decode throughput, while Vision Experimental, whose drafts are accepted
+less often, stayed about even. Routes with more than one remote stage decode
+without DSpark. As on one machine, session-batched serving uses ordinary
+decoding.
 
 Long prefill chunks can occupy different stages simultaneously. A single
 generation stream cannot use that overlap: each token must finish the route

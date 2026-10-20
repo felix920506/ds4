@@ -61357,12 +61357,6 @@ struct ds4_session {
     /* A new request began; the next pipeline draft resets the final stage's
      * DSpark scheduler, which never sees the request itself. */
     bool dist_spec_new_request;
-    /* Final-stage gate: verify cycles in the current window and their
-     * accepted drafts, and how many cycles drafting stays paused. */
-    uint32_t dist_gate_cycles;
-    uint32_t dist_gate_accepted;
-    uint32_t dist_gate_pause;
-    uint32_t dist_gate_pause_len;
     uint32_t dist_spec_start;
     uint32_t dist_spec_n;
     int dist_spec_tokens[DS4_DSPARK_MAX_BLOCK_SIZE + 1u];
@@ -86601,27 +86595,11 @@ int ds4_session_dspark_stage_draft(ds4_session *s, int seed,
     return 0;
 #else
     ds4_engine *e = s->engine;
-    if (new_request) {
-        ds4_session_dspark_scheduler_begin_request(s);
-        s->dist_gate_cycles = 0;
-        s->dist_gate_accepted = 0;
-        s->dist_gate_pause = 0;
-        s->dist_gate_pause_len = 0;
-    }
+    if (new_request) ds4_session_dspark_scheduler_begin_request(s);
     if (!e || e->support_kind != DS4_SUPPORT_DSPARK || !e->dspark ||
         e->quality || e->dspark_strict || ds4_session_is_cpu(s) ||
         !s->checkpoint_valid || s->dist_spec_pending ||
         seed < 0 || seed >= (int)DS4_N_VOCAB) {
-        return 0;
-    }
-    if (s->dist_gate_pause != 0) {
-        s->dist_gate_pause--;
-        /* Keep the drafter's target window current, as a local scheduler
-         * skip does. */
-        const uint32_t feature_pos = (uint32_t)s->checkpoint.len - 1u;
-        (void)metal_graph_dspark_cache_target_prefix(&s->graph, feature_pos);
-        (void)metal_graph_dspark_ring_maintain(&s->graph, &e->mtp_model,
-                                               &e->dspark_weights, feature_pos);
         return 0;
     }
     const bool stats_enabled = ds4_dspark_stats_enabled();
@@ -86828,36 +86806,6 @@ int ds4_session_dspark_stage_commit(ds4_session *s,
     if (s->engine->support_kind == DS4_SUPPORT_DSPARK && accepted != 0) {
         /* The seed was the target's own token; only drafts count. */
         const uint32_t drafts_accepted = accepted - 1u;
-        /* A verify block runs on every stage in turn and costs about three
-         * ordinary decodes over 1 GbE on Strix Halo, so it pays off from
-         * about 2.2 accepted drafts.  Below that over a window, pause
-         * drafting, doubling the pause while the text stays unpredictable. */
-        s->dist_gate_cycles++;
-        s->dist_gate_accepted += drafts_accepted;
-        const uint32_t window = ds4_dspark_env_u32("DS4_DSPARK_STAGE_WINDOW", 8u);
-        if (window != 0 && s->dist_gate_cycles >= window) {
-            const uint32_t min_avg_milli =
-                ds4_dspark_env_u32("DS4_DSPARK_STAGE_MIN_AVG_MILLI", 2200u);
-            const uint64_t avg_milli =
-                (uint64_t)s->dist_gate_accepted * 1000u / s->dist_gate_cycles;
-            if (avg_milli < min_avg_milli) {
-                const uint32_t base =
-                    ds4_dspark_env_u32("DS4_DSPARK_STAGE_PAUSE", 16u);
-                s->dist_gate_pause_len = s->dist_gate_pause_len == 0 ?
-                    base : (s->dist_gate_pause_len >= 256u ? 256u : s->dist_gate_pause_len * 2u);
-                s->dist_gate_pause = s->dist_gate_pause_len;
-            } else {
-                s->dist_gate_pause_len = 0;
-            }
-            if (getenv("DS4_DSPARK_SPEC_LOG") != NULL) {
-                fprintf(stderr,
-                        "ds4: DSpark stage gate cycles=%u avg=%.2f pause=%u\n",
-                        s->dist_gate_cycles, (double)avg_milli / 1000.0,
-                        s->dist_gate_pause);
-            }
-            s->dist_gate_cycles = 0;
-            s->dist_gate_accepted = 0;
-        }
         ds4_session_dspark_scheduler_note(s, drafts_accepted, false,
                                           s->dspark_last_propose_ms);
         if (ds4_dspark_stats_enabled()) {
