@@ -35,6 +35,41 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   work, do not restart or restore it when you are done. Leave it stopped
   unless the user explicitly asks for it to be brought back.
 
+### Freeing disk space
+
+Model files, Docker images and build caches are large, so the disk fills up.
+When there is not enough space, delete things that are cheap to rebuild or
+re-download. Do not stop to ask about these:
+
+- Docker build cache: `docker builder prune` (add `-a` if that is not enough).
+  It often holds tens of GB.
+- Old `ds4:*` test images built for branches or experiments that are finished
+  (e.g. `ds4:<branch>`, `*-baseline`), stopped containers, and dangling
+  images: `docker image rm`, `docker container prune`, `docker image prune`.
+  Keep the image a running container or an active test uses. Base images such
+  as `rocm/dev-ubuntu-*` can be pulled again, but they are slow to download,
+  so remove them only after the options above.
+- Build outputs: `make clean`, `*.o`, the `ds4*` binaries, `tests/test_*`
+  binaries, `__pycache__/`, `core`/`core.*` dumps. This applies to the main
+  checkout and to every worktree under `~/.t3/worktrees/ds4/`.
+- Caches: the server's disk KV cache (the `--kv-disk-dir` directory) and
+  pip/Python caches. Sessions saved with `ds4-agent` in `~/.ds4/kvcache` are
+  covered under "Leave these alone" below.
+- Old logs and traces: `--trace` outputs, `/tmp/ds4-*`, bench/profiler output
+  (rocprof dumps, `speed-bench` results) that a commit or the user's notes do
+  not reference.
+- Abandoned partial downloads (`gguf/*.part`), but only if no download is
+  writing to them right now.
+
+Leave these alone unless the user agrees:
+
+- Complete model files in `gguf/` (`ds4flash.gguf` is a symlink into it).
+  They can be downloaded again, but a download can be tens of GB and take a
+  long time. If you have to free this much space, ask which model to drop.
+- Uncommitted work in any worktree, `misc/` notes, and `ds4-agent` sessions
+  saved in `~/.ds4/kvcache`. If they take a lot of space, `/strip` removes the
+  KV payload and keeps the conversation.
+
 ## Safety
 
 - Avoid large CPU inference runs on macOS; the CPU path has previously exposed kernel VM failures with very large mappings.
