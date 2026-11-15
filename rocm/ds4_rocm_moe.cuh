@@ -27,27 +27,6 @@ __global__ static void moe_swiglu_weighted_f32_kernel(
     mid[i] = (g / (1.0f + expf(-g))) * u * weights[pair];
 }
 
-/* Same SwiGLU, written as the F16 activations of the tiled down kernel. */
-__global__ static void moe_swiglu_weighted_f16_kernel(
-        half * __restrict__ mid_h,
-        const float * __restrict__ gate,
-        const float * __restrict__ up,
-        const float * __restrict__ weights,
-        uint64_t n,
-        uint32_t expert_mid_dim,
-        float clamp) {
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const uint64_t pair = i / expert_mid_dim;
-    float g = isfinite(gate[i]) ? gate[i] : 0.0f;
-    float u = isfinite(up[i]) ? up[i] : 0.0f;
-    if (clamp > 1.0e-6f) {
-        g = fminf(g, clamp);
-        u = fminf(fmaxf(u, -clamp), clamp);
-    }
-    mid_h[i] = __float2half((g / (1.0f + expf(-g))) * u * weights[pair]);
-}
-
 __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
@@ -5125,180 +5104,427 @@ __global__ static void moe_down_q2K_hotlist_wmma_kernel(
     }
 }
 
-/* Q2_K down projection for resident prefill: one block computes a 64-token x
- * 64-row tile of one expert over the whole reduction in 64-wide K chunks.  Each
- * chunk stages both operands once as F16 (activations straight from the
- * pair-major F16 mid buffer, weights dequantized from the raw Q2_K superblock
- * held in LDS) and then eight waves run the 4x4 grid of 16x16 WMMA tiles, so
- * there are two barriers per chunk instead of two per 16-wide slice.  A
- * 128-row tile measured slower: it halves the blocks per CU.
+/* One 32-weight IQ2_XXS group as stored: four grid indices, then four 7-bit
+ * sign fields and the 4-bit group scale.  Groups start 2 bytes into a 66-byte
+ * block, so the words are not 4-byte aligned. */
+struct __attribute__((packed)) ds4_iq2_xxs_group {
+    uint32_t idx;
+    uint32_t aux;
+};
+
+/* Lane l of a wave32 reads the value of lane l ^ 16. */
+__device__ __forceinline__ static uint32_t wave_swap_halves(uint32_t v) {
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210u, 0xfedcba98u, false, false);
+}
+
+/* IQ2_XXS gate and up projections with their SwiGLU for resident prefill.
+ * One block computes T*16 tokens of one expert against the same 256 rows of
+ * both matrices and writes the weighted F16 mid rows the tiled down kernel
+ * reads.
+ *
+ * Only the activations go through LDS (staged once per 64-wide K chunk and
+ * read by all eight waves).  Every wave owns 32 rows of each matrix and
+ * dequantizes them straight into the B operand: lane l needs 16 weights of
+ * row l % 16, which is two grid entries read from an LDS table of exact F16
+ * magnitudes, with the sign bits xored in.  A lane decodes one row tile and
+ * takes the other of its pair from the opposite half of the wave, since the
+ * instruction wants both halves to hold the same operand.  Each operand
+ * then serves all T token tiles from registers.
+ *
+ * The group scale d*(2s+1)/8 is not folded into the operand.  It is constant
+ * per weight row, hence per lane of an accumulator tile, so the accumulators
+ * are kept in units of the current group's scale and rescaled by the ratio
+ * when the group changes: eight multiplies per tile per 32 weights.
+ *
+ * Experts receive anything from one token to the whole batch.  The widest
+ * tiles are bound by the WMMA rate.  Narrower ones are bound by reading the
+ * expert's 4 MiB of weights, which every tile has to do once whatever its
+ * width, so they fetch four groups of a row at a time: reading it group by
+ * group touches every cache line eight times, and 256 rows per block do not
+ * stay in the first-level cache in between.  The widest tile has no
+ * registers left for that.
  * Operand layout of the w32 instruction: see attention_mixed_heads32. */
-template <bool OUT_F16>
-__global__ static void __launch_bounds__(256, 2) moe_down_q2K_tile_wmma_kernel(
-        float *down_out,
-        half *down_out_h,
-        const char *down_base,
-        const half *mid_h,
-        const uint32_t *counts,
-        const uint32_t *offsets,
+template <uint32_t T>
+__global__ static void __launch_bounds__(256) moe_gate_up_iq2_tile_wmma_kernel(
+        half *mid_h,
+        const char *gate_base,
+        const char *up_base,
+        const half *x_h,
+        const float *weights,
         const uint32_t *pairs,
-        const uint32_t *active_experts,
-        uint32_t active_count,
-        uint32_t expert_mid_dim,
-        uint32_t out_dim,
-        uint64_t down_expert_bytes,
-        uint64_t down_row_bytes) {
-    constexpr uint32_t BM = 64u, BN = 64u, BK = 64u;
-    constexpr uint32_t ROW_TILES = BN / 32u;   /* 16-row tiles per wave */
-    constexpr uint32_t A_STRIDE = BK + 8u;
-    constexpr uint32_t B_STRIDE = BK + 8u;
-    constexpr uint32_t RAW_DWORDS = 84u / 4u;
-    constexpr uint32_t W_WORDS = (BN * RAW_DWORDS + 255u) / 256u;
-    const uint32_t active = (uint32_t)blockIdx.z;
-    if (active >= active_count) return;
-    const uint32_t expert = active_experts[active];
-    const uint32_t count = counts[expert];
-    const uint32_t m0 = (uint32_t)blockIdx.y * BM;
-    if (m0 >= count) return;
-    const uint32_t n0 = (uint32_t)blockIdx.x * BN;
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint64_t expert_bytes,
+        uint32_t row_bytes,
+        uint32_t n_expert,
+        float clamp,
+        const uint32_t *tiles) {
+    constexpr uint32_t BM = T * 16u;
+    constexpr uint32_t BN = 256u;                 /* rows of each matrix per block */
+    constexpr uint32_t BK = 64u;
+    constexpr uint32_t A_STRIDE = BK + 8u;        /* odd multiple of 16 bytes: no LDS bank conflicts */
+    constexpr uint32_t WG = T <= 3u ? 4u : 1u;    /* groups per weight fetch */
+    constexpr uint32_t SPAN = WG < 2u ? 2u : WG;  /* groups per unrolled loop body */
+    const uint32_t expert = tiles[2u * blockIdx.y];
+    const uint32_t first = tiles[2u * blockIdx.y + 1u] & 0x00ffffffu;
+    const uint32_t count = (tiles[2u * blockIdx.y + 1u] >> 24u) + 1u;
     const uint32_t tid = threadIdx.x;
     const uint32_t wave = tid >> 5u;
     const uint32_t lane = tid & 31u;
     const uint32_t lane16 = lane & 15u;
     const uint32_t lane_hi = lane >> 4u;
+    const uint32_t row0 = (uint32_t)blockIdx.x * BN + wave * 32u + lane16;
 
     __shared__ __align__(16) half shA[BM * A_STRIDE];
-    __shared__ __align__(16) half shB[BN * B_STRIDE];
-    __shared__ uint32_t shW[BN * RAW_DWORDS];
-    __shared__ uint32_t shPair[BM];
+    __shared__ __align__(16) uint4 shGrid[256];
 
-    if (tid < BM) {
-        const uint32_t bucket_row = m0 + tid;
-        shPair[tid] = bucket_row < count ? pairs[offsets[expert] + bucket_row] : UINT32_MAX;
+    {
+        const uint64_t grid = cuda_iq2xxs_grid[tid];
+        union {
+            uint4 u;
+            half h[8];
+        } v;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) v.h[j] = __float2half((float)((grid >> (8u * j)) & 0xffu));
+        shGrid[tid] = v.u;
     }
-    __syncthreads();
-    const uint32_t tok_tile = wave & 3u;
-    const uint32_t row_tile0 = (wave >> 2u) * ROW_TILES;
+
+    /* Thread tid stages 16 activations of token tid / 4 per chunk. */
     const uint32_t stage_row = tid >> 2u;
-    const uint32_t stage_q = tid & 3u;
-    const uint32_t stage_pair = shPair[stage_row];
-    ds4_q8_float8_t acc[ROW_TILES];
-#pragma unroll
-    for (uint32_t r = 0; r < ROW_TILES; r++) {
-#pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) acc[r][j] = 0.0f;
-    }
-    const unsigned char *w_expert = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+    const half *a_src = stage_row < count ?
+        x_h + (uint64_t)(pairs[first + stage_row] / n_expert) * in_dim + (tid & 3u) * 16u : NULL;
+    uint4 *a_dst = reinterpret_cast<uint4 *>(shA + (stage_row % BM) * A_STRIDE + (tid & 3u) * 16u);
+    /* This lane's row of each matrix: the low half of the wave decodes the
+     * first 16 rows and the high half the next 16. */
+    const unsigned char *w_src[2];
+    w_src[0] = (const unsigned char *)gate_base + (uint64_t)expert * expert_bytes +
+               (uint64_t)(row0 + lane_hi * 16u) * row_bytes;
+    w_src[1] = (const unsigned char *)up_base + (uint64_t)expert * expert_bytes +
+               (uint64_t)(row0 + lane_hi * 16u) * row_bytes;
 
-    /* Global loads for the next chunk are issued before the current chunk's
-     * barrier and MMAs so their latency overlaps the compute. */
+    /* Global loads run one step ahead of their use so their latency overlaps
+     * the compute. */
     uint4 a_pre[2];
-    uint32_t w_pre[W_WORDS];
+    ds4_iq2_xxs_group w_pre[2][WG], w_cur[2][WG];
+    uint32_t d_pre[2];
+    float d[2], scale[4];
     auto load_a = [&](uint32_t k0) {
         a_pre[0] = make_uint4(0u, 0u, 0u, 0u);
         a_pre[1] = a_pre[0];
-        if (stage_pair != UINT32_MAX) {
-            const uint4 *src = reinterpret_cast<const uint4 *>(
-                    mid_h + (uint64_t)stage_pair * expert_mid_dim + k0 + stage_q * 16u);
+        if (a_src && stage_row < BM) {
+            const uint4 *src = reinterpret_cast<const uint4 *>(a_src + k0);
             a_pre[0] = src[0];
             a_pre[1] = src[1];
         }
     };
-    auto load_w = [&](uint32_t kb) {
+    auto load_w = [&](uint32_t k0) {
 #pragma unroll
-        for (uint32_t i = 0; i < W_WORDS; i++) {
-            const uint32_t j = tid + i * 256u;
-            uint32_t v = 0u;
-            if (j < BN * RAW_DWORDS) {
-                const uint32_t row_local = j / RAW_DWORDS;
-                const uint32_t word = j - row_local * RAW_DWORDS;
-                const uint32_t row = n0 + row_local;
-                if (row < out_dim) {
-                    v = *reinterpret_cast<const uint32_t *>(
-                            w_expert + (uint64_t)row * down_row_bytes + (uint64_t)(kb >> 8u) * 84u + word * 4u);
-                }
+        for (uint32_t m = 0; m < 2u; m++) {
+            const unsigned char *blk = w_src[m] + (k0 >> 8u) * 66u;
+            if ((k0 & 255u) == 0u) d_pre[m] = *reinterpret_cast<const uint16_t *>(blk);
+#pragma unroll
+            for (uint32_t i = 0; i < WG; i++) {
+                w_pre[m][i] = *reinterpret_cast<const ds4_iq2_xxs_group *>(
+                        blk + 2u + (((k0 & 255u) >> 5u) + i) * 8u);
             }
-            w_pre[i] = v;
         }
     };
-    load_w(0u);
     load_a(0u);
+    load_w(0u);
 
-    for (uint32_t kb = 0; kb < expert_mid_dim; kb += 256u) {
+    /* acc[2 * m + h]: matrix m, row tile h of this wave. */
+    ds4_q8_float8_t acc[4][T];
 #pragma unroll
-        for (uint32_t i = 0; i < W_WORDS; i++) {
-            const uint32_t j = tid + i * 256u;
-            if (j < BN * RAW_DWORDS) shW[j] = w_pre[i];
+    for (uint32_t rt = 0; rt < 4u; rt++) {
+        scale[rt] = 1.0f;
+#pragma unroll
+        for (uint32_t t = 0; t < T; t++) {
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[rt][t][j] = 0.0f;
         }
-        __syncthreads();
-        if (kb + 256u < expert_mid_dim) load_w(kb + 256u);
-        for (uint32_t kc = 0; kc < 4u && kb + kc * BK < expert_mid_dim; kc++) {
-            const uint32_t k0 = kb + kc * BK;
-            {
-                uint4 *dst = reinterpret_cast<uint4 *>(shA + stage_row * A_STRIDE + stage_q * 16u);
-                dst[0] = a_pre[0];
-                dst[1] = a_pre[1];
+    }
+
+    for (uint32_t kb = 0; kb < in_dim; kb += SPAN * 32u) {
+#pragma unroll
+        for (uint32_t gi = 0; gi < SPAN; gi++) {
+            const uint32_t kg = kb + gi * 32u;
+            if ((gi & 1u) == 0u) {
+                __syncthreads();
+                if (stage_row < BM) {
+                    a_dst[0] = a_pre[0];
+                    a_dst[1] = a_pre[1];
+                }
+                __syncthreads();
+                if (kg + BK < in_dim) load_a(kg + BK);
             }
-            if (k0 + BK < expert_mid_dim) load_a(k0 + BK);
-            /* Sub-block g of the superblock: 16 values sharing one 4-bit scale
-             * and min; its 2-bit codes sit in 16 consecutive qs bytes. */
-            const uint32_t g = (kc * BK + stage_q * 16u) >> 4u;
-            const uint32_t within = g & 7u;
-            const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
-            const uint32_t shift = (within >> 1u) * 2u;
+            if (gi % WG == 0u) {
 #pragma unroll
-            for (uint32_t rb = 0; rb < BN; rb += 64u) {
-                const uint32_t row_local = rb + stage_row;
-                const unsigned char *blk = reinterpret_cast<const unsigned char *>(shW + row_local * RAW_DWORDS);
-                const float d = dev_f16_to_f32((uint16_t)blk[80] | ((uint16_t)blk[81] << 8));
-                const float dm = dev_f16_to_f32((uint16_t)blk[82] | ((uint16_t)blk[83] << 8));
-                const float ds = d * (float)(blk[g] & 0x0fu);
-                const float dmm = dm * (float)(blk[g] >> 4u);
-                const uint32_t *qs = reinterpret_cast<const uint32_t *>(blk + 16u + qbase);
-                union {
-                    uint4 u[2];
-                    half h[16];
-                } out;
+                for (uint32_t m = 0; m < 2u; m++) {
+                    if ((kg & 255u) == 0u) d[m] = dev_f16_to_f32((uint16_t)d_pre[m]);
 #pragma unroll
-                for (uint32_t w = 0; w < 4u; w++) {
-                    const uint32_t word = qs[w];
+                    for (uint32_t i = 0; i < WG; i++) w_cur[m][i] = w_pre[m][i];
+                }
+                if (kg + WG * 32u < in_dim) load_w(kg + WG * 32u);
+            }
 #pragma unroll
-                    for (uint32_t b = 0; b < 4u; b++) {
-                        const float q = (float)(((word >> (8u * b)) >> shift) & 3u);
-                        out.h[w * 4u + b] = __float2half(ds * q - dmm);
+            for (uint32_t m = 0; m < 2u; m++) {
+                /* A zero block scale contributes nothing either way; keep
+                 * the ratio finite. */
+                float s = d[m] * (float)(2u * (w_cur[m][gi % WG].aux >> 28u) + 1u) * 0.125f;
+                if (s == 0.0f) s = 1.0e-20f;
+                const float s_other = __uint_as_float(wave_swap_halves(__float_as_uint(s)));
+#pragma unroll
+                for (uint32_t h = 0; h < 2u; h++) {
+                    const float s_rt = lane_hi == h ? s : s_other;
+                    const float ratio = scale[2u * m + h] / s_rt;
+                    scale[2u * m + h] = s_rt;
+#pragma unroll
+                    for (uint32_t t = 0; t < T; t++) {
+#pragma unroll
+                        for (uint32_t j = 0; j < 8u; j++) acc[2u * m + h][t][j] *= ratio;
                     }
                 }
-                uint4 *dst = reinterpret_cast<uint4 *>(shB + row_local * B_STRIDE + stage_q * 16u);
-                dst[0] = out.u[0];
-                dst[1] = out.u[1];
             }
-            __syncthreads();
 #pragma unroll
-            for (uint32_t ks = 0; ks < BK / 16u; ks++) {
-                const ds4_q8_half16_t a = lds_load_half16(shA + (tok_tile * 16u + lane16) * A_STRIDE + ks * 16u);
+            for (uint32_t ks = 0; ks < 2u; ks++) {
+                ds4_q8_half16_t a[T];
 #pragma unroll
-                for (uint32_t r = 0; r < ROW_TILES; r++) {
-                    const ds4_q8_half16_t b = lds_load_half16(
-                            shB + ((row_tile0 + r) * 16u + lane16) * B_STRIDE + ks * 16u);
-                    acc[r] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[r]);
+                for (uint32_t t = 0; t < T; t++) {
+                    a[t] = lds_load_half16(shA + (t * 16u + lane16) * A_STRIDE + (gi & 1u) * 32u + ks * 16u);
+                }
+#pragma unroll
+                for (uint32_t m = 0; m < 2u; m++) {
+                    const ds4_iq2_xxs_group w = w_cur[m][gi % WG];
+                    uint32_t own[8], other[8];
+#pragma unroll
+                    for (uint32_t l = 0; l < 2u; l++) {
+                        const uint4 mag = shGrid[(w.idx >> (16u * ks + 8u * l)) & 0xffu];
+                        /* Seven stored sign bits plus their parity, spread
+                         * to the sign bits of the eight halves: bits 2j and
+                         * 2j+1 land on bits 15 and 31 of word j. */
+                        const uint32_t f = (w.aux >> (14u * ks + 7u * l)) & 0x7fu;
+                        const uint32_t s8 = f | ((__popc(f) & 1u) << 7u);
+                        own[4u * l + 0u] = mag.x ^ ((s8 * 0x40008000u) & 0x80008000u);
+                        own[4u * l + 1u] = mag.y ^ (((s8 >> 2u) * 0x40008000u) & 0x80008000u);
+                        own[4u * l + 2u] = mag.z ^ (((s8 >> 4u) * 0x40008000u) & 0x80008000u);
+                        own[4u * l + 3u] = mag.w ^ (((s8 >> 6u) * 0x40008000u) & 0x80008000u);
+                    }
+                    /* The swap has to run on every lane: it stays outside
+                     * the select, whose arms only half the lanes evaluate. */
+#pragma unroll
+                    for (uint32_t i = 0; i < 8u; i++) other[i] = wave_swap_halves(own[i]);
+#pragma unroll
+                    for (uint32_t h = 0; h < 2u; h++) {
+                        union {
+                            uint32_t u[8];
+                            ds4_q8_half16_t v;
+                        } b;
+#pragma unroll
+                        for (uint32_t i = 0; i < 8u; i++) b.u[i] = lane_hi == h ? own[i] : other[i];
+#pragma unroll
+                        for (uint32_t t = 0; t < T; t++) {
+                            acc[2u * m + h][t] =
+                                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[t], b.v, acc[2u * m + h][t]);
+                        }
+                    }
                 }
             }
-            __syncthreads();
         }
     }
 
 #pragma unroll
-    for (uint32_t j = 0; j < 8u; j++) {
-        const uint32_t pair = shPair[tok_tile * 16u + 2u * j + lane_hi];
-        if (pair == UINT32_MAX) continue;
+    for (uint32_t t = 0; t < T; t++) {
 #pragma unroll
-        for (uint32_t r = 0; r < ROW_TILES; r++) {
-            const uint32_t row = n0 + (row_tile0 + r) * 16u + lane16;
-            if (row >= out_dim) continue;
-            if (OUT_F16) {
-                down_out_h[(uint64_t)pair * out_dim + row] = __float2half(acc[r][j]);
-            } else {
-                down_out[(uint64_t)pair * out_dim + row] = acc[r][j];
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t tok = t * 16u + 2u * j + lane_hi;
+            if (tok >= count) continue;
+            const uint32_t pair = pairs[first + tok];
+            const float weight = weights[pair];
+#pragma unroll
+            for (uint32_t h = 0; h < 2u; h++) {
+                /* Same SwiGLU as moe_swiglu_weighted_f32_kernel. */
+                float g = acc[h][t][j] * scale[h];
+                float u = acc[2u + h][t][j] * scale[2u + h];
+                g = isfinite(g) ? g : 0.0f;
+                u = isfinite(u) ? u : 0.0f;
+                if (clamp > 1.0e-6f) {
+                    g = fminf(g, clamp);
+                    u = fminf(fmaxf(u, -clamp), clamp);
+                }
+                mid_h[(uint64_t)pair * mid_dim + row0 + h * 16u] =
+                    __float2half((g / (1.0f + expf(-g))) * u * weight);
+            }
+        }
+    }
+}
+
+/* Half of a Q2_K block of one weight row, as moe_down_q2K_tile_wmma_kernel
+ * fetches it: the eight sub-block scale bytes, the 32 code bytes they share
+ * and the block scales.  Sub-block w of the half reads its 16 two-bit codes
+ * from bit 2 * (w / 2) of the 16 bytes at qs + 16 * (w & 1). */
+struct ds4_q2k_half {
+    uint32_t scales[2];
+    uint32_t qs[8];
+    uint32_t d;         /* d | dmin << 16, both F16 */
+};
+
+/* Q2_K down projection for resident prefill, on the tiles and the layout of
+ * moe_gate_up_iq2_tile_wmma_kernel: one block computes T*16 pairs of one
+ * expert against 512 rows, the F16 mid rows go through LDS once per 64-wide
+ * K chunk, and every wave dequantizes its own 64 rows into the B operand,
+ * one lane per row with the other half of each tile pair taken from the
+ * opposite half of the wave.  A sub-block is one 16-wide WMMA step, so its
+ * scale and minimum are folded into the 16 weights the lane converts.
+ *
+ * Weights are fetched half a block of a row at a time, which reads every
+ * cache line once.  Narrow tiles have the registers to fetch one step ahead. */
+template <uint32_t T>
+__global__ static void __launch_bounds__(256) moe_down_q2K_tile_wmma_kernel(
+        half *down_h,
+        const char *down_base,
+        const half *mid_h,
+        const uint32_t *pairs,
+        uint32_t mid_dim,
+        uint32_t out_dim,
+        uint64_t expert_bytes,
+        uint32_t row_bytes,
+        const uint32_t *tiles) {
+    constexpr uint32_t BM = T * 16u;
+    constexpr uint32_t BN = 512u;                 /* rows per block */
+    constexpr uint32_t BK = 64u;
+    constexpr uint32_t A_STRIDE = BK + 8u;        /* odd multiple of 16 bytes: no LDS bank conflicts */
+    constexpr bool W_AHEAD = T <= 2u;
+    const uint32_t expert = tiles[2u * blockIdx.y];
+    const uint32_t first = tiles[2u * blockIdx.y + 1u] & 0x00ffffffu;
+    const uint32_t count = (tiles[2u * blockIdx.y + 1u] >> 24u) + 1u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t lane_hi = lane >> 4u;
+    const uint32_t row0 = (uint32_t)blockIdx.x * BN + wave * 64u + lane16;
+
+    __shared__ __align__(16) half shA[BM * A_STRIDE];
+
+    /* Thread tid stages 16 activations of pair tid / 4 per chunk. */
+    const uint32_t stage_row = tid >> 2u;
+    const half *a_src = stage_row < count ?
+        mid_h + (uint64_t)pairs[first + stage_row] * mid_dim + (tid & 3u) * 16u : NULL;
+    uint4 *a_dst = reinterpret_cast<uint4 *>(shA + (stage_row % BM) * A_STRIDE + (tid & 3u) * 16u);
+    /* This lane's row of the wave's first tile pair; the second pair is 32
+     * rows on. */
+    const unsigned char *w_src = (const unsigned char *)down_base + (uint64_t)expert * expert_bytes +
+                                 (uint64_t)(row0 + lane_hi * 16u) * row_bytes;
+
+    uint4 a_pre[2];
+    ds4_q2k_half w_pre[2], w_cur[2];
+    auto load_a = [&](uint32_t k0) {
+        a_pre[0] = make_uint4(0u, 0u, 0u, 0u);
+        a_pre[1] = a_pre[0];
+        if (a_src && stage_row < BM) {
+            const uint4 *src = reinterpret_cast<const uint4 *>(a_src + k0);
+            a_pre[0] = src[0];
+            a_pre[1] = src[1];
+        }
+    };
+    auto load_w = [&](ds4_q2k_half *w, uint32_t k0) {
+#pragma unroll
+        for (uint32_t p = 0; p < 2u; p++) {
+            const uint32_t *blk = reinterpret_cast<const uint32_t *>(
+                    w_src + p * 32u * row_bytes + (k0 >> 8u) * 84u);
+            const uint32_t half = (k0 >> 7u) & 1u;
+#pragma unroll
+            for (uint32_t i = 0; i < 2u; i++) w[p].scales[i] = blk[half * 2u + i];
+#pragma unroll
+            for (uint32_t i = 0; i < 8u; i++) w[p].qs[i] = blk[4u + half * 8u + i];
+            w[p].d = blk[20];
+        }
+    };
+    load_a(0u);
+    if (W_AHEAD) load_w(w_pre, 0u);
+
+    ds4_q8_float8_t acc[4][T];
+#pragma unroll
+    for (uint32_t rt = 0; rt < 4u; rt++) {
+#pragma unroll
+        for (uint32_t t = 0; t < T; t++) {
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) acc[rt][t][j] = 0.0f;
+        }
+    }
+
+    for (uint32_t kb = 0; kb < mid_dim; kb += 128u) {
+        if (W_AHEAD) {
+#pragma unroll
+            for (uint32_t p = 0; p < 2u; p++) w_cur[p] = w_pre[p];
+            if (kb + 128u < mid_dim) load_w(w_pre, kb + 128u);
+        } else {
+            load_w(w_cur, kb);
+        }
+#pragma unroll
+        for (uint32_t w = 0; w < 8u; w++) {
+            if ((w & 3u) == 0u) {
+                const uint32_t k0 = kb + w * 16u;
+                __syncthreads();
+                if (stage_row < BM) {
+                    a_dst[0] = a_pre[0];
+                    a_dst[1] = a_pre[1];
+                }
+                __syncthreads();
+                if (k0 + BK < mid_dim) load_a(k0 + BK);
+            }
+            ds4_q8_half16_t a[T];
+#pragma unroll
+            for (uint32_t t = 0; t < T; t++) {
+                a[t] = lds_load_half16(shA + (t * 16u + lane16) * A_STRIDE + (w & 3u) * 16u);
+            }
+#pragma unroll
+            for (uint32_t p = 0; p < 2u; p++) {
+                const uint32_t sc = (w_cur[p].scales[w >> 2u] >> (8u * (w & 3u))) & 0xffu;
+                const float ds = dev_f16_to_f32((uint16_t)w_cur[p].d) * (float)(sc & 0x0fu);
+                const float dmm = dev_f16_to_f32((uint16_t)(w_cur[p].d >> 16u)) * (float)(sc >> 4u);
+                union {
+                    uint32_t u[8];
+                    ds4_q8_half16_t v;
+                } own;
+                uint32_t other[8];
+#pragma unroll
+                for (uint32_t i = 0; i < 16u; i++) {
+                    const uint32_t q = (w_cur[p].qs[(w & 1u) * 4u + (i >> 2u)] >> (8u * (i & 3u) + (w >> 1u) * 2u)) & 3u;
+                    own.v[i] = (_Float16)(ds * (float)q - dmm);
+                }
+                /* The swap has to run on every lane: it stays outside the
+                 * select, whose arms only half the lanes evaluate. */
+#pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) other[i] = wave_swap_halves(own.u[i]);
+#pragma unroll
+                for (uint32_t h = 0; h < 2u; h++) {
+                    union {
+                        uint32_t u[8];
+                        ds4_q8_half16_t v;
+                    } b;
+#pragma unroll
+                    for (uint32_t i = 0; i < 8u; i++) b.u[i] = lane_hi == h ? own.u[i] : other[i];
+#pragma unroll
+                    for (uint32_t t = 0; t < T; t++) {
+                        acc[2u * p + h][t] =
+                            __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[t], b.v, acc[2u * p + h][t]);
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (uint32_t t = 0; t < T; t++) {
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t tok = t * 16u + 2u * j + lane_hi;
+            if (tok >= count) continue;
+            const uint32_t pair = pairs[first + tok];
+#pragma unroll
+            for (uint32_t rt = 0; rt < 4u; rt++) {
+                down_h[(uint64_t)pair * out_dim + row0 + rt * 16u] = __float2half(acc[rt][t][j]);
             }
         }
     }

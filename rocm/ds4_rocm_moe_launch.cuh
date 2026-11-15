@@ -228,40 +228,6 @@ static int routed_moe_q2_float_down_launch(
         return 0;
     }
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    /* Prefill batches whose SwiGLU wrote every routed mid row as F16 in place
-     * (mid_f16_only in routed_moe_launch): one tiled WMMA kernel over every
-     * expert that received tokens.  The other F16 mid producers fill only
-     * the hot experts, so they keep the hot/cold split below. */
-    if ((const void *)mid_h_hot == mid->ptr && n_tokens >= 128u && hot_experts_dev && !g_quality_mode &&
-        (expert_mid_dim % 64u) == 0u && (out_dim % 64u) == 0u) {
-        uint32_t h_active[DS4_ROCM_MAX_N_EXPERT];
-        uint32_t active_count = 0u;
-        uint32_t active_max = 0u;
-        for (uint32_t e = 0; e < n_total_expert; e++) {
-            if (h_counts[e] == 0u) continue;
-            h_active[active_count++] = e;
-            if (h_counts[e] > active_max) active_max = h_counts[e];
-        }
-        if (active_count == 0u) return 1;
-        if (!cuda_ok(cudaMemcpy(hot_experts_dev, h_active, active_count * sizeof(uint32_t),
-                                cudaMemcpyHostToDevice),
-                     "routed_moe q2 tile down active copy")) {
-            return 0;
-        }
-        half *down_h = (half *)down->ptr;
-        const dim3 grid(out_dim / 64u, (active_max + 63u) / 64u, active_count);
-        moe_down_q2K_tile_wmma_kernel<true><<<grid, 256>>>(
-                NULL, down_h, down_w, mid_h_hot, counts, offsets, sorted_pairs,
-                hot_experts_dev, active_count, expert_mid_dim, out_dim,
-                down_expert_bytes, down_row_bytes);
-        if (!cuda_ok(cudaGetLastError(), "routed_moe q2 tile down launch")) return 0;
-        const uint64_t n2 = (uint64_t)n_tokens * (out_dim >> 1u);
-        moe_sum_f16x2_kernel<<<(uint32_t)((n2 + 255u) / 256u), 256>>>(
-                (float *)out->ptr, down_h, out_dim, n_expert, n_tokens);
-        return cuda_ok(cudaGetLastError(), "routed_moe q2 tile down sum launch");
-    }
-#endif
     /* The prefill SwiGLU wrote mid as F16 in place; nothing below can read it. */
     if ((const void *)mid_h_hot == mid->ptr) return 0;
 
@@ -516,6 +482,73 @@ typedef struct {
     uint64_t gate_bytes;
     uint64_t down_bytes;
 } routed_moe_launch_plan;
+
+/* Token tiles of the resident IQ2_XXS/Q2_K prefill kernels: every expert
+ * bucket of the sorted pair list cut into runs of at most 64 pairs, listed
+ * by width in 16-pair units so each width gets its own kernel launch.  The
+ * four lists share one device buffer, list w at 2 * w * max_tiles; a tile
+ * is (expert, first sorted pair | (pairs - 1) << 24). */
+struct routed_moe_token_tiles {
+    const uint32_t *dev;
+    uint32_t max_tiles;
+    uint32_t n[4];
+};
+
+/* Every bucket ends in at most one partial tile. */
+static uint32_t routed_moe_token_tiles_max(uint32_t pair_count, uint32_t n_total_expert) {
+    return pair_count / 64u + n_total_expert;
+}
+
+static uint64_t routed_moe_token_tiles_bytes(uint32_t pair_count, uint32_t n_total_expert) {
+    return (uint64_t)4u * 2u * routed_moe_token_tiles_max(pair_count, n_total_expert) * sizeof(uint32_t);
+}
+
+static int routed_moe_token_tiles_build(
+        routed_moe_token_tiles *tt,
+        uint32_t *tiles_dev,
+        const uint32_t *counts,
+        uint32_t pair_count,
+        uint32_t n_total_expert) {
+    uint32_t h_counts[DS4_ROCM_MAX_N_EXPERT];
+    if (n_total_expert > DS4_ROCM_MAX_N_EXPERT ||
+        !cuda_ok(cudaMemcpy(h_counts, counts, n_total_expert * sizeof(uint32_t), cudaMemcpyDeviceToHost),
+                 "routed_moe token tile counts copy")) {
+        return 0;
+    }
+    tt->max_tiles = routed_moe_token_tiles_max(pair_count, n_total_expert);
+    tt->dev = tiles_dev;
+    std::vector<uint32_t> h_tiles((size_t)4u * 2u * tt->max_tiles);
+    uint32_t first = 0u;
+    for (uint32_t w = 0; w < 4u; w++) tt->n[w] = 0u;
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        for (uint32_t left = h_counts[e]; left != 0u; ) {
+            const uint32_t n = left < 64u ? left : 64u;
+            const uint32_t w = (n - 1u) / 16u;
+            uint32_t *tile = h_tiles.data() + ((size_t)w * tt->max_tiles + tt->n[w]++) * 2u;
+            tile[0] = e;
+            tile[1] = first | ((n - 1u) << 24u);
+            first += n;
+            left -= n;
+        }
+    }
+    return cuda_ok(cudaMemcpy(tiles_dev, h_tiles.data(), h_tiles.size() * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice),
+                   "routed_moe token tile list copy");
+}
+
+/* One launch of KERNEL<T> per tile width T with tiles to run. */
+#define DS4_ROCM_MOE_TILE_LAUNCH(KERNEL, tt, rows, ...) \
+    do { \
+        const routed_moe_token_tiles *tt_ = (tt); \
+        const uint32_t *list_ = tt_->dev; \
+        if (tt_->n[0] != 0u) KERNEL<1u><<<dim3((rows), tt_->n[0], 1u), 256>>>(__VA_ARGS__, list_); \
+        list_ += 2u * tt_->max_tiles; \
+        if (tt_->n[1] != 0u) KERNEL<2u><<<dim3((rows), tt_->n[1], 1u), 256>>>(__VA_ARGS__, list_); \
+        list_ += 2u * tt_->max_tiles; \
+        if (tt_->n[2] != 0u) KERNEL<3u><<<dim3((rows), tt_->n[2], 1u), 256>>>(__VA_ARGS__, list_); \
+        list_ += 2u * tt_->max_tiles; \
+        if (tt_->n[3] != 0u) KERNEL<4u><<<dim3((rows), tt_->n[3], 1u), 256>>>(__VA_ARGS__, list_); \
+    } while (0)
 
 static int routed_moe_build_plan(
         const ds4_gpu_tensor *out,
@@ -1230,12 +1263,18 @@ static int routed_moe_launch(
              use_rocm_mmq_gateup) &&
             (out_dim & 1u) == 0u && !g_quality_mode;
         half *iq2_hot_mid_h = use_iq2_hot_f16_mid ? (half *)gate->ptr : NULL;
-        /* Prefill batches feed the tiled F16 down kernel only, so SwiGLU can
-         * write mid as F16 in place instead of F32 plus a conversion pass. */
-        const int mid_f16_only =
-            use_rocm_mmq_gateup && use_iq2_hot_f16_mid && n_tokens >= 128u && tile_experts &&
-            (expert_mid_dim % 64u) == 0u && (out_dim % 64u) == 0u;
-        if (mid_f16_only) iq2_hot_mid_h = (half *)mid->ptr;
+        /* Resident prefill batches of whole IQ2_XXS and Q2_K blocks run the
+         * tiled WMMA kernels, which pass mid as F16 only.  The MMQ pair is
+         * left for the shapes they do not cover. */
+        const int use_token_tiles =
+            use_rocm_mmq_gateup && use_iq2_hot_f16_mid && sorted_pairs && sorted_counts &&
+            pair_count < (1u << 24u) &&
+            (expert_in_dim % 256u) == 0u && gate_row_bytes == (uint64_t)(expert_in_dim / 256u) * 66u &&
+            (expert_mid_dim % 256u) == 0u && down_row_bytes == (uint64_t)(expert_mid_dim / 256u) * 84u &&
+            (out_dim % 512u) == 0u &&
+            up->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(half) &&
+            gate->bytes >= routed_moe_token_tiles_bytes(pair_count, n_total_expert);
+        if (use_token_tiles) iq2_hot_mid_h = (half *)mid->ptr;
         const int use_iq2_x_f16 = use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
             up->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(half);
         half *iq2_x_h = use_iq2_x_f16 ? (half *)up->ptr : NULL;
@@ -1245,7 +1284,25 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 gate x f16 launch");
         }
         int mmq_gateup_done = 0;
-        if (ok && use_rocm_mmq_gateup) {
+        int token_tiles_done = 0;
+        routed_moe_token_tiles token_tiles;
+        if (ok && use_token_tiles) {
+            /* gate and up are scratch here: the tile lists and the F16
+             * activations.  mid receives the weighted SwiGLU as F16. */
+            const uint64_t xh_count = (uint64_t)n_tokens * expert_in_dim;
+            token_tiles_done = routed_moe_token_tiles_build(
+                    &token_tiles, (uint32_t *)gate->ptr, sorted_counts, pair_count, n_total_expert);
+            if (token_tiles_done) {
+                f32_to_f16_kernel<<<(uint32_t)((xh_count + 255u) / 256u), 256>>>(
+                        (half *)up->ptr, (const float *)x->ptr, xh_count);
+                DS4_ROCM_MOE_TILE_LAUNCH(
+                        moe_gate_up_iq2_tile_wmma_kernel, &token_tiles, expert_mid_dim / 256u,
+                        iq2_hot_mid_h, gate_w, up_w, (const half *)up->ptr, (const float *)weights->ptr,
+                        sorted_pairs, expert_in_dim, expert_mid_dim, gate_expert_bytes,
+                        (uint32_t)gate_row_bytes, n_expert, clamp);
+                token_tiles_done = cuda_ok(cudaGetLastError(), "routed_moe iq2 tile gate/up launch");
+            }
+        } else if (ok && use_rocm_mmq_gateup) {
             int mmq_rc = ds4_mmq_init(0) == 0 ? 0 : -1;
             /* The gfx1151 MMQ pair is stable through 2048 token rows. Tile
              * larger prefills instead of letting its flattened assignment
@@ -1275,22 +1332,14 @@ static int routed_moe_launch(
             }
             if (mmq_rc == 0) {
                 const uint64_t mid_count = pair_count64 * expert_mid_dim;
-                if (mid_f16_only) {
-                    moe_swiglu_weighted_f16_kernel<<<
-                        (uint32_t)((mid_count + 255u) / 256u), 256>>>(
-                        iq2_hot_mid_h, (const float *)gate->ptr,
-                        (const float *)up->ptr, (const float *)weights->ptr,
-                        mid_count, expert_mid_dim, clamp);
-                } else {
-                    moe_swiglu_weighted_f32_kernel<<<
-                        (uint32_t)((mid_count + 255u) / 256u), 256>>>(
-                        (float *)mid->ptr, (const float *)gate->ptr,
-                        (const float *)up->ptr, (const float *)weights->ptr,
-                        mid_count, expert_mid_dim, clamp);
-                }
+                moe_swiglu_weighted_f32_kernel<<<
+                    (uint32_t)((mid_count + 255u) / 256u), 256>>>(
+                    (float *)mid->ptr, (const float *)gate->ptr,
+                    (const float *)up->ptr, (const float *)weights->ptr,
+                    mid_count, expert_mid_dim, clamp);
                 mmq_gateup_done = cuda_ok(
                     cudaGetLastError(), "routed_moe MMQ gate/up epilogue launch");
-                if (mmq_gateup_done && use_iq2_hot_f16_mid && !mid_f16_only) {
+                if (mmq_gateup_done && use_iq2_hot_f16_mid) {
                     f32_to_f16_kernel<<<
                         (uint32_t)((mid_count + 255u) / 256u), 256>>>(
                         iq2_hot_mid_h, (const float *)mid->ptr, mid_count);
@@ -1310,11 +1359,11 @@ static int routed_moe_launch(
                     fprintf(stderr, "ds4: ROCm MMQ IQ2 gate/up returned %d; falling back\n", mmq_rc);
                 }
             }
-            if (!mmq_gateup_done) {
-                /* The fallback gate/up below writes F32 mid only. */
-                use_iq2_hot_f16_mid = 0;
-                iq2_hot_mid_h = NULL;
-            }
+        }
+        if (use_rocm_mmq_gateup && !mmq_gateup_done && !token_tiles_done) {
+            /* The fallback gate/up below writes F32 mid only. */
+            use_iq2_hot_f16_mid = 0;
+            iq2_hot_mid_h = NULL;
         }
         int split_gateup_done = 0;
         if (ok && split_selected) {
@@ -1409,7 +1458,7 @@ static int routed_moe_launch(
                         stream_resident_mask | stream_missing_mask);
             }
         }
-        if (ok && !split_gateup_done && !mmq_gateup_done) {
+        if (ok && !split_gateup_done && !mmq_gateup_done && !token_tiles_done) {
             if (getenv("DS4_ROCM_MOE_PATH_DEBUG") != NULL) {
                 fprintf(stderr,
                         "ds4: moe gate/up launch check: sorted_pairs=%p offsets=%p counts=%p "
@@ -1888,6 +1937,16 @@ static int routed_moe_launch(
                 /* The IQ2 direct-sum kernel writes final token rows. */
             } else if (split_ptr_down_done) {
                 /* The split pointer-table path writes the final token row. */
+            } else if (token_tiles_done) {
+                half *down_h = (half *)down->ptr;
+                DS4_ROCM_MOE_TILE_LAUNCH(
+                        moe_down_q2K_tile_wmma_kernel, &token_tiles, out_dim / 512u,
+                        down_h, down_w, iq2_hot_mid_h, sorted_pairs, expert_mid_dim, out_dim,
+                        down_expert_bytes, (uint32_t)down_row_bytes);
+                const uint64_t n2 = (uint64_t)n_tokens * (out_dim >> 1u);
+                moe_sum_f16x2_kernel<<<(uint32_t)((n2 + 255u) / 256u), 256>>>(
+                        (float *)out->ptr, down_h, out_dim, n_expert, n_tokens);
+                ok = cuda_ok(cudaGetLastError(), "routed_moe q2 tile down launch");
             } else if (use_iq2_q2_float_down) {
                 if (!g_quality_mode &&
                     g_dspark_verify_mode && n_tokens <= 6u &&

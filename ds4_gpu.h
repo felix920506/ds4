@@ -2603,6 +2603,10 @@ int ds4_gpu_attention_output_q4_K_batch_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 
+/* F16 low-rank output projection of a prefill batch.  heads still carry the
+ * tail rotation of the keys; it is undone while they are packed, so the
+ * caller must not run the inverse ds4_gpu_rope_tail_tensor first.  Returns 0
+ * with heads untouched when the backend has no such path. */
 int ds4_gpu_attention_output_q8_batch_f16_tensor(
         ds4_gpu_tensor       *out_h,
         ds4_gpu_tensor       *low,
@@ -2615,7 +2619,17 @@ int ds4_gpu_attention_output_q8_batch_f16_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow);
 
 int ds4_gpu_attention_output_low_q8_tensor(
         ds4_gpu_tensor       *low,
