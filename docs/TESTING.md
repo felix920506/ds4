@@ -30,6 +30,25 @@ make tests/test_session_state_gpu tests/test_glm53_kda tests/test_mxfp4_metal
 that it fits before running it; do not accidentally load a large model on a
 single device during multi-GPU QA. ROCm has `make test-rocm`.
 
+The ROCm DeepSeek Flash Vision Experimental encoder has a float64 reference.
+Encode one image with `DS4_ROCM_VISION_DUMP_DIR` set, then check every
+operation against it:
+
+```sh
+mkdir -p /tmp/vision-dump
+DS4_ROCM_VISION_DUMP_DIR=/tmp/vision-dump ./speed-bench/vision_encode_bench \
+  --passes 0 ds4flash.gguf gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf image.png
+python3 tests/deepseek4_vision_ref.py \
+  gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf /tmp/vision-dump --ops --chain
+```
+
+The dump holds every tensor of the encoder: about 2 GB per thousand image
+patches, 6 GB for the largest images. `--ops` fails when a kernel differs from
+float64 in more than 0.2% of its values; correct kernels are five to a hundred
+times below that. Embeddings of two correct builds cannot be compared bit for
+bit; the script and
+[the encoder notes](../speed-bench/gfx1151-vision-encoder.md) explain why.
+
 Official-vector tests must use continuations from the same checkpoint as the
 GGUF. Flash 0731 and Vision Experimental are not interchangeable fixtures.
 See [test vectors](../tests/test-vectors/README.md) and

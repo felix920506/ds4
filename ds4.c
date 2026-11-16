@@ -76299,6 +76299,72 @@ int ds4_engine_vision_encode_file(
     return ok;
 }
 
+typedef struct {
+    const uint8_t *encoded;
+    size_t encoded_len;
+    ds4_image image;
+    char error[160];
+    int ok;
+} ds4_vision_decode_job;
+
+static void *ds4_vision_decode_thread(void *arg) {
+    ds4_vision_decode_job *job = arg;
+    job->ok = ds4_image_decode_memory(&job->image, job->encoded, job->encoded_len,
+                                      job->error, sizeof(job->error));
+    return NULL;
+}
+
+/* The images of one request.  Each goes through the encoder on its own; what
+ * a request with several images can hide is the CPU side.  A PNG or JPEG
+ * decode costs 10-40 ms and an encoder pass runs for hundreds, so the next
+ * image is decoded on a second thread while the current one is on the GPU.
+ * Only one decode runs at a time and at most two decoded images are alive. */
+int ds4_engine_vision_encode_memory_batch(
+        ds4_engine *e,
+        const uint8_t *const *encoded,
+        const size_t *encoded_len,
+        size_t count,
+        ds4_vision_embedding *out,
+        char *error,
+        size_t error_cap) {
+    if (!encoded || !encoded_len || !out || count == 0) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid vision batch input");
+        return 0;
+    }
+    memset(out, 0, count * sizeof(out[0]));
+    ds4_vision_decode_job job[2] = {{.encoded = encoded[0], .encoded_len = encoded_len[0]}};
+    ds4_vision_decode_thread(&job[0]);
+    int ok = 1;
+    for (size_t i = 0; ok && i < count; i++) {
+        ds4_vision_decode_job *cur = &job[i & 1u], *next = &job[(i + 1u) & 1u];
+        const bool more = i + 1u < count;
+        pthread_t thread;
+        bool ahead = false;
+        if (more) {
+            *next = (ds4_vision_decode_job){.encoded = encoded[i + 1u],
+                                            .encoded_len = encoded_len[i + 1u]};
+            ahead = pthread_create(&thread, NULL, ds4_vision_decode_thread, next) == 0;
+        }
+        if (cur->ok) {
+            ok = ds4_engine_vision_encode_image(e, &cur->image, &out[i], error, error_cap);
+        } else {
+            if (error && error_cap) snprintf(error, error_cap, "%s", cur->error);
+            ok = 0;
+        }
+        ds4_image_free(&cur->image);
+        if (ahead) {
+            if (pthread_join(thread, NULL)) abort();
+        } else if (more) {
+            ds4_vision_decode_thread(next);
+        }
+        if (!ok && more) ds4_image_free(&next->image);
+    }
+    if (!ok) {
+        for (size_t i = 0; i < count; i++) ds4_vision_embedding_free(&out[i]);
+    }
+    return ok;
+}
+
 int ds4_engine_vision_encode_memory(
         ds4_engine *e,
         const uint8_t *encoded,
@@ -76306,11 +76372,9 @@ int ds4_engine_vision_encode_memory(
         ds4_vision_embedding *out,
         char *error,
         size_t error_cap) {
-    ds4_image image = {0};
-    if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
-    int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
-    ds4_image_free(&image);
-    return ok;
+    if (!out) return 0;
+    return ds4_engine_vision_encode_memory_batch(e, &encoded, &encoded_len, 1,
+                                                 out, error, error_cap);
 }
 
 int ds4_engine_tp_vocab_split(ds4_engine *e) {

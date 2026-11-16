@@ -289,6 +289,15 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error,
                                     size_t error_cap);
+/* Encode the images of one request in order, decoding each one while the
+ * previous is being encoded. On failure no embedding is returned. */
+int ds4_engine_vision_encode_memory_batch(ds4_engine *e,
+                                          const uint8_t *const *encoded,
+                                          const size_t *encoded_len,
+                                          size_t count,
+                                          ds4_vision_embedding *out,
+                                          char *error,
+                                          size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,
