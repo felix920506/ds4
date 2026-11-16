@@ -196,6 +196,47 @@ __global__ static void head_rms_norm_rope_tail_kernel(
     }
 }
 
+/* cos and sin of one rotary pair at one position, scaled by the YaRN
+ * magnitude; the sine is negated for the inverse rotation.  Same expressions
+ * as rope_tail_kernel, for kernels that compute the angles of a token once. */
+__device__ __forceinline__ static float2 rope_tail_cos_sin(
+        uint32_t pair,
+        uint32_t pos,
+        uint32_t n_rot,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    float theta_extrap = (float)pos * powf(theta_scale, (float)pair);
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)(pair * 2u)) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float c = cosf(theta) * mscale;
+    const float s = sinf(theta) * mscale;
+    return make_float2(c, inverse ? -s : s);
+}
+
+/* Largest n_rot / 2 the per-token angle table of a kernel holds. */
+#define DS4_ROCM_ROPE_TABLE_PAIRS 256u
+
 __global__ static void head_rms_norm_rope_tail_from_half_kernel(
         float *out,
         const __half *x,

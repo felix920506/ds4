@@ -1066,11 +1066,23 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
     (void)low;
     if (!out_h || !heads || !model_map || !g_cublas_ready || g_quality_mode ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 ||
-        n_tokens < DS4_ROCM_F16_GEMM_MIN_TOKENS) {
+        n_tokens < DS4_ROCM_F16_GEMM_MIN_TOKENS ||
+        head_dim == 0 || group_dim % head_dim != 0 ||
+        n_rot > head_dim || (n_rot & 1u) || n_rot / 2u > DS4_ROCM_ROPE_TABLE_PAIRS) {
         return 0;
     }
     if (g_ssd_streaming_mode && n_tokens > 1u) return 0;
@@ -1102,12 +1114,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
     if (!tmp) return 0;
     __half *heads_h = (__half *)tmp;
     __half *low_h = (__half *)((char *)tmp + low_h_offset);
-    attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255u) / 256u, 256>>>(
+    attention_pack_group_heads_inv_rope_f16_kernel<<<n_tokens, 256>>>(
             heads_h,
             (const float *)heads->ptr,
             n_tokens,
             n_groups,
-            group_dim);
+            (uint32_t)group_dim,
+            head_dim, n_rot, pos0, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow);
     if (!cuda_ok(cudaGetLastError(), "attention_output_f16 heads pack launch")) return 0;
     return hipblaslt_gemm_batched(low_h, HIP_R_16F, (uint32_t)low_dim, out_a_f16, heads_h,
                                   (uint32_t)rank, n_tokens, (uint32_t)group_dim,

@@ -33110,28 +33110,12 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("kqv_out", metal_graph_batch_heads(g),
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(tp_heads ? tp_heads : metal_graph_batch_heads(g),
-                                            tp_rows,
-                                            attn_heads,
-                                            DS4_N_HEAD_DIM,
-                                            DS4_N_ROT,
-                                            pos0 + tp_row0,
-                                            compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                            true,
-                                            freq_base,
-                                            freq_scale,
-                                            ext_factor,
-                                            attn_factor,
-                                            DS4_ROPE_YARN_BETA_FAST,
-                                            DS4_ROPE_YARN_BETA_SLOW) != 0;
-    if (ok) {
-        metal_graph_debug_dump_tensor("kqv_back", metal_graph_batch_heads(g),
-                                      (uint64_t)n_tokens * q_dim, il, pos0);
-    }
-    DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
     const bool attn_out_debug =
+        metal_graph_debug_wants("kqv_back", il, pos0) ||
         metal_graph_debug_wants("attn_low", il, pos0) ||
         metal_graph_debug_wants("attn_out", il, pos0);
+    /* The F16 output projection undoes the tail rotation of the heads as it
+     * packs them; every other path rotates them back in place first. */
     bool attn_out_f16 = false;
     if (ok &&
         !attn_out_debug &&
@@ -33151,9 +33135,38 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_groups,
                                                                     DS4_N_EMBD,
                                                                     metal_graph_batch_heads(g),
-                                                                    n_tokens) != 0;
+                                                                    n_tokens,
+                                                                    DS4_N_HEAD_DIM,
+                                                                    DS4_N_ROT,
+                                                                    pos0,
+                                                                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                                    freq_base,
+                                                                    freq_scale,
+                                                                    ext_factor,
+                                                                    attn_factor,
+                                                                    DS4_ROPE_YARN_BETA_FAST,
+                                                                    DS4_ROPE_YARN_BETA_SLOW) != 0;
     }
     if (!attn_out_f16) {
+        if (ok) ok = ds4_gpu_rope_tail_tensor(tp_heads ? tp_heads : metal_graph_batch_heads(g),
+                                                tp_rows,
+                                                attn_heads,
+                                                DS4_N_HEAD_DIM,
+                                                DS4_N_ROT,
+                                                pos0 + tp_row0,
+                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                                                true,
+                                                freq_base,
+                                                freq_scale,
+                                                ext_factor,
+                                                attn_factor,
+                                                DS4_ROPE_YARN_BETA_FAST,
+                                                DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("kqv_back", metal_graph_batch_heads(g),
+                                          (uint64_t)n_tokens * q_dim, il, pos0);
+        }
+        DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         if (ok && tp_head_split) {
             const uint64_t a_bytes = (uint64_t)n_groups * rank *

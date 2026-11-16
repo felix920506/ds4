@@ -431,6 +431,64 @@ __global__ static void attention_pack_group_heads_f16_kernel(
     dst[gid] = __float2half(heads[((uint64_t)t * n_groups + g) * group_dim + d]);
 }
 
+/* attention_pack_group_heads_f16_kernel for heads that still carry their
+ * tail rotation: one block packs one token and undoes the rotation on the
+ * way, with the token's angles computed once into LDS.  Rotating the F32
+ * heads in place first costs a pass of its own over an eighth of every row,
+ * which is as slow as packing all of it. */
+__global__ static void attention_pack_group_heads_inv_rope_f16_kernel(
+        __half *dst,
+        const float *heads,
+        uint32_t n_tokens,
+        uint32_t n_groups,
+        uint32_t group_dim,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens) return;
+    __shared__ float2 sh_cs[DS4_ROCM_ROPE_TABLE_PAIRS];
+    if (tid < n_rot / 2u) {
+        sh_cs[tid] = rope_tail_cos_sin(tid, pos0 + t, n_rot, n_ctx_orig, 1, freq_base, freq_scale,
+                                       ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+    __syncthreads();
+    const uint32_t n_nope = head_dim - n_rot;
+    for (uint32_t g = 0; g < n_groups; g++) {
+        const float *src = heads + ((uint64_t)t * n_groups + g) * group_dim;
+        __half *out = dst + ((uint64_t)g * n_tokens + t) * group_dim;
+        /* d is e within its head; a group is a whole number of heads. */
+        uint32_t d = tid % head_dim;
+        for (uint32_t e = tid; e < group_dim; e += blockDim.x) {
+            float v;
+            if (d < n_nope) {
+                v = src[e];
+            } else {
+                const uint32_t i = (d - n_nope) & ~1u;
+                const float *tail = src + (e - d) + n_nope;
+                const float2 cs = sh_cs[i >> 1u];
+                const float x0 = tail[i];
+                const float x1 = tail[i + 1u];
+                /* The contraction rope_tail_kernel compiles to, spelled
+                 * out so both give the same bits. */
+                v = ((d - n_nope) & 1u) ? __builtin_fmaf(x0, cs.y, x1 * cs.x) :
+                                          __builtin_fmaf(x0, cs.x, -(x1 * cs.y));
+            }
+            out[e] = __float2half(v);
+            d += blockDim.x;
+            while (d >= head_dim) d -= head_dim;
+        }
+    }
+}
+
 __global__ static void attention_pack_group_heads_f32_kernel(
         float *dst,
         const float *heads,
@@ -1250,6 +1308,7 @@ __global__ static void __launch_bounds__(512, 1) attention_mixed_heads32_wmma_ke
     __shared__ uint32_t indexed_raw_count;
     __shared__ uint32_t indexed_raw_first;
     __shared__ uint32_t indexed_comp_count;
+    __shared__ uint32_t topk_wave_count[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP / 32u];
 
     uint32_t raw_count;
     uint32_t raw_first;
@@ -1265,7 +1324,6 @@ __global__ static void __launch_bounds__(512, 1) attention_mixed_heads32_wmma_ke
         if (tid == 0u) {
             indexed_raw_count = 0u;
             indexed_raw_first = 0u;
-            indexed_comp_count = 0u;
             if (n_raw != 0u) {
                 const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
                 if (qpos >= first_raw_pos) {
@@ -1282,22 +1340,51 @@ __global__ static void __launch_bounds__(512, 1) attention_mixed_heads32_wmma_ke
                     }
                 }
             }
-            for (uint32_t i = 0u;
-                 i < top_k && indexed_comp_count < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
-                 i++) {
-                const int32_t ci = topk[(uint64_t)t * top_k + i];
-                if (ci >= 0 && (uint32_t)ci < visible_comp) {
-                    indexed_comp_rows[indexed_comp_count++] = (uint32_t)ci;
-                }
+        }
+        /* Keep the visible top-k rows in their order, all lanes at once: a
+         * scan by one lane holds the other waves at the barrier for as long
+         * as several key tiles take.  Entry i belongs to thread i % 512; its
+         * slot is the number of kept entries before it, from the kept bits
+         * of its own wave and the per-wave counts in LDS. */
+        constexpr uint32_t PASSES = DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP / 512u;
+        int32_t ci[PASSES];
+        uint32_t kept[PASSES];
+#pragma unroll
+        for (uint32_t p = 0; p < PASSES; p++) {
+            const uint32_t i = p * 512u + tid;
+            ci[p] = i < top_k ? topk[(uint64_t)t * top_k + i] : -1;
+            kept[p] = (uint32_t)(ci[p] >= 0 && (uint32_t)ci[p] < visible_comp) << lane;
+#pragma unroll
+            for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+                kept[p] |= __shfl_xor_sync(FULL_WARP_MASK, kept[p], delta, 32);
             }
+            if (lane == 0u) topk_wave_count[p * 16u + wave] = (uint32_t)__popc(kept[p]);
         }
         __syncthreads();
+        uint32_t before[PASSES];
+#pragma unroll
+        for (uint32_t p = 0; p < PASSES; p++) before[p] = 0u;
+#pragma unroll
+        for (uint32_t j = 0; j < PASSES * 16u; j++) {
+            const uint32_t n = topk_wave_count[j];
+            comp_count += n;
+#pragma unroll
+            for (uint32_t p = 0; p < PASSES; p++) {
+                if (j < p * 16u + wave) before[p] += n;
+            }
+        }
+#pragma unroll
+        for (uint32_t p = 0; p < PASSES; p++) {
+            if ((kept[p] >> lane) & 1u) {
+                indexed_comp_rows[before[p] + (uint32_t)__popc(kept[p] & ((1u << lane) - 1u))] =
+                    (uint32_t)ci[p];
+            }
+        }
         for (uint32_t r = tid; r < indexed_raw_count; r += blockDim.x) {
             indexed_raw_rows[r] = (raw_ring_start + indexed_raw_first + r) % raw_cap;
         }
         raw_count = indexed_raw_count;
         raw_first = 0u;
-        comp_count = indexed_comp_count;
     } else if constexpr (MODE == 2) {
         const uint32_t qpos = pos0 + t;
         const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
