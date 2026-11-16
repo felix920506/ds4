@@ -95,7 +95,9 @@ before adjusting the cache budget.
 
 Both GLM 5.3 Flash and DeepSeek Flash Vision Experimental support images on
 ROCm. Add the matching encoder with `--vision FILE`, as described in
-[models and vision](MODELS.md#vision).
+[models and vision](MODELS.md#vision). The DeepSeek encoder takes 0.11 to
+0.28 s per image on this machine; see the
+[encoder notes](../speed-bench/gfx1151-vision-encoder.md).
 
 For a model-free routed-kernel check, use `make test-mxfp4-rocm`.
 Full-model validation is described in [testing](TESTING.md).

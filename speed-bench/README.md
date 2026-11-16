@@ -27,6 +27,28 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+### Vision encoder
+
+`vision_encode_bench` times the image encoder alone: every image in its own
+call (the latency of a one-image request), then all images in one
+`ds4_engine_vision_encode_memory_batch()` call, the way a request with several
+images reaches the encoder. It opens the language model inspect-only, so a run
+takes seconds, and it fails unless every pass reproduces an image's first
+embedding bit for bit.
+
+```
+make vision-encode-bench-rocm        # Strix Halo; elsewhere: make speed-bench/vision_encode_bench
+./speed-bench/vision_encode_bench \
+  gguf/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf \
+  gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf \
+  tests/vision-fixtures/glm53/*.png tests/vision-fixtures/glm53/earth.jpg \
+  tests/vision-fixtures/qwen38/*.png
+```
+
+`--dump DIR` writes the embeddings as raw F32 for comparing two builds.
+Strix Halo numbers are in
+[gfx1151-vision-encoder.md](gfx1151-vision-encoder.md).
+
 ### Metal decode schedule A/B
 
 Build the balanced, same-engine Metal decode comparison with:

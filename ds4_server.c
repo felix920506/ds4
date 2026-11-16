@@ -717,6 +717,9 @@ static void server_inference_unlock(server *s);
 static bool server_encode_image(server *s, const server_image_input *input,
                                 ds4_vision_embedding *out,
                                 char *err, size_t errlen);
+static bool server_encode_images(server *s, server_image_input **inputs,
+                                 ds4_vision_embedding *out, size_t count,
+                                 char *err, size_t errlen);
 
 typedef struct {
     char *id;
@@ -3693,14 +3696,8 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
             inputs[next++] = &msgs->v[i].images.v[j];
     }
 
-    bool ok = true;
     server_inference_lock(s);
-    for (size_t i = 0; i < count; i++) {
-        if (!server_encode_image(s, inputs[i], &embeddings[i], err, errlen)) {
-            ok = false;
-            break;
-        }
-    }
+    bool ok = server_encode_images(s, inputs, embeddings, count, err, errlen);
     server_inference_unlock(s);
     if (!ok) goto done;
 
@@ -10394,28 +10391,79 @@ static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
 }
 
-/* The caller holds inference_mu across cache lookup and encoder execution. */
-static bool server_encode_image(server *s, const server_image_input *input,
-                                ds4_vision_embedding *out,
-                                char *err, size_t errlen) {
-    if (server_image_cache_get(&s->image_cache, input, out)) {
-        metrics_note_image(true);
-        server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
-        return true;
-    }
-    if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
-                                         input->encoded_len, out, err, errlen))
-        return false;
+static bool server_image_cached(server *s, const server_image_input *input,
+                                ds4_vision_embedding *out) {
+    if (!server_image_cache_get(&s->image_cache, input, out)) return false;
+    metrics_note_image(true);
+    server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
+    return true;
+}
+
+static void server_image_encoded(server *s, const server_image_input *input,
+                                 const ds4_vision_embedding *embedding) {
     /* Row width must match the encoder's allocation: the mmproj projection
      * dim is validated to equal the model's n_embd at load (Qwen3.8 is
      * 2560-wide, not 4096; a wrong width over-reads the source in put). */
-    server_image_cache_put(&s->image_cache, input, out,
+    server_image_cache_put(&s->image_cache, input, embedding,
                             (uint32_t)ds4_engine_embd_dim(s->engine),
                             SERVER_IMAGE_CACHE_BYTES);
     metrics_note_image(false);
     server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding encoded; cache=%zu bytes",
                s->image_cache.bytes);
+}
+
+/* The caller holds inference_mu across cache lookup and encoder execution. */
+static bool server_encode_image(server *s, const server_image_input *input,
+                                ds4_vision_embedding *out,
+                                char *err, size_t errlen) {
+    if (server_image_cached(s, input, out)) return true;
+    if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
+                                         input->encoded_len, out, err, errlen))
+        return false;
+    server_image_encoded(s, input, out);
     return true;
+}
+
+/* All images of one request; out is zeroed and the caller holds inference_mu.
+ * Cache hits are served first.  The first occurrence of every other image
+ * goes to the engine as one batch, so it can decode the next image while it
+ * encodes the current one.  An image repeated inside the request is then a
+ * cache hit, as it was when images were encoded one call at a time. */
+static bool server_encode_images(server *s, server_image_input **inputs,
+                                 ds4_vision_embedding *out, size_t count,
+                                 char *err, size_t errlen) {
+    const uint8_t **encoded = xmalloc(count * sizeof(encoded[0]));
+    size_t *encoded_len = xmalloc(count * sizeof(encoded_len[0]));
+    size_t *miss = xmalloc(count * sizeof(miss[0]));
+    ds4_vision_embedding *fresh = xmalloc(count * sizeof(fresh[0]));
+    size_t misses = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (server_image_cached(s, inputs[i], &out[i])) continue;
+        bool repeat = false;
+        for (size_t j = 0; j < misses && !repeat; j++) {
+            repeat = encoded_len[j] == inputs[i]->encoded_len &&
+                     !memcmp(encoded[j], inputs[i]->encoded, encoded_len[j]);
+        }
+        if (repeat) continue;
+        encoded[misses] = inputs[i]->encoded;
+        encoded_len[misses] = inputs[i]->encoded_len;
+        miss[misses++] = i;
+    }
+    bool ok = misses == 0 ||
+        ds4_engine_vision_encode_memory_batch(s->engine, encoded, encoded_len,
+                                              misses, fresh, err, errlen);
+    for (size_t j = 0; ok && j < misses; j++) {
+        out[miss[j]] = fresh[j];
+        server_image_encoded(s, inputs[miss[j]], &fresh[j]);
+    }
+    for (size_t i = 0; ok && i < count; i++) {
+        if (!out[i].data) ok = server_encode_image(s, inputs[i], &out[i], err, errlen);
+    }
+    free(fresh);
+    free(miss);
+    free(encoded_len);
+    free(encoded);
+    return ok;
 }
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
