@@ -137,7 +137,8 @@ built and run inside the ROCm container.  Pure prefill, `--gen-tokens 0`:
 
 The three binaries were built from the same tree state and run back to back.
 "Routed MoE" is the kernel pass described next, "Glue pass" adds the changes
-under "Follow-up" below.  Decode is unchanged (14.3 tok/s at 2K); batches
+under "Follow-up" below.  Decode was unchanged by this pass (14.3 tok/s at 2K; see
+[gfx1151-decode.md](gfx1151-decode.md) for the later decode pass); batches
 under 128 tokens do not reach the new kernels.  The Vision Experimental
 checkpoint's text path moves the same way.
 

@@ -85,39 +85,6 @@ __device__ __forceinline__ static void dev_iq2_i8x8_lut(
     *w1 = __vsub4((int32_t)(uint32_t)(g >> 32) ^ sm1, sm1);
 }
 
-__device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
-        const cuda_block_iq2_xxs *x,
-        const cuda_block_q8_K *y,
-        const uint64_t *grid,
-        const uint8_t *signs) {
-    const float xd = dev_f16_to_f32(x->d);
-    const uint16_t *q2 = x->qs;
-    const int8_t *q8 = y->qs;
-    int32_t bsum = 0;
-    for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-        q2 += 4;
-        const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
-        int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
-        int32_t sumi = 0;
-        sumi = __dp4a(w[0], *(const int32_t *)(q8 + ib32 * 32u + 0),  sumi);
-        sumi = __dp4a(w[1], *(const int32_t *)(q8 + ib32 * 32u + 4),  sumi);
-        sumi = __dp4a(w[2], *(const int32_t *)(q8 + ib32 * 32u + 8),  sumi);
-        sumi = __dp4a(w[3], *(const int32_t *)(q8 + ib32 * 32u + 12), sumi);
-        sumi = __dp4a(w[4], *(const int32_t *)(q8 + ib32 * 32u + 16), sumi);
-        sumi = __dp4a(w[5], *(const int32_t *)(q8 + ib32 * 32u + 20), sumi);
-        sumi = __dp4a(w[6], *(const int32_t *)(q8 + ib32 * 32u + 24), sumi);
-        sumi = __dp4a(w[7], *(const int32_t *)(q8 + ib32 * 32u + 28), sumi);
-        bsum += sumi * ls;
-    }
-    return 0.125f * xd * y->d * (float)bsum;
-}
-
 __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, const cuda_block_q8_K *y) {
     const float d = dev_f16_to_f32(x->d) * y->d;
     const uint16_t *q2 = x->qs;
@@ -1114,7 +1081,150 @@ __global__ static void moe_gate_up_mid_qwarp32_ptrs_split_kernel(
     }
 }
 
-__global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
+/* Eight signed IQ2 weights dotted with eight Q8_K activations.  The grid holds
+ * nonzero magnitudes, so negating a byte is (w ^ 0xff) + 1 with no carry into
+ * its neighbour: one xor and one add sign a whole dword. */
+__device__ __forceinline__ static int32_t dev_iq2_signed_dp4a_8(
+        uint64_t grid,
+        uint64_t sign_mask,
+        int32_t x0,
+        int32_t x1,
+        int32_t acc) {
+    const uint64_t w = grid ^ sign_mask;
+    acc = __dp4a((int32_t)((uint32_t)w + ((uint32_t)sign_mask & 0x01010101u)), x0, acc);
+    acc = __dp4a((int32_t)((uint32_t)(w >> 32u) + ((uint32_t)(sign_mask >> 32u) & 0x01010101u)), x1, acc);
+    return acc;
+}
+
+/* What a block of the decode gate/up kernels keeps in LDS: the token's Q8_K
+ * activations, the IQ2 grid, and a byte mask per sign code (0xff where the
+ * weight is negative). */
+__device__ __forceinline__ static void moe_decode_iq2_stage(
+        cuda_block_q8_K *sxq,
+        uint64_t *grid,
+        uint64_t *sign_mask,
+        const cuda_block_q8_K *xq,
+        uint32_t xq_blocks) {
+    for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xq[i];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) {
+        const uint32_t s = dev_unpack_iq2_signs(cuda_ksigns_iq2xs[i]);
+        sign_mask[i] = (uint64_t)(uint32_t)__vcmpne4(s & 0x08040201u, 0) |
+                       ((uint64_t)(uint32_t)__vcmpne4(s & 0x80402010u, 0) << 32u);
+    }
+    __syncthreads();
+}
+
+/* silu(gate) * up * weight in the operation order the fast-math build gives
+ * the row kernels, pinned so this kernel stays bit-identical to them. */
+__device__ __forceinline__ static float moe_decode_swiglu_weighted(float gate, float up, float weight) {
+#pragma clang fp reassociate(off)
+    return ((up * gate) * weight) / (1.0f + expf(-gate));
+}
+
+/* Single-token routed gate/up over IQ2_XXS experts and Q8_K activations.
+ *
+ * Decode of these experts is bound by arithmetic, not by reading the weights,
+ * so the layout is chosen to spend few instructions per weight.  A thread owns
+ * one 256-weight block of one gate row and of the matching up row: it fetches
+ * both blocks up front (eight 8-byte loads each), reads every activation dword
+ * once for the two rows, and signs the grid bytes from a table.  A wave
+ * holds two rows of sixteen blocks, so each wave streams 4 KiB of weights.
+ *
+ * The block sums are exact integers.  The float tail keeps the summation order
+ * of the row kernels this replaces (blocks b and b+8, then a tree over eight
+ * partials), so the result is bit-identical to them. */
+__device__ __forceinline__ static void moe_gate_up_mid_decode_iq2_rows(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const unsigned char *gate_expert,
+        const unsigned char *up_expert,
+        const cuda_block_q8_K *xq,
+        const uint64_t *grid,
+        const uint64_t *sign_mask,
+        float weight,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint64_t out_base,
+        uint32_t write_aux,
+        float clamp) {
+    const uint32_t b = threadIdx.x & 15u;
+    const uint32_t row = blockIdx.x * (blockDim.x >> 4u) + (threadIdx.x >> 4u);
+    if (row >= expert_mid_dim) return;
+    /* Block scale and integer block sum of this thread's gate and up block. */
+    float gc = 0.0f, gs = 0.0f;
+    float uc = 0.0f, us = 0.0f;
+    if (b < xq_blocks) {
+        const unsigned char *gb = gate_expert + (uint64_t)row * gate_row_bytes + b * sizeof(cuda_block_iq2_xxs);
+        const unsigned char *ub = up_expert + (uint64_t)row * gate_row_bytes + b * sizeof(cuda_block_iq2_xxs);
+        uint64_t gq[8], uq[8];
+        uint16_t gd, ud;
+        __builtin_memcpy(&gd, gb, sizeof(gd));
+        __builtin_memcpy(&ud, ub, sizeof(ud));
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; k++) {
+            __builtin_memcpy(&gq[k], gb + 2u + 8u * k, sizeof(gq[k]));
+            __builtin_memcpy(&uq[k], ub + 2u + 8u * k, sizeof(uq[k]));
+        }
+        const int32_t *x = reinterpret_cast<const int32_t *>(xq[b].qs);
+        int32_t gsum = 0;
+        int32_t usum = 0;
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; k++) {
+            const uint32_t g0 = (uint32_t)gq[k], g1 = (uint32_t)(gq[k] >> 32u);
+            const uint32_t u0 = (uint32_t)uq[k], u1 = (uint32_t)(uq[k] >> 32u);
+            int32_t gi = 0;
+            int32_t ui = 0;
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) {
+                const int32_t x0 = x[8u * k + 2u * j];
+                const int32_t x1 = x[8u * k + 2u * j + 1u];
+                gi = dev_iq2_signed_dp4a_8(grid[(g0 >> (8u * j)) & 0xffu],
+                                           sign_mask[(g1 >> (7u * j)) & 127u], x0, x1, gi);
+                ui = dev_iq2_signed_dp4a_8(grid[(u0 >> (8u * j)) & 0xffu],
+                                           sign_mask[(u1 >> (7u * j)) & 127u], x0, x1, ui);
+            }
+            gsum += gi * (int32_t)(2u * (g1 >> 28u) + 1u);
+            usum += ui * (int32_t)(2u * (u1 >> 28u) + 1u);
+        }
+        const float xd = 0.125f * xq[b].d;
+        gc = dev_f16_to_f32(gd) * xd;
+        uc = dev_f16_to_f32(ud) * xd;
+        gs = (float)gsum;
+        us = (float)usum;
+    }
+    /* Lane b adds block b+8 with a fused multiply-add, as the row kernels'
+     * per-lane loop does, then the eight partials reduce pairwise. */
+    float gate = __builtin_fmaf(__shfl_down_sync(FULL_WARP_MASK, gc, 8, 16),
+                                __shfl_down_sync(FULL_WARP_MASK, gs, 8, 16), gc * gs);
+    float up = __builtin_fmaf(__shfl_down_sync(FULL_WARP_MASK, uc, 8, 16),
+                              __shfl_down_sync(FULL_WARP_MASK, us, 8, 16), uc * us);
+    for (uint32_t offset = 4u; offset > 0u; offset >>= 1u) {
+        gate += __shfl_down_sync(FULL_WARP_MASK, gate, offset, 16);
+        up += __shfl_down_sync(FULL_WARP_MASK, up, offset, 16);
+    }
+    if (b == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = out_base + row;
+        if (write_aux) {
+            gate_out[off] = gate;
+            up_out[off] = up;
+        }
+        mid_out[off] = moe_decode_swiglu_weighted(gate, up, weight);
+    }
+}
+
+/* Rows covered by one block of the decode gate/up kernels below. */
+#define DS4_ROCM_MOE_DECODE_IQ2_BLOCK_ROWS 16u
+#define DS4_ROCM_MOE_DECODE_IQ2_BLOCK_THREADS (16u * DS4_ROCM_MOE_DECODE_IQ2_BLOCK_ROWS)
+
+__global__ static void moe_gate_up_mid_decode_iq2_kernel(
         float *gate_out,
         float *up_out,
         float *mid_out,
@@ -1127,60 +1237,25 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         uint64_t gate_row_bytes,
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
-        uint32_t n_expert,
         uint32_t write_aux,
-        uint32_t active_mask,
         float clamp) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t pair = blockIdx.y;
-    uint32_t tok = pair / n_expert;
-    uint32_t slot = pair - tok * n_expert;
-    if ((active_mask & (1u << slot)) == 0) return;
-    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    const uint32_t slot = blockIdx.y;
+    int32_t expert_i = selected[slot];
     if (expert_i < 0) expert_i = 0;
-    uint32_t expert = (uint32_t)expert_i;
-    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-    }
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    __syncthreads();
-    if (xq_blocks <= 16u) xqb = sxq;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
-        if (row >= expert_mid_dim) continue;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
-        float gate = 0.0f;
-        float up = 0.0f;
-        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
-        }
-        gate = quarter_warp_sum_f32(gate, lane);
-        up = quarter_warp_sum_f32(up, lane);
-        if (lane == 0) {
-            if (clamp > 1.0e-6f) {
-                if (gate > clamp) gate = clamp;
-                if (up > clamp) up = clamp;
-                if (up < -clamp) up = -clamp;
-            }
-            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-            if (write_aux) {
-                gate_out[off] = gate;
-                up_out[off] = up;
-            }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
-        }
-    }
+    __shared__ uint64_t s_iq2_sign_mask[128];
+    moe_decode_iq2_stage(sxq, s_iq2_grid, s_iq2_sign_mask, xq, xq_blocks);
+    moe_gate_up_mid_decode_iq2_rows(
+            gate_out, up_out, mid_out,
+            (const unsigned char *)gate_base + (uint64_t)(uint32_t)expert_i * gate_expert_bytes,
+            (const unsigned char *)up_base + (uint64_t)(uint32_t)expert_i * gate_expert_bytes,
+            sxq, s_iq2_grid, s_iq2_sign_mask, weights[slot],
+            gate_row_bytes, xq_blocks, expert_mid_dim,
+            (uint64_t)slot * expert_mid_dim, write_aux, clamp);
 }
 
-__global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
+__global__ static void moe_gate_up_mid_decode_iq2_ptrs_kernel(
         float *gate_out,
         float *up_out,
         float *mid_out,
@@ -1192,60 +1267,26 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
         uint64_t gate_row_bytes,
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
-        uint32_t n_expert,
         uint32_t write_aux,
         uint32_t active_mask,
         float clamp) {
-    uint32_t lane = threadIdx.x & 7u;
-    uint32_t row_lane = threadIdx.x >> 3u;
-    uint32_t pair = blockIdx.y;
-    uint32_t tok = pair / n_expert;
-    uint32_t slot = pair - tok * n_expert;
+    const uint32_t slot = blockIdx.y;
     if ((active_mask & (1u << slot)) == 0) return;
-    int32_t slot_i = selected[(uint64_t)tok * n_expert + slot];
+    int32_t slot_i = selected[slot];
     if (slot_i < 0) slot_i = 0;
-    const uint32_t compact_slot = (uint32_t)slot_i;
-    const char *gate_base = gate_slots[compact_slot];
-    const char *up_base = up_slots[compact_slot];
+    const char *gate_base = gate_slots[(uint32_t)slot_i];
+    const char *up_base = up_slots[(uint32_t)slot_i];
     if (!gate_base || !up_base) return;
-    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-    }
-    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-    __syncthreads();
-    if (xq_blocks <= 16u) xqb = sxq;
-    for (uint32_t rr = 0; rr < 4u; rr++) {
-        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
-        if (row >= expert_mid_dim) continue;
-        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)row * gate_row_bytes);
-        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)row * gate_row_bytes);
-        float gate = 0.0f;
-        float up = 0.0f;
-        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
-        }
-        gate = quarter_warp_sum_f32(gate, lane);
-        up = quarter_warp_sum_f32(up, lane);
-        if (lane == 0) {
-            if (clamp > 1.0e-6f) {
-                if (gate > clamp) gate = clamp;
-                if (up > clamp) up = clamp;
-                if (up < -clamp) up = -clamp;
-            }
-            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
-            if (write_aux) {
-                gate_out[off] = gate;
-                up_out[off] = up;
-            }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
-        }
-    }
+    __shared__ uint64_t s_iq2_sign_mask[128];
+    moe_decode_iq2_stage(sxq, s_iq2_grid, s_iq2_sign_mask, xq, xq_blocks);
+    moe_gate_up_mid_decode_iq2_rows(
+            gate_out, up_out, mid_out,
+            (const unsigned char *)gate_base, (const unsigned char *)up_base,
+            sxq, s_iq2_grid, s_iq2_sign_mask, weights[slot],
+            gate_row_bytes, xq_blocks, expert_mid_dim,
+            (uint64_t)slot * expert_mid_dim, write_aux, clamp);
 }
 
 __global__ static void moe_count_sorted_pairs_kernel(
@@ -4276,6 +4317,19 @@ __global__ static void moe_gate_up_mid_q2K_rows_w32_kernel(
     }
 }
 
+/* Routed Q2_K down projection of float mid activations, one output row per
+ * wave: lane l sums the weights l, l + 32, ... of every 256-weight block of
+ * every selected expert, and the lanes reduce pairwise.
+ *
+ * Decode of this projection is bound by arithmetic and by the number of
+ * loads, so a lane fetches the sub-block scales of a block as two words and
+ * its two quant bytes once, and the per-lane offsets live in the base
+ * pointers so that the loads need no per-lane address arithmetic.
+ *
+ * The values and their order are pinned: a weight is
+ * (d * scale) * q - dmin * min, fused into the product with the activation,
+ * and the eight weights of a block are added in the order the fast-math
+ * build gave the loop this replaces, so the result is bit-identical to it. */
 __global__ static void moe_down_q2K_sum_rows_w32_kernel(
         float *out,
         const char *down_base,
@@ -4287,6 +4341,7 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t n_expert) {
+#pragma clang fp reassociate(off)
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
@@ -4295,6 +4350,9 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
     const uint32_t tok = blockIdx.y;
     if (row >= out_dim || tok >= n_tokens) return;
 
+    /* Lanes 0..15 hold the weights of the even 16-weight sub-blocks, lanes
+     * 16..31 those of the odd ones. */
+    const uint32_t odd = lane >> 4u;
     float acc = 0.0f;
     const uint32_t nb = expert_mid_dim >> 8u;
 #pragma unroll
@@ -4303,16 +4361,30 @@ __global__ static void moe_down_q2K_sum_rows_w32_kernel(
         int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
         if (expert_i < 0) expert_i = 0;
         const unsigned char *dr = (const unsigned char *)down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes;
-        const float *mr = mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim;
+        const unsigned char *quants = dr + 16u + lane;
+        const float *mr = mid + ((uint64_t)tok * n_expert + slot) * expert_mid_dim + lane;
         for (uint32_t b = 0; b < nb; b++) {
-            const unsigned char *db = dr + (uint64_t)b * 84u;
-            float d, dmin;
-            q2_K_scale_broadcast_w32(db, &d, &dmin);
-            const uint64_t mbase = (uint64_t)b * 256u;
+            const uint32_t off = b * 84u;
+            uint64_t sc64[2];
+            uint32_t dm_bits;
+            __builtin_memcpy(sc64, dr + off, sizeof(sc64));
+            __builtin_memcpy(&dm_bits, dr + off + 80u, sizeof(dm_bits));
+            const uint32_t q[2] = { quants[off], quants[off + 32u] };
+            const float *m = mr + (b << 8u);
+            const float d = dev_f16_to_f32((uint16_t)dm_bits);
+            const float dmin = dev_f16_to_f32((uint16_t)(dm_bits >> 16u));
+            /* This lane's eight (scale, min) bytes, two per dword. */
+            const uint64_t s0 = sc64[0] >> (odd << 3u), s1 = sc64[1] >> (odd << 3u);
+            const uint32_t sc[4] = { (uint32_t)s0, (uint32_t)(s0 >> 32u), (uint32_t)s1, (uint32_t)(s1 >> 32u) };
 #pragma unroll
-            for (uint32_t kk = 0; kk < 8u; kk++) {
-                const uint32_t i = lane + (kk << 5u);
-                acc += q2_K_dequant_256_scaled_w32(db, lane, kk, d, dmin) * mr[mbase + i];
+            for (uint32_t k = 0; k < 8u; k++) {
+                /* 7, 3, 5, 1, 6, 2, 4, 0: the order of the replaced kernel. */
+                const uint32_t kk = 7u - (((k & 1u) << 2u) | (k & 2u) | ((k >> 2u) & 1u));
+                const uint32_t s = sc[kk >> 1u] >> ((kk & 1u) << 4u);
+                const float ds = d * (float)(s & 15u);
+                const float dmm = dmin * (float)((s >> 4u) & 15u);
+                const float qf = (float)((q[kk >> 2u] >> ((kk & 3u) << 1u)) & 3u);
+                acc = __builtin_fmaf(__builtin_fmaf(ds, qf, -dmm), m[kk << 5u], acc);
             }
         }
     }

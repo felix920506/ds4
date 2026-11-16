@@ -576,22 +576,107 @@ __device__ static float attention_block_max_oldhip_w32(float v) {
     return sh[0];
 }
 
+/* The single-token attention kernels below are bound by load latency, not by
+ * arithmetic: a wave waits for memory on every load it consumes at once.
+ * Their helpers therefore fetch several operands ahead of the sums.  The sums
+ * keep their order and the fused multiply-adds are spelled out, because both
+ * fix the rounding. */
 __device__ __forceinline__ static float attention_dot_f32_vec4_oldhip(const float *a, const float *b, uint32_t n) {
     float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
     const uint32_t n4 = n >> 2u;
     const float4 *a4 = (const float4 *)a;
     const float4 *b4 = (const float4 *)b;
-    for (uint32_t i = 0; i < n4; i++) {
+    uint32_t i = 0;
+    for (; i + 8u <= n4; i += 8u) {
+        float4 av[8], bv[8];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            av[j] = a4[i + j];
+            bv[j] = b4[i + j];
+        }
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            s0 = __builtin_fmaf(av[j].x, bv[j].x, s0);
+            s1 = __builtin_fmaf(av[j].y, bv[j].y, s1);
+            s2 = __builtin_fmaf(av[j].z, bv[j].z, s2);
+            s3 = __builtin_fmaf(av[j].w, bv[j].w, s3);
+        }
+    }
+    for (; i < n4; i++) {
         const float4 av = a4[i];
         const float4 bv = b4[i];
-        s0 += av.x * bv.x;
-        s1 += av.y * bv.y;
-        s2 += av.z * bv.z;
-        s3 += av.w * bv.w;
+        s0 = __builtin_fmaf(av.x, bv.x, s0);
+        s1 = __builtin_fmaf(av.y, bv.y, s1);
+        s2 = __builtin_fmaf(av.z, bv.z, s2);
+        s3 = __builtin_fmaf(av.w, bv.w, s3);
     }
     float s = (s0 + s1) + (s2 + s3);
-    for (uint32_t i = n4 << 2u; i < n; i++) s += a[i] * b[i];
+    for (i = n4 << 2u; i < n; i++) s = __builtin_fmaf(a[i], b[i], s);
     return s;
+}
+
+/* acc[j] += sum over r < n of scores[r] * kv[row_of(r)][d + j] for W adjacent
+ * columns, where kv_col points at column d of row 0.  A thread that owns W
+ * columns reads each row and each score once for all of them. */
+template <int W, typename RowOf>
+__device__ __forceinline__ static void attention_weighted_columns_oldhip(
+        float *acc,
+        const float *scores,
+        const float *kv_col,
+        uint32_t head_dim,
+        uint32_t n,
+        RowOf row_of) {
+    enum { AHEAD = 16 };
+    uint32_t r = 0;
+    for (; r + AHEAD <= n; r += AHEAD) {
+        float w[AHEAD], v[AHEAD][W];
+#pragma unroll
+        for (uint32_t j = 0; j < AHEAD; j++) {
+            w[j] = scores[r + j];
+            __builtin_memcpy(v[j], kv_col + (uint64_t)row_of(r + j) * head_dim, sizeof(v[j]));
+        }
+#pragma unroll
+        for (uint32_t j = 0; j < AHEAD; j++) {
+#pragma unroll
+            for (int k = 0; k < W; k++) acc[k] = __builtin_fmaf(w[j], v[j][k], acc[k]);
+        }
+    }
+    for (; r < n; r++) {
+        const float w = scores[r];
+        const float *v = kv_col + (uint64_t)row_of(r) * head_dim;
+#pragma unroll
+        for (int k = 0; k < W; k++) acc[k] = __builtin_fmaf(w, v[k], acc[k]);
+    }
+}
+
+/* Softmax-weighted values of one head: raw window rows, then compressed rows,
+ * each thread owning W adjacent columns. */
+template <int W, typename RawRowOf, typename CompRowOf>
+__device__ __forceinline__ static void attention_decode_values_oldhip(
+        float *head_out,
+        const float *scores,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t head_dim,
+        uint32_t n_raw,
+        uint32_t n_comp,
+        float inv_denom,
+        RawRowOf raw_row_of,
+        CompRowOf comp_row_of) {
+    for (uint32_t d = threadIdx.x * W; d + W <= head_dim; d += blockDim.x * W) {
+        float acc[W] = {};
+        attention_weighted_columns_oldhip<W>(acc, scores, raw_kv + d, head_dim, n_raw, raw_row_of);
+        attention_weighted_columns_oldhip<W>(acc, scores + n_raw, comp_kv + d, head_dim, n_comp, comp_row_of);
+#pragma unroll
+        for (int k = 0; k < W; k++) head_out[d + k] = acc[k] * inv_denom;
+    }
+}
+
+/* Row r of the raw ring: raw_start < raw_cap and r < raw_cap, so one
+ * conditional subtract replaces the modulo. */
+__device__ __forceinline__ static uint32_t attention_raw_ring_row(uint32_t raw_start, uint32_t raw_cap, uint32_t r) {
+    const uint32_t row = raw_start + r;
+    return raw_cap && row >= raw_cap ? row - raw_cap : (raw_cap ? row : r);
 }
 
 __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
@@ -619,7 +704,7 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
 
     float local_max = sinks[h];
     for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
-        const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+        const uint32_t row = attention_raw_ring_row(raw_start, raw_cap, r);
         const float *kv = raw_kv + (uint64_t)row * head_dim;
         float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
         if (!use_vec4) {
@@ -655,16 +740,14 @@ __global__ static void attention_decode_mixed_one_fast_oldhip_kernel(
     const float denom = attention_block_sum_oldhip_w32(local_sum);
     const float inv_denom = 1.0f / denom;
 
-    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < n_raw; r++) {
-            const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
-            acc += scores[r] * raw_kv[(uint64_t)row * head_dim + d];
-        }
-        for (uint32_t c = 0; c < n_comp; c++) {
-            acc += scores[n_raw + c] * comp_kv[(uint64_t)c * head_dim + d];
-        }
-        heads[(uint64_t)h * head_dim + d] = acc * inv_denom;
+    const auto raw_row_of = [=](uint32_t r) { return attention_raw_ring_row(raw_start, raw_cap, r); };
+    const auto comp_row_of = [](uint32_t c) { return c; };
+    if (use_vec4) {
+        attention_decode_values_oldhip<4>(heads + (uint64_t)h * head_dim, scores, raw_kv, comp_kv,
+                                          head_dim, n_raw, n_comp, inv_denom, raw_row_of, comp_row_of);
+    } else {
+        attention_decode_values_oldhip<1>(heads + (uint64_t)h * head_dim, scores, raw_kv, comp_kv,
+                                          head_dim, n_raw, n_comp, inv_denom, raw_row_of, comp_row_of);
     }
 }
 
@@ -689,7 +772,6 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     if (h >= n_head) return;
     extern __shared__ float scores[];
     __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
-    __shared__ uint32_t comp_count_s;
     const uint32_t tid = threadIdx.x;
     const float *qh = q + (uint64_t)h * head_dim;
     const float scale = rsqrtf((float)head_dim);
@@ -699,24 +781,55 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
         visible_comp = (pos0 + 1u) / ratio;
         if (visible_comp > n_comp) visible_comp = n_comp;
     }
-    if (tid == 0u) {
-        comp_count_s = 0;
-        for (uint32_t i = 0;
-             i < top_k && comp_count_s < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
-             i++) {
-            const int32_t ci = topk[i];
-            if (ci < 0) continue;
-            const uint32_t c = (uint32_t)ci;
-            if (c < n_comp && c < visible_comp) comp_rows[comp_count_s++] = c;
+    /* Keep the visible top-k rows in their order, all lanes at once: a scan
+     * by one lane would hold the other waves at the barrier.  The block has
+     * 256 threads and entry i belongs to thread i % 256; its slot is the
+     * number of kept entries before it, from the kept bits of its own wave
+     * and the per-wave counts in LDS. */
+    constexpr uint32_t PASSES = DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP / 256u;
+    __shared__ uint32_t topk_wave_count[PASSES * 8u];
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    int32_t ci[PASSES];
+    uint32_t kept[PASSES];
+#pragma unroll
+    for (uint32_t p = 0; p < PASSES; p++) {
+        const uint32_t i = p * 256u + tid;
+        ci[p] = i < top_k ? topk[i] : -1;
+        kept[p] = (uint32_t)(ci[p] >= 0 && (uint32_t)ci[p] < n_comp &&
+                             (uint32_t)ci[p] < visible_comp) << lane;
+#pragma unroll
+        for (uint32_t delta = 1u; delta < 32u; delta <<= 1u) {
+            kept[p] |= __shfl_xor_sync(FULL_WARP_MASK, kept[p], delta, 32);
+        }
+        if (lane == 0u) topk_wave_count[p * 8u + wave] = (uint32_t)__popc(kept[p]);
+    }
+    __syncthreads();
+    uint32_t comp_count = 0;
+    uint32_t before[PASSES];
+#pragma unroll
+    for (uint32_t p = 0; p < PASSES; p++) before[p] = 0u;
+#pragma unroll
+    for (uint32_t j = 0; j < PASSES * 8u; j++) {
+        const uint32_t n = topk_wave_count[j];
+        comp_count += n;
+#pragma unroll
+        for (uint32_t p = 0; p < PASSES; p++) {
+            if (j < p * 8u + wave) before[p] += n;
+        }
+    }
+#pragma unroll
+    for (uint32_t p = 0; p < PASSES; p++) {
+        if ((kept[p] >> lane) & 1u) {
+            comp_rows[before[p] + (uint32_t)__popc(kept[p] & ((1u << lane) - 1u))] = (uint32_t)ci[p];
         }
     }
     __syncthreads();
-    const uint32_t comp_count = comp_count_s;
     const uint32_t n_rows = n_raw + comp_count;
 
     float local_max = sinks[h];
     for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
-        const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+        const uint32_t row = attention_raw_ring_row(raw_start, raw_cap, r);
         const float *kv = raw_kv + (uint64_t)row * head_dim;
         float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim) : 0.0f;
         if (!use_vec4) {
@@ -749,17 +862,14 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     const float denom = attention_block_sum_oldhip_w32(local_sum);
     const float inv_denom = 1.0f / denom;
 
-    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < n_raw; r++) {
-            const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
-            acc += scores[r] * raw_kv[(uint64_t)row * head_dim + d];
-        }
-        for (uint32_t c = 0; c < comp_count; c++) {
-            const uint32_t row = comp_rows[c];
-            acc += scores[n_raw + c] * comp_kv[(uint64_t)row * head_dim + d];
-        }
-        heads[(uint64_t)h * head_dim + d] = acc * inv_denom;
+    const auto raw_row_of = [=](uint32_t r) { return attention_raw_ring_row(raw_start, raw_cap, r); };
+    const auto comp_row_of = [&](uint32_t c) { return comp_rows[c]; };
+    if (use_vec4) {
+        attention_decode_values_oldhip<4>(heads + (uint64_t)h * head_dim, scores, raw_kv, comp_kv,
+                                          head_dim, n_raw, comp_count, inv_denom, raw_row_of, comp_row_of);
+    } else {
+        attention_decode_values_oldhip<1>(heads + (uint64_t)h * head_dim, scores, raw_kv, comp_kv,
+                                          head_dim, n_raw, comp_count, inv_denom, raw_row_of, comp_row_of);
     }
 }
 

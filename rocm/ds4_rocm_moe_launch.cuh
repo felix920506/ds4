@@ -855,6 +855,11 @@ static int routed_moe_launch(
             !q4k_path && !mxfp4_path && use_atomic_down && n_tokens >= 128u;
         const uint32_t use_decode_lut_gate =
             !mxfp4_path && n_tokens == 1u && xq_blocks <= 16u;
+        const dim3 decode_iq2_grid(
+            (expert_mid_dim + DS4_ROCM_MOE_DECODE_IQ2_BLOCK_ROWS - 1u) /
+                DS4_ROCM_MOE_DECODE_IQ2_BLOCK_ROWS,
+            n_expert,
+            1);
         const uint32_t gate_row_span = 1024u;
         const uint32_t down_row_span = 1024u;
         const uint32_t use_down_row2048 =
@@ -1378,7 +1383,8 @@ static int routed_moe_launch(
             if (split_supported) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_iq2_ptrs_kernel<<<
+                            decode_iq2_grid, DS4_ROCM_MOE_DECODE_IQ2_BLOCK_THREADS>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -1390,7 +1396,6 @@ static int routed_moe_launch(
                         gate_row_bytes,
                         xq_blocks,
                         expert_mid_dim,
-                        n_expert,
                         write_gate_up,
                         stream_resident_mask,
                         clamp);
@@ -1418,7 +1423,8 @@ static int routed_moe_launch(
                     ok = cuda_stream_selected_finish_pending_missing(0);
                 }
                 if (ok && use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_iq2_ptrs_kernel<<<
+                            decode_iq2_grid, DS4_ROCM_MOE_DECODE_IQ2_BLOCK_THREADS>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -1430,7 +1436,6 @@ static int routed_moe_launch(
                         gate_row_bytes,
                         xq_blocks,
                         expert_mid_dim,
-                        n_expert,
                         write_gate_up,
                         stream_missing_mask,
                         clamp);
@@ -1728,7 +1733,8 @@ static int routed_moe_launch(
                         write_gate_up,
                         clamp);
                 } else if (use_decode_lut_gate) {
-                    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_iq2_kernel<<<
+                            decode_iq2_grid, DS4_ROCM_MOE_DECODE_IQ2_BLOCK_THREADS>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
@@ -1741,9 +1747,7 @@ static int routed_moe_launch(
                         gate_row_bytes,
                         xq_blocks,
                         expert_mid_dim,
-                        n_expert,
                         write_gate_up,
-                        0xffffffffu,
                         clamp);
                 } else {
                     moe_gate_up_mid_qwarp32_kernel<<<qgrid, 256>>>(

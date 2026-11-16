@@ -905,10 +905,8 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) {
         return 0;
     }
-    const uint32_t rows_per_block = cfg->q8_hc_decode_rpb;
-    matmul_q8_0_hc_expand_preq_rows_w32_kernel<<<
-            ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
-            rows_per_block * 32u>>>(
+    if (n_hc > 4u) return 0;
+    matmul_q8_0_hc_expand_preq_rows_w32_kernel<<<2u * DS4_ROCM_DECODE_STREAMS, 32>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
             block_add ? (const float *)block_add->ptr : (const float *)block_out->ptr,
@@ -918,11 +916,10 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
             xq,
             xscale,
             in_dim,
-            out_dim,
+            (uint32_t)out_dim,
             n_embd,
             n_hc,
-            blocks,
-            rows_per_block,
+            (uint32_t)blocks,
             block_add ? 1 : 0,
             use_dp4a);
     return cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand rows launch");
@@ -1038,20 +1035,17 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                                          CUBLAS_GEMM_DEFAULT);
         return cublas_ok(st, "f16 matmul");
     }
-    /* The 4096x256 F16 router projection is latency-bound and the ordered
-     * 32-thread row kernel is at least as fast on gfx1151; keep shared-X for
-     * compressor/indexer F16 decode where reusing x across rows is the win. */
+    /* The 4096x256 F16 router projection is latency-bound and stays on the
+     * ordered 32-thread row kernel; the compressor and indexer projections
+     * are bound by memory and take the streaming row kernel. */
     const bool f16_decode_router_shape = (in_dim == 4096u && out_dim == 256u);
     if (n_tok == 1u && !g_quality_mode && !cuda_runtime_config()->graph_dump &&
         !f16_decode_router_shape) {
-        if (in_dim <= 8192u && in_dim * sizeof(float) <= 65536u) {
-            const uint32_t rows_per_block = 32u;
-            matmul_f16_f32_sharedx_warp_rows_w32_kernel<<<
-                    ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
-                    rows_per_block * 32u,
-                    (size_t)in_dim * sizeof(float)>>>(
-                    (float *)out->ptr, w, (const float *)x->ptr, (uint32_t)in_dim, out_dim);
-            return cuda_ok(cudaGetLastError(), "matmul_f16 sharedx launch");
+        if (in_dim <= 8192u) {
+            matmul_f16_rows_w32_kernel<1><<<2u * DS4_ROCM_DECODE_STREAMS, 32>>>(
+                    (float *)out->ptr, NULL, w, NULL, (const float *)x->ptr,
+                    (uint32_t)in_dim, (uint32_t)out_dim);
+            return cuda_ok(cudaGetLastError(), "matmul_f16 rows launch");
         }
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
@@ -1147,15 +1141,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                                            in_dim, out_dim, x, n_tok);
     }
     if (!g_quality_mode && !cuda_runtime_config()->graph_dump) {
-        if (in_dim <= 8192u && in_dim * sizeof(float) <= 65536u) {
-            const uint32_t rows_per_block = 32u;
-            matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<
-                    ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
-                    rows_per_block * 32u,
-                    (size_t)in_dim * sizeof(float)>>>(
+        if (in_dim <= 8192u) {
+            matmul_f16_rows_w32_kernel<2><<<DS4_ROCM_DECODE_STREAMS, 32>>>(
                     (float *)out0->ptr, (float *)out1->ptr, w0, w1,
-                    (const float *)x->ptr, (uint32_t)in_dim, out_dim);
-            return cuda_ok(cudaGetLastError(), "matmul_f16_pair sharedx launch");
+                    (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_pair rows launch");
         }
     }
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(

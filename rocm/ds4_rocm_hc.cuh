@@ -348,14 +348,40 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
     if (d == 0) hc4_split_one(sp, mix + (uint64_t)t * mix_hc, scale, base, sinkhorn_iters, epsv);
     __syncthreads();
 
+    /* A wave waits for memory on every load it consumes at once: fetch the
+     * four streams of a few columns ahead of the arithmetic.  The fused
+     * multiply-adds are spelled out because they fix the rounding. */
+    const float s0 = sp[0], s1 = sp[1], s2 = sp[2], s3 = sp[3];
+    const float *rt = residual_hc + (uint64_t)t * 4u * n_embd + d;
+    float *ot = out + (uint64_t)t * n_embd + d;
+    const uint32_t step = blockDim.x;
+    const uint32_t count = d < n_embd ? (n_embd - d + step - 1u) / step : 0u;
     float sum = 0.0f;
-    for (uint32_t col = d; col < n_embd; col += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < 4; h++) {
-            acc += residual_hc[(uint64_t)t * 4u * n_embd + (uint64_t)h * n_embd + col] * sp[h];
+    uint32_t k = 0;
+    for (; k + 4u <= count; k += 4u) {
+        float r[4][4];
+#pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) {
+#pragma unroll
+            for (uint32_t h = 0; h < 4u; h++) r[j][h] = rt[(uint64_t)h * n_embd + (k + j) * step];
         }
-        out[(uint64_t)t * n_embd + col] = acc;
-        sum += acc * acc;
+#pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) {
+            float acc = r[j][0] * s0;
+            acc = __builtin_fmaf(r[j][1], s1, acc);
+            acc = __builtin_fmaf(r[j][2], s2, acc);
+            acc = __builtin_fmaf(r[j][3], s3, acc);
+            ot[(k + j) * step] = acc;
+            sum = __builtin_fmaf(acc, acc, sum);
+        }
+    }
+    for (; k < count; k++) {
+        float acc = rt[k * step] * s0;
+        acc = __builtin_fmaf(rt[(uint64_t)n_embd + k * step], s1, acc);
+        acc = __builtin_fmaf(rt[2ull * n_embd + k * step], s2, acc);
+        acc = __builtin_fmaf(rt[3ull * n_embd + k * step], s3, acc);
+        ot[k * step] = acc;
+        sum = __builtin_fmaf(acc, acc, sum);
     }
 
     __shared__ float partial[256];

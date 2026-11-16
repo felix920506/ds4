@@ -1,12 +1,26 @@
+/* Thread t owns elements t, t + blockDim.x, ...  A wave waits for memory on
+ * every load it consumes at once, so the elements are fetched eight at a time
+ * ahead of the sum.  The sum keeps its order, one fused multiply-add per
+ * element. */
 __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
-    const float *xr = x + (uint64_t)row * n;
-    float *orow = out + (uint64_t)row * n;
+    const uint32_t step = blockDim.x;
+    const float *xt = x + (uint64_t)row * n + threadIdx.x;
+    float *ot = out + (uint64_t)row * n + threadIdx.x;
+    const uint32_t count = threadIdx.x < n ? (n - threadIdx.x + step - 1u) / step : 0u;
     float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = xr[i];
-        sum += v * v;
+    uint32_t k = 0;
+    for (; k + 8u <= count; k += 8u) {
+        float v[8];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) v[j] = xt[(k + j) * step];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) sum = __builtin_fmaf(v[j], v[j], sum);
+    }
+    for (; k < count; k++) {
+        float v = xt[k * step];
+        sum = __builtin_fmaf(v, v, sum);
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
@@ -16,9 +30,14 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
         __syncthreads();
     }
     float scale = rsqrtf(partial[0] / (float)n + eps);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * scale;
+    for (k = 0; k + 8u <= count; k += 8u) {
+        float v[8];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) v[j] = xt[(k + j) * step];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) ot[(k + j) * step] = v[j] * scale;
     }
+    for (; k < count; k++) ot[k * step] = xt[k * step] * scale;
 }
 
 /* Same reduction as rms_norm_plain_kernel, written as the F16 activations of

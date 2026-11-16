@@ -898,6 +898,18 @@ __global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
     }
 }
 
+/* Single-token Q8_0 projection of prequantized activations, expanded into
+ * the n_hc (at most four) hyper-connection streams:
+ *
+ *   block     = w . x (+ block_add)
+ *   out_hc[j] = block * post[j] + sum_i residual_hc[i] * comb[i][j]
+ *
+ * Launch with 2 * DS4_ROCM_DECODE_STREAMS blocks of one wave (a step reads
+ * 1 KiB of weights per unrolled half); block b computes rows b,
+ * b + gridDim.x, ...  Lane l dots the 32-weight blocks l, l + 32, ...
+ * of a row in order.  The per-lane offsets live in the base pointers, and
+ * lane 0 fetches the row's residuals ahead of the dot product instead of
+ * waiting on them one by one after it. */
 __global__ static void matmul_q8_0_hc_expand_preq_rows_w32_kernel(
         float *out_hc,
         float *block_out,
@@ -908,41 +920,68 @@ __global__ static void matmul_q8_0_hc_expand_preq_rows_w32_kernel(
         const int8_t *xq,
         const float *xscale,
         uint64_t in_dim,
-        uint64_t out_dim,
+        uint32_t out_dim,
         uint32_t n_embd,
         uint32_t n_hc,
-        uint64_t blocks,
-        uint32_t rows_per_block,
+        uint32_t blocks,
         int has_add,
         int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + row * blocks * 34u;
-    float acc = 0.0f;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        const uint64_t i0 = b * 32u;
-        const uint64_t bn = in_dim - i0 < 32u ? in_dim - i0 : 32u;
-        const __half *scale_h = (const __half *)(wr + b * 34u);
-        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
-        const int8_t *xqb = xq + b * 32u;
-        const int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
-        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
-    }
-    acc = warp_sum_f32(acc);
+    const uint32_t lane = threadIdx.x;
+    const int8_t *xl = xq + lane * 32u;
+    const float *xs = xscale + lane;
+    /* Steps in which every lane has a whole block; one more step takes the
+     * remaining blocks, the last of which may be short. */
+    const uint32_t rounds = (uint32_t)(in_dim >> 10u);
+    const uint32_t tail_block = rounds * 32u + lane;
+    float post[4], comb[4][4];
     if (lane == 0u) {
-        const uint32_t d = (uint32_t)row;
-        block_out[d] = acc;
-        float block_v = acc;
-        if (has_add) block_v += block_add[d];
-        const float *post = split + n_hc;
-        const float *comb = split + 2u * n_hc;
-        for (uint32_t dst_hc = 0; dst_hc < n_hc; dst_hc++) {
-            float hc_acc = block_v * post[dst_hc];
-            for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
-                hc_acc += residual_hc[(uint64_t)src_hc * n_embd + d] * comb[(uint64_t)src_hc * n_hc + dst_hc];
+#pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) {
+            post[j] = j < n_hc ? split[n_hc + j] : 0.0f;
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                comb[i][j] = i < n_hc && j < n_hc ? split[2u * n_hc + i * n_hc + j] : 0.0f;
             }
-            out_hc[(uint64_t)dst_hc * n_embd + d] = hc_acc;
+        }
+    }
+    for (uint32_t row = blockIdx.x; row < out_dim; row += gridDim.x) {
+        const unsigned char *wl = w + (uint64_t)row * blocks * 34u + lane * 34u;
+        float residual[4], add = 0.0f;
+        if (lane == 0u) {
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                residual[i] = i < n_hc ? residual_hc[(uint64_t)i * n_embd + row] : 0.0f;
+            }
+            if (has_add) add = block_add[row];
+        }
+        float acc = 0.0f;
+#pragma unroll 2
+        for (uint32_t k = 0; k < rounds; k++) {
+            const unsigned char *blk = wl + k * (32u * 34u);
+            const int dot = dot_i8_block((const int8_t *)(blk + 2u), xl + k * 1024u, 32u, use_dp4a);
+            acc = q8_0_preq_block_fma(acc, __half2float(*(const __half *)blk), xs[k * 32u], dot);
+        }
+        if (tail_block < blocks) {
+            const unsigned char *blk = wl + rounds * (32u * 34u);
+            const uint64_t left = in_dim - (uint64_t)tail_block * 32u;
+            const int dot = dot_i8_block((const int8_t *)(blk + 2u), xl + rounds * 1024u,
+                                         left < 32u ? left : 32u, use_dp4a);
+            acc = q8_0_preq_block_fma(acc, __half2float(*(const __half *)blk), xs[rounds * 32u], dot);
+        }
+        acc = warp_sum_f32(acc);
+        if (lane == 0u) {
+            block_out[row] = acc;
+            const float block_v = has_add ? acc + add : acc;
+#pragma unroll
+            for (uint32_t j = 0; j < 4u; j++) {
+                if (j >= n_hc) continue;
+                float hc_acc = block_v * post[j];
+#pragma unroll
+                for (uint32_t i = 0; i < 4u; i++) {
+                    if (i < n_hc) hc_acc = __builtin_fmaf(residual[i], comb[i][j], hc_acc);
+                }
+                out_hc[(uint64_t)j * n_embd + row] = hc_acc;
+            }
         }
     }
 }
