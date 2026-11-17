@@ -135,3 +135,6 @@ __pycache__/
 /tests/test_metal_qwen4_moe_half
 /tests/test_qwen4_resident_arithmetic
 /speed-bench/vision_encode_bench
+
+/tests/test_rocm_head_norm
+/speed-bench/rocm_prefill_variant_bench

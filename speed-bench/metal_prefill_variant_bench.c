@@ -10,7 +10,11 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef DS4_ROCM_BUILD
+#define BENCH_NAME "rocm-prefill-variant-bench"
+#else
 #define BENCH_NAME "metal-prefill-variant-bench"
+#endif
 
 enum {
     VARIANT_COUNT = 2,
@@ -386,7 +390,11 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+#ifdef DS4_ROCM_BUILD
+        .backend = DS4_BACKEND_CUDA,
+#else
         .backend = DS4_BACKEND_METAL,
+#endif
         .context_size = cfg.ctx,
         .prefill_chunk = (uint32_t)cfg.prefill_chunk,
         .power_percent = 100,

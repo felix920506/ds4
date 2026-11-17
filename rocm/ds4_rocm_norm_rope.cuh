@@ -256,6 +256,20 @@ __device__ __forceinline__ static float2 rope_tail_cos_sin(
 /* Largest n_rot / 2 the per-token angle table of a kernel holds. */
 #define DS4_ROCM_ROPE_TABLE_PAIRS 256u
 
+/* Preserve the 256-thread reduction tree under -ffast-math.  Without the
+ * explicit adds the compiler reassociates the register-resident part, which
+ * changes the normalization (and can change the greedy token downstream). */
+__device__ static float head_norm_ordered_add(float a, float b) {
+    float r;
+    asm("v_add_f32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+}
+
+/* For 512-wide prefill heads, one wave owns a row instead of a whole block.
+ * Its eight partial sums correspond to lanes l+32*j of the old block; the
+ * 128/64/32 stages stay in registers, followed by the same 16/8/4/2/1 tree
+ * across the wave.  Eight rows share a block without any block barriers. */
+template <bool WAVE = false>
 __global__ static void head_rms_norm_rope_tail_from_half_kernel(
         float *out,
         const __half *x,
@@ -273,26 +287,48 @@ __global__ static void head_rms_norm_rope_tail_from_half_kernel(
         float beta_fast,
         float beta_slow,
         float eps) {
-    uint32_t row = blockIdx.x;
+    const uint32_t lane = WAVE ? (threadIdx.x & 31u) : threadIdx.x;
+    const uint32_t step = WAVE ? 32u : blockDim.x;
+    const uint32_t row = WAVE ? blockIdx.x * 8u + (threadIdx.x >> 5u) : blockIdx.x;
     if (row >= n_tok * n_head) return;
-    uint32_t t = row / n_head;
+    const uint32_t t = row / n_head;
     const __half *xr = x + (uint64_t)row * head_dim;
     float *orow = out + (uint64_t)row * head_dim;
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = __half2float(xr[i]);
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    float scale;
+    if constexpr (WAVE) {
+        float v[16], sum[8];
+#pragma unroll
+        for (uint32_t j = 0; j < 16u; j++) v[j] = __half2float(xr[lane + 32u * j]);
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) sum[j] = __builtin_fmaf(v[j + 8u], v[j + 8u], v[j] * v[j]);
+#pragma unroll
+        for (uint32_t j = 0; j < 4u; j++) sum[j] = head_norm_ordered_add(sum[j], sum[j + 4u]);
+#pragma unroll
+        for (uint32_t j = 0; j < 2u; j++) sum[j] = head_norm_ordered_add(sum[j], sum[j + 2u]);
+        float total = head_norm_ordered_add(sum[0], sum[1]);
+#pragma unroll
+        for (uint32_t delta = 16u; delta > 0u; delta >>= 1u) {
+            total = head_norm_ordered_add(total, __shfl_down(total, delta, 32));
+        }
+        total = __shfl(total, 0, 32);
+        scale = rsqrtf(total / (float)head_dim + eps);
+    } else {
+        float sum = 0.0f;
+        for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = __half2float(xr[i]);
+            sum += v * v;
+        }
+        __shared__ float partial[256];
+        partial[threadIdx.x] = sum;
         __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        scale = rsqrtf(partial[0] / (float)head_dim + eps);
     }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
     const uint32_t n_nope = head_dim - n_rot;
-    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
+    for (uint32_t i = lane; i < n_nope; i += step) {
         orow[i] = __half2float(xr[i]) * scale;
     }
 
@@ -307,7 +343,7 @@ __global__ static void head_rms_norm_rope_tail_from_half_kernel(
     const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
     const __half *tail = xr + n_nope;
     float *otail = orow + n_nope;
-    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
+    for (uint32_t pair = lane; pair < n_rot / 2; pair += step) {
         uint32_t i = pair * 2u;
         float theta_extrap = (float)(pos0 + t) * powf(theta_scale, (float)pair);
         float theta_interp = freq_scale * theta_extrap;
@@ -682,10 +718,18 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
             return 0;
         }
     }
-    head_rms_norm_rope_tail_from_half_kernel<<<n_tok * n_head, 256>>>(
-            (float *)out->ptr, (const __half *)q_half->ptr, n_tok, n_head, head_dim, n_rot,
-            pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
-            beta_fast, beta_slow, eps);
+    if (head_dim == 512u && n_tok >= 32u && ds4_rocm_is_gfx1151() &&
+        ds4_rocm_gfx1151_flag("DS4_ROCM_Q_NORM_WAVE")) {
+        head_rms_norm_rope_tail_from_half_kernel<true><<<(n_tok * n_head + 7u) / 8u, 256>>>(
+                (float *)out->ptr, (const __half *)q_half->ptr, n_tok, n_head, head_dim, n_rot,
+                pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
+                beta_fast, beta_slow, eps);
+    } else {
+        head_rms_norm_rope_tail_from_half_kernel<<<n_tok * n_head, 256>>>(
+                (float *)out->ptr, (const __half *)q_half->ptr, n_tok, n_head, head_dim, n_rot,
+                pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
+                beta_fast, beta_slow, eps);
+    }
     return cuda_ok(cudaGetLastError(), "attn q_b f16-out head_rms_norm_rope launch");
 }
 

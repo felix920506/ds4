@@ -138,6 +138,27 @@ Qwen routed MoE quantization specialization is enabled by default on M3 Ultra.
 other devices. To compare the final default against rollback, pass
 `--candidate-env DS4_QWEN4_MOE_MM_SPECIALIZE --candidate-value 0` to the harness.
 
+### ROCm prefill variant A/B
+
+After `make strix-halo`, build the same balanced harness for ROCm:
+
+```sh
+make rocm-prefill-variant-bench
+./speed-bench/rocm_prefill_variant_bench \
+  -m gguf/MODEL.gguf --prompt-file speed-bench/promessi_sposi.txt \
+  --candidate-env DS4_ROCM_Q_NORM_WAVE --candidate-value 0 \
+  --prefix-tokens 8192 --prefill-chunk 2048 --warmup-tokens 2048 --repeats 2
+```
+
+The default is the optimized control; the candidate restores the original
+256-thread Q head normalization. Both use the same loaded model and hipBLASLt
+plans. Warm up at the measured chunk size to exclude first-use GEMM tuning.
+Every full-vocabulary frontier must match bit for bit, including across
+alternating ABBA/BAAB runs. `DS4_ROCM_Q_NORM_WAVE=0` is a diagnostic rollback;
+the wave path is enabled by default for 512-wide prefill heads on gfx1151.
+`make test-rocm-head-norm` checks the fused projection against the original
+normalization and RoPE using its actual F16 GEMM output.
+
 ### Concurrency: many requests at once
 
 `session_concurrency_bench` measures the engine without HTTP overhead.
