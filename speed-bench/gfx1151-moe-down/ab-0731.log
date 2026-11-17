@@ -1,0 +1,34 @@
+ds4: Linux rocm backend set oom_score_adj=1000
+ds4: warming mapped tensor pages: 80.76 GiB
+ds4: warmed tensor pages in 52.002s (checksum=2606653865)
+ds4: ROCm backend initialized on AMD Radeon 8060S Graphics (sm_115)
+ds4: ROCm preparing model tensor mappings
+ds4: ROCm loading model tensors into device cache
+ds4: ROCm loading model tensors 16.02 GiB cached
+ds4: ROCm prepared model tensor mappings 16.37 GiB
+ds4: ROCm loading model tensors 32.06 GiB cached
+ds4: ROCm prepared model tensor mappings 32.07 GiB
+ds4: ROCm loading model tensors 47.70 GiB cached
+ds4: ROCm prepared model tensor mappings 47.77 GiB
+ds4: ROCm loading model tensors 48.02 GiB cached
+ds4: ROCm prepared model tensor mappings 48.43 GiB
+ds4: ROCm loading model tensors 64.06 GiB cached
+ds4: ROCm prepared model tensor mappings 64.13 GiB
+ds4: ROCm loading model tensors 80.04 GiB cached
+ds4: ROCm prepared model tensor mappings 80.24 GiB
+ds4: ROCm startup model preparation covered 80.76 GiB of tensor spans in 45.997s
+ds4: rocm backend initialized for graph diagnostics
+ds4: memory: KV 0.29 GiB (raw 0.19 + compressed 0.11) + buffers 0.03 GiB + resident model 80.76 GiB = 81.09 GiB planned
+ds4: memory detail: ctx=8193 prefill_cap=2048 raw_kv_rows=2304 compressed_kv_rows=2050 backend=rocm
+rocm-prefill-variant-bench: model=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf prompt=speed-bench/promessi_sposi.txt prefix=8192 initial=0 warmup=2048 ctx=8193 repeats=2 candidate_env=DS4_ROCM_MOE_DOWN_NARROW candidate_value=0 control_value=<unset> prefill_chunk=2048
+run=1 repeat=1 pattern=ABBA slot=1 variant=control tokens=8192 seconds=13.635970 tokens_per_second=600.7640 exact=yes
+run=2 repeat=1 pattern=ABBA slot=2 variant=candidate tokens=8192 seconds=13.804523 tokens_per_second=593.4287 exact=yes
+run=3 repeat=1 pattern=ABBA slot=3 variant=candidate tokens=8192 seconds=14.226306 tokens_per_second=575.8347 exact=yes
+run=4 repeat=1 pattern=ABBA slot=4 variant=control tokens=8192 seconds=13.703539 tokens_per_second=597.8018 exact=yes
+run=5 repeat=2 pattern=BAAB slot=1 variant=candidate tokens=8192 seconds=13.896425 tokens_per_second=589.5041 exact=yes
+run=6 repeat=2 pattern=BAAB slot=2 variant=control tokens=8192 seconds=13.750681 tokens_per_second=595.7523 exact=yes
+run=7 repeat=2 pattern=BAAB slot=3 variant=control tokens=8192 seconds=13.769639 tokens_per_second=594.9321 exact=yes
+run=8 repeat=2 pattern=BAAB slot=4 variant=candidate tokens=8192 seconds=14.034573 tokens_per_second=583.7014 exact=yes
+aggregate variant=control runs=4 tokens=32768 seconds=54.859829 tokens_per_second=597.3041
+aggregate variant=candidate runs=4 tokens=32768 seconds=55.961826 tokens_per_second=585.5420
+candidate_delta_percent=-1.9692 exact_runs=8 exact_floats=1034240 vocab=129280

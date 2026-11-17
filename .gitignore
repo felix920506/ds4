@@ -138,3 +138,5 @@ __pycache__/
 
 /tests/test_rocm_head_norm
 /speed-bench/rocm_prefill_variant_bench
+
+/tests/test_rocm_moe_down

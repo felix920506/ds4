@@ -159,6 +159,11 @@ the wave path is enabled by default for 512-wide prefill heads on gfx1151.
 `make test-rocm-head-norm` checks the fused projection against the original
 normalization and RoPE using its actual F16 GEMM output.
 
+To compare the smaller Q2_K routed-down blocks, use
+`--candidate-env DS4_ROCM_MOE_DOWN_NARROW --candidate-value 0` with the
+same command. `make test-rocm-moe-down` covers the production routing path.
+See [routed-down measurements](gfx1151-moe-down/README.md).
+
 ### Concurrency: many requests at once
 
 `session_concurrency_bench` measures the engine without HTTP overhead.
