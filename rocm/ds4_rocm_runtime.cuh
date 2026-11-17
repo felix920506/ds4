@@ -4782,7 +4782,6 @@ struct ds4_rocm_runtime_config {
     int q8_decode_sharedx_64k;
     int graph_dump;
     uint32_t q8_decode_rpb;
-    uint32_t q8_hc_decode_rpb;
     uint32_t attn_out_low_decode_rpb;
     uint32_t moe_decode_rpb;
     uint32_t moe_decode_gate_rpb;
@@ -4844,7 +4843,6 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.graph_dump =
             graph_dump_requested && !graph_dump_noninvasive;
         g_rocm_cfg.q8_decode_rpb = 1u;
-        g_rocm_cfg.q8_hc_decode_rpb = 16u;
         g_rocm_cfg.attn_out_low_decode_rpb = 32u;
         const char *moe_decode_rpb_env = getenv("DS4_ROCM_MOE_DECODE_RPB");
         const int moe_decode_rpb_env_present =
