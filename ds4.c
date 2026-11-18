@@ -18836,8 +18836,10 @@ static bool metal_graph_kv_reserve_scratch(ds4_gpu_graph *g, uint64_t need_bytes
     for (int i = 0; i < 2; i++) {
         const uint64_t have = ds4_gpu_tensor_bytes(*scratch[i]);
         if (need_bytes <= have || need_bytes > reserved) continue;
-        uint64_t bytes = 2u * have;
-        if (bytes < need_bytes) bytes = need_bytes;
+        /* Nothing is copied, so a quarter of slack is enough to keep a long
+         * prefill from reallocating at every chunk; doubling would hold
+         * gigabytes the weight cache could use. */
+        uint64_t bytes = need_bytes + need_bytes / 4u;
         if (bytes > reserved) bytes = reserved;
         if (!metal_graph_kv_resize(g, scratch[i], bytes, 0, false)) return false;
     }
