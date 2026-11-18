@@ -5513,6 +5513,17 @@ static int cuda_stream_model_cache_prepare_memory(
 
 extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom);
 
+/* Before an allocation that must not fail (fixed weights, session buffers):
+ * if it does not fit, give up optional memory, cheapest first.  Both steps
+ * synchronize the device before they free anything. */
+static void cuda_memory_make_room(uint64_t bytes) {
+    uint64_t missing = ds4_gpu_memory_shortfall(bytes, 0);
+    if (missing && cuda_q8_f16_cache_evict(missing)) {
+        missing = ds4_gpu_memory_shortfall(bytes, 0);
+    }
+    if (missing) (void)ds4_gpu_reclaim_weights(missing);
+}
+
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -5535,8 +5546,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     /* The weights every token needs load after the elastic expert tables.
      * When they do not fit, routed experts give way: those can be read back
      * on demand, these cannot. */
-    const uint64_t missing = ds4_gpu_memory_shortfall(chunk, 0);
-    if (missing) (void)ds4_gpu_reclaim_weights(missing);
+    cuda_memory_make_room(chunk);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -5929,6 +5939,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    cuda_memory_make_room(bytes);
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
         return NULL;
@@ -5942,6 +5953,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    cuda_memory_make_room(bytes);
     if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
         free(t);
         return NULL;
