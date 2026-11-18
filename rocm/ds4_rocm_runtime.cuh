@@ -5004,6 +5004,8 @@ static void cuda_q8_f16_cache_budget_notice(
     }
 }
 
+static int cuda_elastic_weights_evicted(void); /* ds4_rocm_elastic.cuh */
+
 static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
     (void)label;
     const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
@@ -5012,6 +5014,10 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
         cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
         return 0;
     }
+
+    /* Evicted routed experts cost disk reads on every miss; free memory goes
+     * back to them (cuda_elastic_maybe_grow) before it expands any weight. */
+    if (cuda_elastic_weights_evicted()) return 0;
 
     size_t free_b = 0;
     size_t total_b = 0;
@@ -6006,27 +6012,14 @@ extern "C" uint64_t ds4_gpu_memory_ceiling(int movable) {
         return 0;
     }
     const uint64_t reserve = cuda_memory_os_reserve_bytes();
+    /* Evictable routed experts are pinned device memory like the F16 cache. */
     return (free_b > reserve ? (uint64_t)free_b - reserve : 0) + g_q8_f16_bytes +
+           ds4_gpu_reclaimable_weight_bytes() +
            (movable && ds4_rocm_uses_host_ram() ? ds4_linux_cma_free_memory() : 0);
 }
 
-/* Last step of the chain.  No resident weight is evictable yet; routed
- * experts that can be read back from disk plug in here. */
-extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
-    (void)need_bytes;
-    return 0;
-}
-
 extern "C" uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes) {
-    static uint64_t (*const steps[])(uint64_t) = {
-        cuda_q8_f16_cache_evict,
-        ds4_gpu_reclaim_weights,
-    };
-    uint64_t freed = 0;
-    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]) && freed < need_bytes; i++) {
-        freed += steps[i](need_bytes - freed);
-    }
-    return freed;
+    return cuda_q8_f16_cache_evict(need_bytes);
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {

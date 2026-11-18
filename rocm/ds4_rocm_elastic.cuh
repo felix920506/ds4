@@ -96,6 +96,13 @@ static int cuda_elastic_full(const cuda_elastic_layer &l) {
     return l.slots == l.t.n_total_expert;
 }
 
+static int cuda_elastic_weights_evicted(void) {
+    for (const cuda_elastic_layer &l : g_elastic_layers) {
+        if (l.block && !cuda_elastic_full(l)) return 1;
+    }
+    return 0;
+}
+
 /* The three sections of a block with the given slot count. */
 struct cuda_elastic_view {
     char *gate;

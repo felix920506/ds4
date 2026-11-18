@@ -18715,6 +18715,12 @@ static bool metal_graph_kv_make_room(ds4_gpu_graph *g, uint64_t bytes, bool keep
         ds4_gpu_reclaim_memory(missing);
         missing = ds4_gpu_memory_shortfall(bytes, keep_cache_headroom);
     }
+    /* Last resort, measured again because an emptied F16 cache needs no
+     * headroom: routed experts come back from disk at a real cost in speed. */
+    if (missing) {
+        ds4_gpu_reclaim_weights(missing);
+        missing = ds4_gpu_memory_shortfall(bytes, keep_cache_headroom);
+    }
     return missing == 0;
 }
 
@@ -91272,6 +91278,26 @@ void ds4_session_set_test_images(ds4_session *s,
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
+}
+
+uint64_t ds4_session_context_memory_bytes(const ds4_session *s) {
+    uint64_t bytes = 0;
+#ifndef DS4_NO_GPU
+    if (!s || !s->graph.kv_on_demand) return 0;
+    const ds4_gpu_graph *g = &s->graph;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bytes += ds4_gpu_tensor_bytes(g->layer_raw_cache[il]) +
+                 ds4_gpu_tensor_bytes(g->layer_attn_comp_cache[il]) +
+                 ds4_gpu_tensor_bytes(g->layer_index_comp_cache[il]);
+    }
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        bytes += ds4_gpu_tensor_bytes(g->indexer_scores_by_tier[t]) +
+                 ds4_gpu_tensor_bytes(g->comp_mask_by_tier[t]);
+    }
+#else
+    (void)s;
+#endif
+    return bytes;
 }
 
 int ds4_session_prefill_cap(ds4_session *s) {

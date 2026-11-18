@@ -9467,7 +9467,6 @@ int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n) {
 }
 
 /* Metal allocates the context up front and keeps no evictable cache. */
-uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) { (void)need_bytes; return 0; }
 uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes) { (void)need_bytes; return 0; }
 
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {

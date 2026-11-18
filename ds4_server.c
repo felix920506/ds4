@@ -15364,6 +15364,10 @@ static uint64_t slot_kick(server *s, server_slot *slot, const char *reason) {
             return 0;
         }
     }
+    /* What the session really holds when its context is committed on demand;
+     * the full-context estimate otherwise. */
+    uint64_t freed = ds4_session_context_memory_bytes(slot->session);
+    if (!freed) freed = s->slot_session_bytes;
     ds4_session_free(slot_detach_session(s, slot));
     __atomic_sub_fetch(&s->resident_sessions, 1, __ATOMIC_RELAXED);
 
@@ -15378,8 +15382,8 @@ static uint64_t slot_kick(server *s, server_slot *slot, const char *reason) {
                cost == KICK_LOSSY ? "dropped (the conversation needs a new prefill)" :
                written ? "saved" : "already on disk",
                (double)written / (1024.0 * 1024.0),
-               (double)s->slot_session_bytes / (1024.0 * 1024.0 * 1024.0));
-    return s->slot_session_bytes;
+               (double)freed / (1024.0 * 1024.0 * 1024.0));
+    return freed;
 }
 
 /* Kick idle slots, cheapest first, until need_bytes are released or no

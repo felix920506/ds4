@@ -3236,7 +3236,6 @@ static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
 }
 
 /* CUDA allocates the context up front and keeps no evictable cache. */
-extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) { (void)need_bytes; return 0; }
 extern "C" uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes) { (void)need_bytes; return 0; }
 
 extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {

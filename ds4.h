@@ -659,6 +659,9 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
+/* Context memory this session holds right now, when the backend commits it on
+ * demand; 0 when the context was allocated up front (see the estimate). */
+uint64_t ds4_session_context_memory_bytes(const ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
