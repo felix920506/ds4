@@ -18918,6 +18918,33 @@ static bool metal_graph_kv_refit(
     return true;
 }
 
+/* The same for a checkpoint shard that carries only layers
+ * [layer_start, layer_start + n_layers): the other layers keep their rows. */
+static bool metal_graph_kv_refit_layers(
+        ds4_gpu_graph  *g,
+        uint32_t        layer_start,
+        uint32_t        n_layers,
+        const uint32_t *n_comp,
+        const uint32_t *n_index_comp) {
+    if (!g->kv_on_demand) return true;
+    for (uint32_t i = 0; i < n_layers; i++) {
+        const uint32_t il = layer_start + i;
+        g->layer_n_comp[il] = 0;
+        g->layer_n_index_comp[il] = 0;
+        for (int indexer = 0; indexer < 2; indexer++) {
+            ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
+                                             : &g->layer_attn_comp_cache[il];
+            if (!*cache) continue;
+            const uint32_t valid = indexer ? n_index_comp[i] : n_comp[i];
+            const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
+                metal_graph_kv_rows_for(0, valid, g->layer_comp_cap[il]);
+            if (bytes != ds4_gpu_tensor_bytes(*cache) &&
+                !metal_graph_kv_resize(g, cache, bytes, 0, g->kv_managed)) return false;
+        }
+    }
+    return true;
+}
+
 /* =========================================================================
  * Metal Diagnostic Dump Hooks.
  * =========================================================================
@@ -65492,6 +65519,12 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     ds4_session_dspark_capture_invalidate(s);
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
+    if (!metal_graph_kv_refit_layers(g, layer_start, n_layers, n_comp, n_index_comp)) {
+        free(n_comp);
+        free(n_index_comp);
+        payload_set_err(err, errlen, "not enough memory for the KV shard");
+        return 1;
+    }
 
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
@@ -77248,16 +77281,18 @@ static int ds4_session_attach_distributed(ds4_session *s, ds4_engine *e,
 }
 
 #ifndef DS4_NO_GPU
-/* Sessions commit their context on demand on the ROCm backend, for the plain
- * resident single-host graph.  SSD streaming budgets its expert cache against
- * a context allocated in full, and distributed or tensor-parallel sessions
- * mirror allocations across processes, so those keep the up-front allocation
- * Metal and CUDA use.  DS4_ROCM_KV_UPFRONT=1 forces it for A/B validation. */
+/* Sessions commit their context on demand on the ROCm backend, for the
+ * resident graph on one host and for pipeline stages, where every process
+ * grows the caches of its own layer slice as that slice sees the tokens.
+ * SSD streaming budgets its expert cache against a context allocated in
+ * full, and tensor-parallel ranks mirror allocations across processes, so
+ * those keep the up-front allocation Metal and CUDA use.
+ * DS4_ROCM_KV_UPFRONT=1 forces it for A/B validation; a pipeline needs it on
+ * no particular stage, since stages do not see each other's allocations. */
 static bool ds4_engine_kv_on_demand(const ds4_engine *e) {
 #ifdef DS4_ROCM_BUILD
     return e->backend == DS4_BACKEND_CUDA && !e->ssd_streaming && !e->multi_tier &&
            !e->cuda_tensor_parallel && !e->tp.active &&
-           e->distributed.role == DS4_DISTRIBUTED_NONE &&
            getenv("DS4_ROCM_KV_UPFRONT") == NULL;
 #else
     (void)e;
