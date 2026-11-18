@@ -62,11 +62,34 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+### Context memory on demand
+
+Resident Flash on ROCm commits a session's context memory as the context
+fills. `--ctx` is a reservation: the compressed KV caches and the indexer
+scratch start small and grow, so a 1M-token session costs a short prompt
+nothing. With a 1M reservation, 2K-token prefill is 466 tok/s instead of 153,
+because the Q8->F16 weight cache keeps the memory the context is not using.
+`DS4_ROCM_KV_UPFRONT=1` restores up-front allocation for comparison.
+
+When an allocation does not fit, memory is taken back in this order:
+
+1. Idle server slots: saved to the disk KV cache and freed (see
+   [Serving](SERVER.md)).
+2. The Q8->F16 weight cache: later prefill runs the Q8 kernels.
+3. Routed experts: read back from the GGUF on demand (next section). This is
+   the last resort; it costs real speed.
+
+Free memory goes back the other way: experts first, then the F16 cache. A
+session is refused at creation only if its full reservation could not be
+committed with all three given up. Output does not depend on the first and
+third step. The second changes which kernels prefill runs, as a small or large
+`--ctx` already did.
+
 ### Elastic expert weights
 
 Resident Flash on ROCm loads each layer's routed experts as its own device
-block. `ds4_gpu_reclaim_weights()` can then evict cold experts when the KV
-cache needs memory, and they are read back from the GGUF on demand; attention,
+block. `ds4_gpu_reclaim_weights()` can then evict cold experts when the context,
+a new session or the fixed weights at load need memory, and they are read back from the GGUF on demand; attention,
 shared experts and all other weights always stay resident. The mechanism and
 its policy are documented in `rocm/ds4_rocm_elastic.cuh`. Results do not
 change: evicted layers run the same kernels on the same bytes.
