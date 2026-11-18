@@ -177,7 +177,7 @@ so a request's cost is split into:
 | `ds4_kv_save_*`, `ds4_kv_load_*` | Disk KV payloads written and restored, bytes, seconds |
 | `ds4_net_*` | Bytes and blocked seconds exchanged with other nodes (pipeline or TP), gate count, and worker compute reported in pipeline telemetry |
 | `ds4_ssd_read_*` | Routed-expert bytes streamed from disk and seconds |
-| `ds4_server_*` | Requests by endpoint and finish reason, prompt/cached/completion tokens, queue-wait, time-to-first-token and request-duration histograms, disk KV and image cache hits, slot kicks (`ds4_server_slot_kicks_total` by `state="saved"` or `"dropped"`, `ds4_server_slot_kick_bytes_total`), live gauges including `ds4_server_resident_sessions` |
+| `ds4_server_*` | Requests by endpoint and finish reason, prompt/cached/completion tokens, queue-wait, time-to-first-token and request-duration histograms, disk KV and image cache hits, slot kicks (`ds4_server_slot_kicks_total`, `state="saved"` when nothing was lost and `"dropped"` when the conversation must be prefilled again; `ds4_server_slot_kick_bytes_total`), live gauges including `ds4_server_resident_sessions` |
 
 On a distributed coordinator the network wait is nested inside prefill and
 decode time; `network_transport_seconds_estimate` in the JSON view subtracts

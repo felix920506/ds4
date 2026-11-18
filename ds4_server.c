@@ -6984,8 +6984,8 @@ typedef struct {
     uint64_t kv_disk_lookups;
     uint64_t kv_disk_hits;
     uint64_t kv_disk_stores;
-    uint64_t slot_kicks_saved;   /* state on disk, session freed */
-    uint64_t slot_kicks_dropped; /* session freed, state lost */
+    uint64_t slot_kicks_saved;   /* session freed, nothing lost: on disk or empty */
+    uint64_t slot_kicks_dropped; /* session freed, conversation state lost */
     uint64_t slot_kick_bytes;    /* KV payload bytes written by kicks */
     uint64_t image_cache_hits;
     uint64_t image_encodes;
@@ -15306,7 +15306,8 @@ static server_slot *slot_kick_victim_locked(server *s) {
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
-        if (!slot->session || slot->busy || slot->assigned || slot->kicking ||
+        /* Idle first: only an idle slot's session pointer is stable. */
+        if (slot->busy || slot->assigned || slot->kicking || !slot->session ||
             ds4_session_is_distributed(slot->session)) continue;
         bool pinned = false;
         for (const job *j = s->head; j && !pinned; j = j->next)
@@ -16022,7 +16023,7 @@ static void metrics_render_prometheus(server *s, buf *b) {
     metrics_prom_u64(b, "ds4_server_kv_disk_stores_total", "counter",
                      "Disk KV cache checkpoints written.", m.kv_disk_stores);
     metrics_prom_header(b, "ds4_server_slot_kicks_total", "counter",
-                        "Idle sessions freed for an active request, by what happened to their state.");
+                        "Idle sessions freed for an active request; saved: nothing lost, dropped: the conversation prefills again.");
     buf_printf(b, "ds4_server_slot_kicks_total{state=\"saved\"} %llu\n"
                   "ds4_server_slot_kicks_total{state=\"dropped\"} %llu\n",
                (unsigned long long)m.slot_kicks_saved,
@@ -16385,13 +16386,25 @@ static void *client_main(void *arg) {
 
     /* Diagnostic: stand in for the engine's memory-pressure call, so kicks
      * can be exercised on a machine with memory to spare.  The body is the
-     * byte count to ask for. */
+     * byte count to ask for; a following "restore" makes the call arrive
+     * the way it does from a disk checkpoint load, under inference_mu and
+     * kv_mu. */
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/memory-pressure") &&
         getenv("DS4_SERVER_DEBUG_MEMORY_PRESSURE")) {
         const uint64_t need = hr.body ? strtoull(hr.body, NULL, 10) : 0;
+        const bool restore = hr.body && strstr(hr.body, "restore");
+        if (restore) {
+            pthread_mutex_lock(&s->inference_mu);
+            pthread_mutex_lock(&s->kv_mu);
+        }
+        const uint64_t freed = server_memory_pressure(s, need ? need : 1);
+        if (restore) {
+            pthread_mutex_unlock(&s->kv_mu);
+            pthread_mutex_unlock(&s->inference_mu);
+        }
         char body[64];
         snprintf(body, sizeof(body), "{\"freed_bytes\":%llu}\n",
-                 (unsigned long long)server_memory_pressure(s, need ? need : 1));
+                 (unsigned long long)freed);
         http_response(fd, s->enable_cors, 200, "application/json", body);
         http_request_free(&hr);
         goto done;

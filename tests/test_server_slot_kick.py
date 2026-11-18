@@ -102,6 +102,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--kick", type=int, default=0,
                     help="slots to kick between the two turns")
+    ap.add_argument("--restore-locks", action="store_true",
+                    help="kick the way the engine asks during a disk restore")
     ap.add_argument("--min-kicks", type=int, default=0,
                     help="fail unless the server kicked at least this often")
     ap.add_argument("--pid", type=int, default=0, help="server pid, for memory")
@@ -129,7 +131,8 @@ def main():
 
     if args.kick:
         for _ in range(args.kick):
-            freed = http(args.base, "/debug/memory-pressure", b"1")["freed_bytes"]
+            freed = http(args.base, "/debug/memory-pressure",
+                         b"1 restore" if args.restore_locks else b"1")["freed_bytes"]
             print("kick: freed_bytes=%d" % freed)
             if freed == 0:
                 failures.append("a kick released nothing")
