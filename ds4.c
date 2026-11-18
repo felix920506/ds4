@@ -17367,6 +17367,13 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
         name, minv, maxv, sqrt(ss / (double)n));
 }
 
+/* The engine's memory pressure handler: the first step of the reclaim chain
+ * that feeds on-demand context memory. */
+typedef struct {
+    ds4_memory_pressure_fn fn;
+    void *user;
+} ds4_memory_pressure;
+
 #ifndef DS4_NO_GPU
 /*
  * Metal stores the persistent attention-compressed KV cache in F16. Producers
@@ -17468,6 +17475,12 @@ typedef struct {
      * for every ratio-128 layer. */
     uint32_t layer_comp_cap[DS4_MAX_LAYER];
     uint32_t attn_comp_stage_cap;
+    /* Non-NULL when the context-sized tensors are committed on demand (see
+     * "On-demand context memory"); it is the engine's pressure handler.
+     * comp_cap and layer_comp_cap stay the reserved full-context maximum; the
+     * committed size is the tensor size. */
+    const ds4_memory_pressure *kv_on_demand;
+    bool kv_managed; /* the KV caches live in managed (movable) memory */
 
     /* Class P (per-layer work tensors). Each used tier has its
      * own replica. They are reused in place by every layer instead of
@@ -18624,6 +18637,274 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
 }
 
 /* =========================================================================
+ * On-demand context memory (ROCm).
+ * =========================================================================
+ *
+ * A session reserves its whole context, but a million-token session that
+ * holds 2K tokens uses a thousandth of it.  Committing the reservation at
+ * creation costs twice on a unified-memory machine: the pages are pinned from
+ * token 0, and the optional Q8->F16 weight cache that makes prefill fast gets
+ * no room.  So the tensors that scale with the context start small and grow:
+ *
+ *   - the compressed attention and indexer caches, one row per `ratio`
+ *     tokens: geometric growth, valid rows copied to the new tensor;
+ *   - the indexer score and top-k mask scratch, one float per (visible row,
+ *     chunk token): grown to what the current step needs, nothing to copy.
+ *
+ * Kernels receive valid row counts, never capacities, so only the allocation
+ * moves.  Growth happens at the top of a layer, before the layer creates a
+ * view or launches a kernel on these tensors, and waits for queued kernels
+ * before the old buffer is freed.
+ *
+ * Memory comes from the reclaim chain when it is short: the engine's pressure
+ * handler (the server parks idle sessions on disk), then the backend's
+ * optional caches.  A session is still admitted only if its whole reservation
+ * fits once those caches are gone, so alone it can reach its context limit;
+ * several sessions may reserve more than the machine holds together, and then
+ * rely on the pressure handler or fail the step that cannot grow.
+ */
+enum { DS4_KV_ON_DEMAND_MIN_ROWS = 2048 }; /* 8K tokens of a ratio-4 layer */
+
+/* Rows a compressed cache starts with.  DS4_ROCM_KV_MIN_ROWS is a diagnostic:
+ * a tiny value makes a short test cross many growth steps. */
+static uint32_t metal_graph_kv_min_rows(void) {
+    const char *env = getenv("DS4_ROCM_KV_MIN_ROWS");
+    const long v = env ? strtol(env, NULL, 10) : 0;
+    return v > 0 && v < DS4_KV_ON_DEMAND_MIN_ROWS ? (uint32_t)v
+                                                  : DS4_KV_ON_DEMAND_MIN_ROWS;
+}
+
+static uint64_t metal_graph_comp_cache_row_bytes(bool indexer) {
+    return indexer
+        ? (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float)
+        : (uint64_t)DS4_N_HEAD_DIM *
+          (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float));
+}
+
+/* Rows to commit for `need` valid rows: double, within [minimum, reserved]. */
+static uint32_t metal_graph_kv_rows_for(uint32_t have, uint32_t need, uint32_t reserved) {
+    uint64_t rows = 2ull * have;
+    if (rows < need) rows = need;
+    if (rows < metal_graph_kv_min_rows()) rows = metal_graph_kv_min_rows();
+    return rows < reserved ? (uint32_t)rows : reserved;
+}
+
+/* Bytes of one indexer scratch tensor: the full reservation, or what a new
+ * on-demand session starts with. */
+static uint64_t metal_graph_kv_scratch_bytes(const ds4_gpu_graph *g, bool reserved) {
+    const uint32_t rows = reserved ? g->comp_cap
+                                   : metal_graph_kv_rows_for(0, 0, g->comp_cap);
+    return (uint64_t)rows * g->prefill_cap * sizeof(float);
+}
+
+#ifdef DS4_ROCM_BUILD
+/* Free memory until `bytes` more fit, walking the reclaim chain in order. */
+static bool metal_graph_kv_make_room(ds4_gpu_graph *g, uint64_t bytes, bool keep_cache_headroom) {
+    uint64_t missing = ds4_gpu_memory_shortfall(bytes, keep_cache_headroom);
+    if (missing && g->kv_on_demand->fn) {
+        g->kv_on_demand->fn(g->kv_on_demand->user, missing);
+        missing = ds4_gpu_memory_shortfall(bytes, keep_cache_headroom);
+    }
+    if (missing) {
+        ds4_gpu_reclaim_memory(missing);
+        missing = ds4_gpu_memory_shortfall(bytes, keep_cache_headroom);
+    }
+    return missing == 0;
+}
+
+/* A new session is admitted only if the part of its reservation it has not
+ * committed could still be, once the optional caches are evicted.  Managed
+ * caches may also take the CMA region, but each growth step still has to
+ * pass the allocator's check against pinnable memory, so the largest cache
+ * is counted there too. */
+static bool metal_graph_kv_admit(const ds4_gpu_graph *g, uint32_t ctx_size) {
+    uint64_t pinned = 2u * (metal_graph_kv_scratch_bytes(g, true) -
+                            metal_graph_kv_scratch_bytes(g, false));
+    uint64_t caches = 0, largest = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        for (int indexer = 0; indexer < 2; indexer++) {
+            const ds4_gpu_tensor *cache = indexer ? g->layer_index_comp_cache[il]
+                                                  : g->layer_attn_comp_cache[il];
+            if (!cache) continue;
+            const uint64_t reserved = g->layer_comp_cap[il] *
+                                      metal_graph_comp_cache_row_bytes(indexer != 0);
+            caches += reserved - ds4_gpu_tensor_bytes(cache);
+            if (reserved > largest) largest = reserved;
+        }
+    }
+    pinned += g->kv_managed ? largest : caches;
+    const uint64_t total = pinned + (g->kv_managed ? caches - largest : 0);
+    const uint64_t ceiling = ds4_gpu_memory_ceiling(g->kv_managed);
+    if (pinned <= ds4_gpu_memory_ceiling(false) && total <= ceiling) return true;
+    fprintf(stderr,
+            "ds4: not enough memory for a %u token context: it grows by up to "
+            "%.2f GiB, %.2f GiB is free or reclaimable\n",
+            ctx_size,
+            (double)total / 1073741824.0,
+            (double)ceiling / 1073741824.0);
+    return false;
+}
+#else
+static bool metal_graph_kv_make_room(ds4_gpu_graph *g, uint64_t bytes, bool keep_cache_headroom) {
+    (void)g; (void)bytes; (void)keep_cache_headroom;
+    return false;
+}
+static bool metal_graph_kv_admit(const ds4_gpu_graph *g, uint32_t ctx_size) {
+    (void)g; (void)ctx_size;
+    return false;
+}
+#endif
+
+/* Replace *slot with a tensor of new_bytes that keeps the first keep_bytes.
+ * With nothing to keep the old tensor is released first, so a scratch resize
+ * never needs both sizes at once.  On failure the slot still holds a tensor
+ * of the old size. */
+static bool metal_graph_kv_resize(
+        ds4_gpu_graph   *g,
+        ds4_gpu_tensor **slot,
+        uint64_t         new_bytes,
+        uint64_t         keep_bytes,
+        bool             managed) {
+    ds4_gpu_tensor *old = *slot;
+    const uint64_t old_bytes = ds4_gpu_tensor_bytes(old);
+    const uint64_t extra = keep_bytes ? new_bytes
+                                      : (new_bytes > old_bytes ? new_bytes - old_bytes : 0);
+    /* Kernels already queued may still read or write the old buffer. */
+    if (ds4_gpu_synchronize() == 0) return false;
+    if (extra && !metal_graph_kv_make_room(g, extra, false)) {
+        fprintf(stderr,
+                "ds4: out of memory growing the context by %.2f MiB, even after "
+                "reclaiming optional caches\n",
+                (double)extra / 1048576.0);
+        return false;
+    }
+    ds4_gpu_tensor *t = NULL;
+    if (keep_bytes == 0) {
+        ds4_gpu_tensor_free(old);
+        t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
+        *slot = t ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
+    } else {
+        t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
+        if (t && (ds4_gpu_tensor_copy(t, 0, old, 0, keep_bytes) == 0 ||
+                  ds4_gpu_synchronize() == 0)) {
+            ds4_gpu_tensor_free(t);
+            t = NULL;
+        }
+        if (t) {
+            ds4_gpu_tensor_free(old);
+            *slot = t;
+        }
+    }
+    if (!t) {
+        fprintf(stderr, "ds4: context memory allocation failed (%.2f MiB)\n",
+                (double)new_bytes / 1048576.0);
+        return false;
+    }
+    /* Give the optional caches' transient headroom back at their expense.
+     * Asked only now: managed memory may have come out of the CMA region,
+     * in which case it cost none of that headroom. */
+    if (extra) (void)metal_graph_kv_make_room(g, 0, true);
+    return true;
+}
+
+/* Commit room for `add` more rows after the `valid` ones of a compressed
+ * cache.  A count beyond the reservation is left to the caller's capacity
+ * check, which reports it. */
+static bool metal_graph_kv_reserve_rows(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        bool           indexer,
+        uint32_t       valid,
+        uint32_t       add) {
+    ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
+                                     : &g->layer_attn_comp_cache[il];
+    const uint64_t row_bytes = metal_graph_comp_cache_row_bytes(indexer);
+    const uint64_t need = (uint64_t)valid + add;
+    const uint64_t have = ds4_gpu_tensor_bytes(*cache) / row_bytes;
+    if (need <= have || need > g->layer_comp_cap[il]) return true;
+    const uint32_t rows = metal_graph_kv_rows_for((uint32_t)have, (uint32_t)need,
+                                                  g->layer_comp_cap[il]);
+    return metal_graph_kv_resize(g, cache, rows * row_bytes, valid * row_bytes,
+                                 g->kv_managed);
+}
+
+static bool metal_graph_kv_reserve_scratch(ds4_gpu_graph *g, uint64_t need_bytes) {
+    ds4_gpu_tensor **scratch[2] = {
+        &g->indexer_scores_by_tier[0], &g->comp_mask_by_tier[0],
+    };
+    const uint64_t reserved = metal_graph_kv_scratch_bytes(g, true);
+    for (int i = 0; i < 2; i++) {
+        const uint64_t have = ds4_gpu_tensor_bytes(*scratch[i]);
+        if (need_bytes <= have || need_bytes > reserved) continue;
+        uint64_t bytes = 2u * have;
+        if (bytes < need_bytes) bytes = need_bytes;
+        if (bytes > reserved) bytes = reserved;
+        if (!metal_graph_kv_resize(g, scratch[i], bytes, 0, false)) return false;
+    }
+    return true;
+}
+
+/* Make layer il ready for tokens [pos0, pos0 + n_tokens): room for the
+ * compressed rows they emit and for scoring every row visible afterwards
+ * against each of them.  Decode and prefill both append rows only below this
+ * call, which is what lets it be the single growth point. */
+static bool metal_graph_kv_reserve(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       pos0,
+        uint32_t       n_tokens) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (!g->kv_on_demand || ratio == 0) return true;
+    const uint32_t emits = (pos0 % ratio + n_tokens) / ratio;
+    uint64_t rows = (uint64_t)g->layer_n_comp[il] + emits;
+    if (!metal_graph_kv_reserve_rows(g, il, false, g->layer_n_comp[il], emits)) return false;
+    if (ratio == 4) {
+        const uint64_t index_rows = (uint64_t)g->layer_n_index_comp[il] + emits;
+        if (index_rows > rows) rows = index_rows;
+        if (!metal_graph_kv_reserve_rows(g, il, true, g->layer_n_index_comp[il], emits)) {
+            return false;
+        }
+    }
+    return metal_graph_kv_reserve_scratch(g, rows * n_tokens * sizeof(float));
+}
+
+/* Size every compressed cache for the given valid row counts without keeping
+ * its contents, and the scratch back to its minimum: a reset session holds
+ * what a new one holds (n_comp == NULL), and a checkpoint about to be loaded
+ * gets exactly the rows it carries. */
+static bool metal_graph_kv_refit(
+        ds4_gpu_graph  *g,
+        const uint32_t *n_comp,
+        const uint32_t *n_index_comp) {
+    if (!g->kv_on_demand) return true;
+    /* The contents go, and with them the valid rows. */
+    memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
+    memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        for (int indexer = 0; indexer < 2; indexer++) {
+            ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
+                                             : &g->layer_attn_comp_cache[il];
+            if (!*cache) continue;
+            const uint32_t *valid = indexer ? n_index_comp : n_comp;
+            const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
+                metal_graph_kv_rows_for(0, valid ? valid[il] : 0, g->layer_comp_cap[il]);
+            if (bytes != ds4_gpu_tensor_bytes(*cache) &&
+                !metal_graph_kv_resize(g, cache, bytes, 0, g->kv_managed)) return false;
+        }
+    }
+    if (n_comp) return true;
+    const uint64_t scratch_bytes = metal_graph_kv_scratch_bytes(g, false);
+    ds4_gpu_tensor **scratch[2] = {
+        &g->indexer_scores_by_tier[0], &g->comp_mask_by_tier[0],
+    };
+    for (int i = 0; i < 2; i++) {
+        if (scratch_bytes != ds4_gpu_tensor_bytes(*scratch[i]) &&
+            !metal_graph_kv_resize(g, scratch[i], scratch_bytes, 0, false)) return false;
+    }
+    return true;
+}
+
+/* =========================================================================
  * Metal Diagnostic Dump Hooks.
  * =========================================================================
  *
@@ -19320,8 +19601,10 @@ static bool metal_graph_alloc_raw_cap(
         bool                    cuda_tensor_parallel,
         const ds4_gpu_graph    *shared_prefill_workspace) {
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
+    const ds4_memory_pressure *const kv_on_demand = g->kv_on_demand;
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
+    g->kv_on_demand = kv_on_demand;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
@@ -19459,6 +19742,15 @@ static bool metal_graph_alloc_raw_cap(
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
     const bool managed_kv_cache =
         ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
+    /* Caches committed on demand keep this choice, made for the reserved
+     * size.  On Strix Halo a very large context still needs managed memory:
+     * it is movable, so it can live in the CMA region (about 10 GiB) that
+     * pinned device memory cannot use, and a 1M-token context grows by 21 GiB
+     * with 20 GiB of other memory left.  What it no longer costs is speed.
+     * The ~10% prefill loss came from committing the whole cache at
+     * allocation; a managed cache that grows with the context measures like
+     * device memory (465 vs 461 tok/s for a 2K-token prefill). */
+    g->kv_managed = managed_kv_cache;
     if (managed_kv_cache) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
@@ -19563,10 +19855,13 @@ static bool metal_graph_alloc_raw_cap(
             const uint32_t coff = ratio == 4 ? 2u : 1u;
             const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
             const uint64_t attn_rows = (uint64_t)coff * ratio;
+            const uint32_t comp_rows = g->kv_on_demand
+                ? metal_graph_kv_rows_for(0, 0, g->layer_comp_cap[il])
+                : g->layer_comp_cap[il];
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                     managed_kv_cache,
                     layer_tier,
-                    (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
+                    (uint64_t)comp_rows * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             if (layer_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
@@ -19610,7 +19905,7 @@ static bool metal_graph_alloc_raw_cap(
                 g->layer_index_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
                         managed_kv_cache,
                         layer_tier,
-                        (uint64_t)g->layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+                        (uint64_t)comp_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
                 g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 g->layer_index_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                 if (enable_frontier_snapshot) {
@@ -19662,8 +19957,10 @@ static bool metal_graph_alloc_raw_cap(
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
-        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
+                t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
+                t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
         g->comp_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                 (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) * pc * sizeof(uint32_t));
         g->heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_dim * sizeof(float));
@@ -19954,6 +20251,10 @@ static bool metal_graph_alloc_raw_cap(
                     g->cpu_router_norm &&
                     (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->batch_q_half) &&
                     g->prefill_seed_router_selected;
+    if (ok && g->kv_on_demand && !metal_graph_kv_admit(g, ctx_size)) {
+        metal_graph_free(g);
+        return false;
+    }
     if (!ok) metal_graph_free(g);
     return ok;
 }
@@ -24393,7 +24694,7 @@ static bool metal_graph_encode_decode_layer_phase(
         (uint32_t)DS4_N_HEAD / 2u : (uint32_t)DS4_N_HEAD;
     const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
 
-    bool ok = true;
+    bool ok = metal_graph_kv_reserve(g, il, pos, 1);
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
     const bool fuse_shared_gate_up =
@@ -31396,6 +31697,7 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    if (!metal_graph_kv_reserve(g, il, pos0, n_tokens)) return false;
 
     const bool tp_head_split =
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -37958,6 +38260,8 @@ static void imatrix_collector_report_coverage(
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
+    /* An emptied context gives its memory back. */
+    if (!metal_graph_kv_refit(g, NULL, NULL)) return false;
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
     metal_graph_dspark_capture_invalidate(g);
@@ -44810,6 +45114,7 @@ typedef enum {
 
 struct ds4_engine {
     char *model_path;
+    ds4_memory_pressure memory_pressure;
     uint64_t ds41_session_bytes;
     uint64_t qwen4_session_bytes;
     ds4_model model;
@@ -67005,6 +67310,11 @@ static int ds4_session_load_payload_unmetered(ds4_session *s, FILE *fp, uint64_t
     ds4_session_dspark_capture_invalidate(s);
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
+    if (!metal_graph_kv_refit(g, n_comp, n_index_comp)) {
+        token_vec_free(&new_checkpoint);
+        payload_set_err(err, errlen, "not enough memory for the KV checkpoint");
+        return 1;
+    }
 
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     int rc = 0;
@@ -75617,6 +75927,12 @@ int ds4_engine_power(ds4_engine *e) {
     return e ? e->power_percent : 100;
 }
 
+void ds4_engine_set_memory_pressure_handler(ds4_engine *e, ds4_memory_pressure_fn fn, void *user) {
+    if (!e) return;
+    e->memory_pressure.fn = fn;
+    e->memory_pressure.user = user;
+}
+
 int ds4_engine_set_power(ds4_engine *e, int power_percent) {
     if (!e || power_percent < 1 || power_percent > 100) return 1;
     e->power_percent = power_percent;
@@ -76845,6 +77161,25 @@ static int ds4_session_attach_distributed(ds4_session *s, ds4_engine *e,
     return 0;
 }
 
+#ifndef DS4_NO_GPU
+/* Sessions commit their context on demand on the ROCm backend, for the plain
+ * resident single-host graph.  SSD streaming budgets its expert cache against
+ * a context allocated in full, and distributed or tensor-parallel sessions
+ * mirror allocations across processes, so those keep the up-front allocation
+ * Metal and CUDA use.  DS4_ROCM_KV_UPFRONT=1 forces it for A/B validation. */
+static bool ds4_engine_kv_on_demand(const ds4_engine *e) {
+#ifdef DS4_ROCM_BUILD
+    return e->backend == DS4_BACKEND_CUDA && !e->ssd_streaming && !e->multi_tier &&
+           !e->cuda_tensor_parallel && !e->tp.active &&
+           e->distributed.role == DS4_DISTRIBUTED_NONE &&
+           getenv("DS4_ROCM_KV_UPFRONT") == NULL;
+#else
+    (void)e;
+    return false;
+#endif
+}
+#endif
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -77178,6 +77513,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             ? &e->shared_prefill_workspace
             : NULL;
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
+    s->graph.kv_on_demand = ds4_engine_kv_on_demand(e) ? &e->memory_pressure : NULL;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    need_spec_verifier,

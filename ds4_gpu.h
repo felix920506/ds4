@@ -342,6 +342,21 @@ int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
                                      uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                                      uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
+/* Memory reclaim chain.  ds4_gpu_reclaim_memory releases optional memory until
+ * need_bytes are free and returns the bytes freed; its steps run in order from
+ * the cheapest to rebuild: the Q8->F16 weight cache first, then
+ * ds4_gpu_reclaim_weights (resident routed experts that can be read back from
+ * disk).  Only ROCm has anything to give back; other backends return 0. */
+uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes);
+uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes);
+#ifdef DS4_ROCM_BUILD
+/* Bytes missing before `bytes` more can be allocated now (0 when they fit),
+ * optionally also keeping the headroom the optional caches keep; and the most
+ * that could be allocated with every such cache evicted, as pinned device
+ * memory or as movable (managed) memory. */
+uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom);
+uint64_t ds4_gpu_memory_ceiling(int movable);
+#endif
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);

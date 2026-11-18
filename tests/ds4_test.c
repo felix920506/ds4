@@ -5,6 +5,9 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include "../ds4_image.h"
+#ifdef DS4_ROCM_BUILD
+#include "../ds4_linux_memory.h"
+#endif
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
@@ -5313,6 +5316,105 @@ static void test_metal_short_prefill_ratio4(void) {
     }
 }
 
+#ifdef DS4_ROCM_BUILD
+/* Host memory still allocatable: on a unified-memory device every GPU buffer
+ * is pinned host memory, and unlike the kfd counters this works in a container. */
+static uint64_t test_rocm_free_bytes(void) {
+    uint64_t bytes = 0;
+    TEST_ASSERT(ds4_linux_nonmovable_memory(&bytes));
+    return bytes;
+}
+
+static bool test_logits_identical(ds4_engine *engine, ds4_session *a, ds4_session *b) {
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *la = malloc((size_t)vocab * sizeof(la[0]));
+    float *lb = malloc((size_t)vocab * sizeof(lb[0]));
+    const bool same = la && lb &&
+        ds4_session_copy_logits(a, la, vocab) == vocab &&
+        ds4_session_copy_logits(b, lb, vocab) == vocab &&
+        memcmp(la, lb, (size_t)vocab * sizeof(la[0])) == 0;
+    free(la);
+    free(lb);
+    return same;
+}
+
+/* On-demand context memory: a session whose compressed caches start at four
+ * rows and grow while it decodes must produce exactly the logits of a session
+ * allocated up front, through checkpoints exchanged in both directions and a
+ * reset, while holding a fraction of the memory. */
+static void test_rocm_context_growth(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    enum { CTX = 262144, STEPS = 96 };
+    const uint64_t gib = 1ull << 30;
+    ds4_session *upfront = NULL, *grown = NULL;
+    ds4_session_snapshot snap_upfront = {0}, snap_grown = {0};
+    ds4_tokens prompt = {0};
+    char err[192] = {0};
+
+    const uint64_t free0 = test_rocm_free_bytes();
+    setenv("DS4_ROCM_KV_UPFRONT", "1", 1);
+    TEST_ASSERT(ds4_session_create(&upfront, engine, CTX) == 0);
+    unsetenv("DS4_ROCM_KV_UPFRONT");
+    const uint64_t free1 = test_rocm_free_bytes();
+    setenv("DS4_ROCM_KV_MIN_ROWS", "4", 1);
+    TEST_ASSERT(ds4_session_create(&grown, engine, CTX) == 0);
+    const uint64_t free2 = test_rocm_free_bytes();
+    if (!upfront || !grown) goto cleanup;
+    /* The compressed caches and indexer scratch of this context are 5.5 GiB. */
+    fprintf(stderr, "ds4-test: context growth: up-front session %.2f GiB, "
+            "on-demand session %.2f GiB\n",
+            (double)(free0 - free1) / (double)gib, (double)(free1 - free2) / (double)gib);
+    TEST_ASSERT(free0 > free1 && free1 > free2 &&
+                free0 - free1 > free1 - free2 + 4 * gib);
+
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user",
+                            "Describe a long walk along a river, slowly and in detail.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(ds4_session_sync(upfront, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(grown, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(test_logits_identical(engine, upfront, grown));
+
+    for (int phase = 0; phase < 3; phase++) {
+        /* 96 tokens are 24 rows of a ratio-4 layer: growth at 4, 8 and 16. */
+        for (int i = 0; i < STEPS; i++) {
+            const int token = ds4_session_argmax(upfront);
+            TEST_ASSERT(ds4_session_eval(upfront, token, err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_session_eval(grown, token, err, sizeof(err)) == 0);
+            if (!test_logits_identical(engine, upfront, grown)) {
+                fprintf(stderr, "ds4-test: context growth: logits differ at "
+                        "phase %d step %d\n", phase, i);
+                TEST_ASSERT(false);
+                goto cleanup;
+            }
+        }
+        if (phase == 0) {
+            /* Each session continues from the other's checkpoint. */
+            TEST_ASSERT(ds4_session_save_snapshot(upfront, &snap_upfront, err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_session_save_snapshot(grown, &snap_grown, err, sizeof(err)) == 0);
+            TEST_ASSERT(snap_upfront.len == snap_grown.len &&
+                        memcmp(snap_upfront.ptr, snap_grown.ptr, snap_grown.len) == 0);
+            TEST_ASSERT(ds4_session_load_snapshot(upfront, &snap_grown, err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_session_load_snapshot(grown, &snap_upfront, err, sizeof(err)) == 0);
+        } else if (phase == 1) {
+            /* A reset shrinks the on-demand session; it must grow again. */
+            TEST_ASSERT(ds4_session_sync(upfront, &prompt, err, sizeof(err)) == 0);
+            TEST_ASSERT(ds4_session_sync(grown, &prompt, err, sizeof(err)) == 0);
+            TEST_ASSERT(test_logits_identical(engine, upfront, grown));
+        }
+    }
+
+cleanup:
+    unsetenv("DS4_ROCM_KV_MIN_ROWS");
+    ds4_session_snapshot_free(&snap_upfront);
+    ds4_session_snapshot_free(&snap_grown);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(grown);
+    ds4_session_free(upfront);
+}
+#endif
+
 typedef struct {
     int expected_start;
     int expected_total;
@@ -7337,6 +7439,9 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
+#ifdef DS4_ROCM_BUILD
+    {"--rocm-context-growth", "rocm-context-growth", "ROCm on-demand context memory matches an up-front session bit for bit", test_rocm_context_growth},
+#endif
     {"--glm53-continued-prefill", "glm53-continued-prefill", "GLM 5.3 resumed prefill latency, throughput, progress, and cold-path agreement", test_glm53_continued_prefill},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},

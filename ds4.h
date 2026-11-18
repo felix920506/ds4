@@ -254,6 +254,15 @@ int ds4_engine_vocab_size(ds4_engine *e);
 uint32_t ds4_engine_prefill_chunk(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
+/* Memory pressure handler: the first step of the reclaim chain.  When a
+ * session cannot grow its context memory, the engine calls the handler from
+ * the inference thread, in the middle of that session's eval, asking it to
+ * release need_bytes of accelerator memory; the engine's own optional caches
+ * are evicted only afterwards.  The handler may save and free other, idle
+ * sessions (never the one being evaluated) and returns the bytes it believes
+ * it released; the engine measures free memory again either way. */
+typedef uint64_t (*ds4_memory_pressure_fn)(void *user, uint64_t need_bytes);
+void ds4_engine_set_memory_pressure_handler(ds4_engine *e, ds4_memory_pressure_fn fn, void *user);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
