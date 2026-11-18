@@ -346,6 +346,14 @@ void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
+/* Evict cold routed-expert weights to give at least need_bytes back to the
+ * system; they are read-only GGUF bytes and are read again on demand. Returns
+ * the bytes actually freed, 0 when nothing is evictable. Call from the
+ * inference thread between GPU operations. Only ROCm implements eviction. */
+uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes);
+/* Upper bound of what ds4_gpu_reclaim_weights() can still free while every
+ * layer keeps its minimum hot expert set. */
+uint64_t ds4_gpu_reclaimable_weight_bytes(void);
 #ifdef __APPLE__
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 /* M6 shares the M5 dispatch defaults and existing M5 rollback switches. */
@@ -474,6 +482,12 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
+#ifdef DS4_ROCM_BUILD
+/* Load one layer's routed expert tensors as an individually evictable block
+ * instead of through the model range cache (see rocm/ds4_rocm_elastic.cuh). */
+int ds4_gpu_elastic_expert_table_load(const ds4_gpu_stream_expert_table *table);
+int ds4_gpu_model_range_is_elastic(const void *model_map, uint64_t offset, uint64_t bytes);
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Optional CUDA look-ahead between completed layers, inside the existing
  * expert cache. The foreground owns slots; the reader cannot publish them

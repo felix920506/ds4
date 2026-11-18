@@ -690,8 +690,28 @@ static int routed_moe_launch(
     uint32_t stream_batch_unique = 0;
     uint32_t stream_batch_resident_count = 0;
     uint32_t stream_batch_missing_count = 0;
+    /* Elastic layers resolve their own table (resident block, hot slots or
+     * gathered scratch) and then look like a loaded full layer below. */
+    const int elastic_layer =
+        cuda_elastic_apply(model_map,
+                           layer_index,
+                           n_total_expert,
+                           gate_offset,
+                           up_offset,
+                           down_offset,
+                           gate_expert_bytes,
+                           down_expert_bytes,
+                           selected,
+                           n_tokens,
+                           n_expert,
+                           &selected_exec,
+                           &gate_w,
+                           &up_w,
+                           &down_w);
+    if (elastic_layer < 0) return 0;
     const int stream_full_layer =
-        (n_tokens > 1u || force_resident) &&
+        elastic_layer ||
+        ((n_tokens > 1u || force_resident) &&
         cuda_stream_layer_expert_cache_apply(model_map,
                                              layer_index,
                                              n_total_expert,
@@ -702,7 +722,7 @@ static int routed_moe_launch(
                                              down_expert_bytes,
                                              &gate_w,
                                              &up_w,
-                                             &down_w);
+                                             &down_w));
     const int full_table_cached =
         !stream_full_layer &&
         routed_moe_full_table_is_cached(model_map,

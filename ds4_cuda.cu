@@ -35794,6 +35794,16 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
     (void)enabled;
 }
 
+/* Weight eviction is a ROCm unified-memory feature; nothing to reclaim here. */
+extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
+    (void)need_bytes;
+    return 0;
+}
+
+extern "C" uint64_t ds4_gpu_reclaimable_weight_bytes(void) {
+    return 0;
+}
+
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
