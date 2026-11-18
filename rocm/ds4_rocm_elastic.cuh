@@ -458,6 +458,43 @@ static int cuda_elastic_take_scratch(cuda_elastic_layer &l) {
     return 1;
 }
 
+/*
+ * Under real pressure not even the smallest new block fits beside the full
+ * one, so the layer cannot move by device copy and no scratch block can be
+ * kept.  Free the table first and read its hottest experts back into a
+ * minimum block.  The memory this returns lets the next layer take the
+ * scratch block the usual way.
+ */
+static int cuda_elastic_shrink_in_place(cuda_elastic_layer &l) {
+    const uint32_t slots = DS4_ROCM_ELASTIC_MIN_SLOTS;
+    const cuda_elastic_layer full = l;
+    uint32_t order[DS4_ROCM_MAX_N_EXPERT];
+    cuda_elastic_slots_by_heat(full, order);
+    (void)cudaFree(l.block);
+    l.block = NULL;
+    void *block = NULL;
+    if (!cuda_ok(cudaMalloc(&block, (size_t)cuda_elastic_block_bytes(l, slots)),
+                 "elastic expert block")) {
+        /* The layer is unusable now; launches fail instead of misrouting. */
+        cuda_elastic_clear_slots(l, 0);
+        return 0;
+    }
+    const cuda_elastic_view view = cuda_elastic_view_of(l, (char *)block, slots);
+    cuda_elastic_clear_slots(l, slots);
+    l.block = (char *)block;
+    std::vector<cuda_stream_read_job> jobs;
+    for (uint32_t i = 0; i < slots; i++) {
+        const uint32_t expert = order[i];   /* full layer: slot == expert */
+        cuda_elastic_expert_jobs(l, expert, view, i, jobs);
+        l.slot_expert[i] = (int32_t)expert;
+        l.expert_slot[expert] = (int16_t)i;
+        l.slot_used[i] = full.slot_used[expert];
+    }
+    /* Slots that could not be read stay empty and load on their first miss. */
+    if (!cuda_elastic_read_jobs(jobs)) cuda_elastic_clear_slots(l, slots);
+    return 1;
+}
+
 static int cuda_elastic_ensure_slot_ids(void) {
     if (g_elastic_slot_ids) return 1;
     void *ids = NULL;
@@ -846,7 +883,10 @@ extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
     const uint64_t max_table = cuda_elastic_max_table_bytes();
     uint64_t now = before;
     /* Taking the scratch block costs memory first, hence the signed form. */
-    while (now + need_bytes > before) {
+    /* A shrunk layer needs the scratch block for its batches, so the loop
+     * also runs until one exists. */
+    int shrunk = cuda_elastic_weights_evicted();
+    while (now + need_bytes > before || (shrunk && !g_elastic_scratch)) {
         cuda_elastic_layer *victim = NULL;
         double victim_cost = 0.0;
         for (cuda_elastic_layer &l : g_elastic_layers) {
@@ -868,8 +908,9 @@ extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
         if (!victim) break;
         const int ok = g_elastic_scratch ?
             cuda_elastic_resize(*victim, cuda_elastic_next_slots(*victim, -1)) :
-            cuda_elastic_take_scratch(*victim);
+            cuda_elastic_take_scratch(*victim) || cuda_elastic_shrink_in_place(*victim);
         if (!ok) break;
+        shrunk = 1;
         g_elastic_stats.shrinks++;
         now = cuda_elastic_resident_bytes();
     }

@@ -5511,6 +5511,8 @@ static int cuda_stream_model_cache_prepare_memory(
     return 1;
 }
 
+extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom);
+
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -5530,6 +5532,11 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
     const uint64_t chunk = ds4_rocm_model_arena_bytes(aligned);
+    /* The weights every token needs load after the elastic expert tables.
+     * When they do not fit, routed experts give way: those can be read back
+     * on demand, these cannot. */
+    const uint64_t missing = ds4_gpu_memory_shortfall(chunk, 0);
+    if (missing) (void)ds4_gpu_reclaim_weights(missing);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
