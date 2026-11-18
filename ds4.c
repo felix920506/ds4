@@ -3630,7 +3630,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             continue;
         }
 #endif
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
         /* Already resident as an evictable block of its own. */
         if (ds4_gpu_model_range_is_elastic(m->map, t->abs_offset, t->bytes)) {
             continue;
@@ -74124,7 +74124,7 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /*
  * Resident DeepSeek V4 on ROCm loads each layer's routed experts as its own
  * device block, so the runtime can evict cold layers when the KV cache needs
@@ -74141,7 +74141,11 @@ static void engine_load_elastic_expert_tables(const ds4_engine *e) {
         const ds4_layer_weights *layer = &e->weights.layer[il];
         uint64_t gate_expert_bytes = 0;
         uint64_t down_expert_bytes = 0;
+        /* Only the Q2 Flash layout has been validated bit for bit so far. */
         if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps ||
+            layer->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+            layer->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+            layer->ffn_down_exps->type != DS4_TENSOR_Q2_K ||
             !streaming_layer_gate_down_expert_bytes(layer,
                                                     &gate_expert_bytes,
                                                     &down_expert_bytes) ||
@@ -75564,7 +75568,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
         if (!load_slice && load_span_count == 0) engine_load_elastic_expert_tables(e);
 #endif
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
@@ -79297,7 +79301,7 @@ static int ds4_session_sync_unmetered(ds4_session *s, const ds4_tokens *prompt,
                                       char *err, size_t errlen);
 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     rocm_diag_evict_weights(s);
 #endif
     /* Stale image state is dropped before the reuse estimate, or the
@@ -82024,7 +82028,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     rocm_diag_evict_weights(s);
 #endif
 #ifndef DS4_NO_GPU

@@ -62,6 +62,44 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+### Elastic expert weights
+
+Resident Flash on ROCm loads each layer's routed experts as its own device
+block. `ds4_gpu_reclaim_weights()` can then evict cold experts when the KV
+cache needs memory, and they are read back from the GGUF on demand; attention,
+shared experts and all other weights always stay resident. The mechanism and
+its policy are documented in `rocm/ds4_rocm_elastic.cuh`. Results do not
+change: evicted layers run the same kernels on the same bytes.
+
+Routing is only mildly skewed, so eviction is not free. Over 4000 decode
+tokens of `speed-bench/promessi_sposi.txt`, 90% of a layer's selections need a
+median of 81 of its 256 experts (57 to 208 across layers) and 99% need 181;
+layers 0-2 are hash-routed and uniform. A 4096-token prefill batch touches 208
+to 256 experts per layer. Every evicted expert that is needed again is a
+6.75 MiB read.
+
+Measured on a 128 GB gfx1151 with a 2 GB/s NVMe drive, 0731 Q2 checkpoint,
+`ds4-bench --rocm --prompt-file speed-bench/promessi_sposi.txt`, eviction
+forced with `DS4_ROCM_ELASTIC_EVICT=<GiB>@<pos>` after the first frontier;
+prefill is one 2048-token step after the eviction, decode is 255 steady tokens:
+
+| Evicted | Prefill 2K->4K | Decode at 2K | Prefill 30.7K->32.8K | Decode at 30.7K |
+|---:|---:|---:|---:|---:|
+| 0 GiB | 617 tok/s | 17.6 tok/s | 553 tok/s | 16.1 tok/s |
+| 10 GiB | 272 tok/s | 15.4 tok/s | 256 tok/s | 13.4 tok/s |
+| 20 GiB | 166 tok/s | 12.8 tok/s | 159 tok/s | 11.7 tok/s |
+| 40 GiB | 85 tok/s | 7.0 tok/s | 83 tok/s | 6.5 tok/s |
+
+Both are bound by SSD reads; a faster drive moves every evicted row up.
+`--ssd-streaming` on the same model and drive gives 15.6 tok/s prefill and
+10.1 tok/s decode at 2K. The reclaim call itself takes about 2 to 6 seconds
+for 10 to 40 GiB. At most 61.8 of the 72.6 GiB of routed experts can be
+evicted; every layer keeps at least 32 experts.
+
+Diagnostics: `DS4_ROCM_ELASTIC_STATS=1` prints reclaim and hit/miss counters,
+`DS4_ROCM_ELASTIC_NO_GROW=1` stops evicted layers from growing back while
+memory is free, `DS4_ROCM_ELASTIC_TRACE=FILE` records every routed selection.
+
 ## DeepSeek V4.1 Flash
 
 Use Q2 with SSD streaming on a 128 GB machine:
