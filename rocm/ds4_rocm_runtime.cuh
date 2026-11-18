@@ -369,6 +369,8 @@ static int cuda_stream_batch_selected_reuse_wait(const char *what);
 static int cuda_stream_batch_selected_upload_wait_host(const char *what);
 static void cuda_stream_batch_selected_stage_release(void);
 static void cuda_stream_read_pool_shutdown(void);
+static void cuda_elastic_release_all(void);
+static uint64_t cuda_elastic_resident_bytes(void);
 
 static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out) return 0;
@@ -5637,7 +5639,8 @@ static const char *cuda_model_range_ptr_from_fd(
         cuda_model_drop_file_pages(offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
         copied += n;
-        cuda_model_load_progress_note(g_model_range_bytes + copied);
+        cuda_model_load_progress_note(g_model_range_bytes +
+                                      cuda_elastic_resident_bytes() + copied);
         chunk_idx++;
     }
     err = cudaStreamSynchronize(g_model_upload_stream);
@@ -5651,7 +5654,7 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
-    cuda_model_load_progress_note(g_model_range_bytes);
+    cuda_model_load_progress_note(g_model_range_bytes + cuda_elastic_resident_bytes());
     return (const char *)dev;
 }
 
@@ -5750,6 +5753,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_ranges_only(void) {
+    cuda_elastic_release_all();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -6411,6 +6415,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "memory %s: used=%.2f GiB free=%.2f GiB total=%.2f GiB "
             "placement=%s model_image=%.2f GiB range_cache=%.2f GiB "
+            "elastic_experts=%.2f GiB "
             "q8_f16_cache=%.2f GiB scratch=%.2f GiB",
             label ? label : "",
             (double)used_b / 1073741824.0,
@@ -6419,6 +6424,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             placement,
             (double)cuda_model_image_bytes() / 1073741824.0,
             (double)g_model_range_bytes / 1073741824.0,
+            (double)cuda_elastic_resident_bytes() / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
             (double)g_cuda_tmp_bytes / 1073741824.0);
     fprintf(stderr, "\n");

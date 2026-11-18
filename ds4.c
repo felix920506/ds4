@@ -3630,6 +3630,12 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             continue;
         }
 #endif
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        /* Already resident as an evictable block of its own. */
+        if (ds4_gpu_model_range_is_elastic(m->map, t->abs_offset, t->bytes)) {
+            continue;
+        }
+#endif
         /* Expert sharding owns tensor slices, not necessarily whole tensors. */
         for (uint32_t j = 0; j < (span_count ? span_count : 1u); j++) {
             uint64_t off = t->abs_offset, end = off + t->bytes;
@@ -74430,6 +74436,72 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/*
+ * Resident DeepSeek V4 on ROCm loads each layer's routed experts as its own
+ * device block, so the runtime can evict cold layers when the KV cache needs
+ * the memory and read the experts back from the GGUF on demand.  Layers the
+ * runtime declines stay with the ordinary tensor-span cache, which is only
+ * less elastic, never wrong.
+ */
+static void engine_load_elastic_expert_tables(const ds4_engine *e) {
+    if (e->backend != DS4_BACKEND_CUDA || e->ssd_streaming ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &e->weights.layer[il];
+        uint64_t gate_expert_bytes = 0;
+        uint64_t down_expert_bytes = 0;
+        /* Only the Q2 Flash layout has been validated bit for bit so far. */
+        if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps ||
+            layer->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+            layer->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+            layer->ffn_down_exps->type != DS4_TENSOR_Q2_K ||
+            !streaming_layer_gate_down_expert_bytes(layer,
+                                                    &gate_expert_bytes,
+                                                    &down_expert_bytes) ||
+            layer->ffn_gate_exps->bytes != DS4_N_EXPERT * gate_expert_bytes ||
+            layer->ffn_up_exps->bytes != layer->ffn_gate_exps->bytes ||
+            layer->ffn_down_exps->bytes != DS4_N_EXPERT * down_expert_bytes) {
+            continue;
+        }
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(&e->model, layer, il,
+                                           gate_expert_bytes, down_expert_bytes);
+        if (ds4_gpu_elastic_expert_table_load(&table) == 0) return;
+    }
+}
+
+/*
+ * Diagnostic: DS4_ROCM_ELASTIC_EVICT="GiB[@pos]" evicts that much routed
+ * expert weight once, when the session first reaches token position pos
+ * (default 0).  It stands in for KV-cache pressure when validating that
+ * eviction leaves logits unchanged and when measuring its cost.
+ */
+static void rocm_diag_evict_weights(const ds4_session *s) {
+    static bool done;
+    if (done || !s) return;
+    const char *env = getenv("DS4_ROCM_ELASTIC_EVICT");
+    if (!env || !env[0]) {
+        done = true;
+        return;
+    }
+    char *end = NULL;
+    const double gib = strtod(env, &end);
+    const long pos = end && *end == '@' ? strtol(end + 1, NULL, 10) : 0;
+    if (s->checkpoint.len < pos) return;
+    done = true;
+    const uint64_t freed =
+        ds4_gpu_reclaim_weights((uint64_t)(gib * 1073741824.0));
+    fprintf(stderr,
+            "ds4: DS4_ROCM_ELASTIC_EVICT at pos %d: asked %.2f GiB, freed %.2f GiB, "
+            "%.2f GiB still reclaimable\n",
+            s->checkpoint.len, gib, ds4_bytes_to_gib(freed),
+            ds4_bytes_to_gib(ds4_gpu_reclaimable_weight_bytes()));
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
@@ -75808,6 +75880,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        if (!load_slice && load_span_count == 0) engine_load_elastic_expert_tables(e);
+#endif
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
@@ -79564,6 +79639,9 @@ static int ds4_session_sync_unmetered(ds4_session *s, const ds4_tokens *prompt,
                                       char *err, size_t errlen);
 
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    rocm_diag_evict_weights(s);
+#endif
     /* Stale image state is dropped before the reuse estimate, or the
      * prefix it invalidates would count as reused rather than prefilled. */
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
@@ -82288,6 +82366,9 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    rocm_diag_evict_weights(s);
+#endif
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
         probe_mtp = false;
