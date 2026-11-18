@@ -1,0 +1,15 @@
+0731 2048: all 129280 logits identical = True
+0731 4096: all 129280 logits identical = True
+0731 6144: all 129280 logits identical = True
+0731 8192: all 129280 logits identical = True
+vision 2048: all 129280 logits identical = True
+vision 4096: all 129280 logits identical = True
+vision 6144: all 129280 logits identical = True
+vision 8192: all 129280 logits identical = True
+ds4: ROCm backend initialized on AMD Radeon 8060S Graphics (sm_115)
+PASS: 96 head norm/RoPE cases, bit-identical with output guards intact
+
+ds4-eval: answer extractor self-tests passed
+
+Server unit tests: passed (./ds4_test --server)
+Final build: all five ROCm binaries linked and passed --help smoke checks.

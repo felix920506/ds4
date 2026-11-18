@@ -1,0 +1,5 @@
+ds4: ROCm backend initialized on AMD Radeon 8060S Graphics (sm_115)
+PASS: 12 production MoE routing cases, bit-identical with intact output guards
+ds4: ROCm backend initialized on AMD Radeon 8060S Graphics (sm_115)
+PASS: 96 head norm/RoPE cases, bit-identical with output guards intact
+All five ROCm binaries built and passed --help smoke checks.

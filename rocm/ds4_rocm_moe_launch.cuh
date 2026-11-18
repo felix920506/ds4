@@ -1943,10 +1943,25 @@ static int routed_moe_launch(
                 /* The split pointer-table path writes the final token row. */
             } else if (token_tiles_done) {
                 half *down_h = (half *)down->ptr;
-                DS4_ROCM_MOE_TILE_LAUNCH(
-                        moe_down_q2K_tile_wmma_kernel, &token_tiles, out_dim / 512u,
-                        down_h, down_w, iq2_hot_mid_h, sorted_pairs, expert_mid_dim, out_dim,
-                        down_expert_bytes, (uint32_t)down_row_bytes);
+                if (ds4_rocm_gfx1151_flag("DS4_ROCM_MOE_DOWN_NARROW")) {
+                    const uint32_t *list = token_tiles.dev;
+#define DS4_DOWN_NARROW(T) \
+                    if (token_tiles.n[(T) - 1u]) \
+                        moe_down_q2K_tile_wmma_kernel<T, 2u, 128u><<<dim3(out_dim / 128u, token_tiles.n[(T) - 1u]), 128>>>( \
+                            down_h, down_w, iq2_hot_mid_h, sorted_pairs, \
+                            expert_mid_dim, out_dim, down_expert_bytes, (uint32_t)down_row_bytes, list); \
+                    list += 2u * token_tiles.max_tiles
+                    DS4_DOWN_NARROW(1u);
+                    DS4_DOWN_NARROW(2u);
+                    DS4_DOWN_NARROW(3u);
+                    DS4_DOWN_NARROW(4u);
+#undef DS4_DOWN_NARROW
+                } else {
+                    DS4_ROCM_MOE_TILE_LAUNCH(
+                            moe_down_q2K_tile_wmma_kernel, &token_tiles, out_dim / 512u,
+                            down_h, down_w, iq2_hot_mid_h, sorted_pairs, expert_mid_dim, out_dim,
+                            down_expert_bytes, (uint32_t)down_row_bytes);
+                }
                 const uint64_t n2 = (uint64_t)n_tokens * (out_dim >> 1u);
                 moe_sum_f16x2_kernel<<<(uint32_t)((n2 + 255u) / 256u), 256>>>(
                         (float *)out->ptr, down_h, out_dim, n_expert, n_tokens);
