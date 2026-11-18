@@ -44916,7 +44916,18 @@ struct ds4_engine {
     int            placement_session_count_hint;
     uint32_t       glm_session_count;
     uint64_t       glm_session_graph_bytes;
+    /* Owner hook asked for memory before the engine gives up its own caches. */
+    ds4_memory_pressure_fn memory_pressure;
+    void          *memory_pressure_user;
 };
+
+void ds4_engine_set_memory_pressure_handler(ds4_engine *e,
+                                            ds4_memory_pressure_fn fn,
+                                            void *user) {
+    if (!e) return;
+    e->memory_pressure = fn;
+    e->memory_pressure_user = user;
+}
 
 static DS4_MAYBE_UNUSED uint64_t ds4_engine_glm_graph_budget(
         const ds4_engine *e, uint64_t next_graph_bytes) {

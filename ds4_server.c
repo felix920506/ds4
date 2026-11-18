@@ -6984,6 +6984,9 @@ typedef struct {
     uint64_t kv_disk_lookups;
     uint64_t kv_disk_hits;
     uint64_t kv_disk_stores;
+    uint64_t slot_kicks_saved;   /* state on disk, session freed */
+    uint64_t slot_kicks_dropped; /* session freed, state lost */
+    uint64_t slot_kick_bytes;    /* KV payload bytes written by kicks */
     uint64_t image_cache_hits;
     uint64_t image_encodes;
 } server_metrics;
@@ -7052,6 +7055,14 @@ static void metrics_note_kv_store(void) {
     pthread_mutex_unlock(&g_metrics.mu);
 }
 
+static void metrics_note_slot_kick(bool saved, uint64_t written_bytes) {
+    pthread_mutex_lock(&g_metrics.mu);
+    if (saved) g_metrics.slot_kicks_saved++;
+    else g_metrics.slot_kicks_dropped++;
+    g_metrics.slot_kick_bytes += written_bytes;
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
 static void metrics_note_image(bool cache_hit) {
     pthread_mutex_lock(&g_metrics.mu);
     if (cache_hit) g_metrics.image_cache_hits++;
@@ -7072,7 +7083,8 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
-                         code == 500 ? "Internal Server Error" : "Error";
+                         code == 500 ? "Internal Server Error" :
+                         code == 503 ? "Service Unavailable" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
@@ -10213,10 +10225,19 @@ struct server_slot {
     char *live_text;
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
+    /* Frontier last written to, or loaded from, the disk KV cache.  While it
+     * equals the session position a kick has nothing left to write. */
+    int disk_frontier_tokens;
+    /* Frontier a kick failed to persist: dropping it now loses the prefill,
+     * so it is a last-resort victim until the conversation moves on. */
+    int kick_unsaved_tokens;
 
     job *assigned;
     job *running;
     bool busy;
+    /* Claimed under mu by a kick that is saving and freeing the session: the
+     * router skips the slot, so nobody else reads the session meanwhile. */
+    bool kicking;
     bool prefill_waiting;
 
     /* Prefill gate accounting for the running job, owned by the slot thread. */
@@ -10342,6 +10363,10 @@ struct server {
     server_slot *slots;
     int slot_count;
     int ctx_size;
+    int resident_sessions;  /* Slots holding a session; atomic. */
+    /* What freeing one slot's session returns: its KV caches.  The prefill
+     * workspace is shared by the slots and stays with the engine. */
+    uint64_t slot_session_bytes;
     bool batched_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
@@ -11546,7 +11571,11 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
-    if (ok) metrics_note_kv_store();
+    if (ok) {
+        /* The store only accepts the live frontier, so this is it. */
+        slot->disk_frontier_tokens = store_len;
+        metrics_note_kv_store();
+    }
     return ok;
 }
 
@@ -11557,11 +11586,11 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
-static void kv_cache_store_current(server *s, server_slot *slot,
+static bool kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
-    if (!s || !slot) return;
+    if (!s || !slot) return false;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
+    if (!tokens) return false;
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
@@ -11592,13 +11621,15 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
+    bool ok;
     if (visible_text) {
-        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+        ok = kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                             visible_text, visible_ext, visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        ok = kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
     }
+    return ok;
 }
 
 #ifdef DS4_SERVER_TEST
@@ -11710,6 +11741,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
     if (s->kv.enabled) metrics_note_kv_lookup(loaded > 0);
     if (loaded > 0) {
+        slot->disk_frontier_tokens = loaded;
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
     }
@@ -15219,6 +15251,197 @@ decode_again:
     ds4_tokens_free(&effective_prompt);
 }
 
+/* =========================================================================
+ * Slot kick: persist and release idle sessions.
+ * =========================================================================
+ *
+ * A session holds its KV caches whether or not anyone is talking to it.  When
+ * an active request needs memory that is not there, the idle slots pay: a
+ * kick writes the slot's live state to the disk KV cache and frees its
+ * session.  The slot is then as empty as one that was never used (sessions
+ * are created on first use, see slot_session_ensure), and the conversation
+ * comes back through the ordinary disk lookup on whichever slot serves its
+ * next request.
+ *
+ * Locking.  A kick may start on a thread that already holds inference_mu,
+ * and kv_mu too when the engine runs out of memory while restoring a disk
+ * checkpoint (see server_memory_pressure), so it takes mu inside them.  That
+ * is safe because nothing waits for inference_mu or kv_mu while holding mu:
+ * mu only ever nests tool_mu, and tool_mu nests nothing.  The victim is
+ * claimed under mu (slot->kicking), which keeps the router and other kicks
+ * away from its session, and the slow save and free run under inference_mu
+ * like every other use of a session. */
+typedef enum {
+    KICK_FREE,     /* No live checkpoint: nothing to lose. */
+    KICK_ON_DISK,  /* The frontier is already in the disk KV cache. */
+    KICK_SAVE,     /* The frontier must be written first. */
+    KICK_LOSSY,    /* Cannot be saved: the owner will prefill again. */
+} slot_kick_cost;
+
+static void dispatch_jobs_locked(server *s);
+static int job_required_slot_locked(server *s, const job *j);
+
+static slot_kick_cost slot_kick_cost_of(server *s, server_slot *slot,
+                                        int *tokens_out) {
+    const int tokens = ds4_session_checkpoint_valid(slot->session)
+                       ? ds4_session_pos(slot->session) : 0;
+    if (tokens_out) *tokens_out = tokens;
+    if (tokens == 0) return KICK_FREE;
+    if (!s->kv.enabled || tokens < s->kv.opt.min_tokens ||
+        slot->kick_unsaved_tokens == tokens ||
+        ds4_session_has_vision_state(slot->session)) return KICK_LOSSY;
+    return slot->disk_frontier_tokens == tokens ? KICK_ON_DISK : KICK_SAVE;
+}
+
+/* The idle slot that is cheapest to lose, or NULL.  Never a slot that runs
+ * or was handed a job, nor one a queued request can only continue on.  The
+ * cost class comes first: dropping a checkpoint that is already on disk is
+ * free now and costs its owner one load later, while saving another one
+ * costs a write now and possibly the same load later, however idle it is.
+ * Within a class the longest-idle slot goes, as the least likely to return.
+ * State that cannot be saved is only dropped once nothing else is left. */
+static server_slot *slot_kick_victim_locked(server *s) {
+    server_slot *best = NULL;
+    slot_kick_cost best_cost = KICK_FREE;
+    pthread_mutex_lock(&s->tool_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (!slot->session || slot->busy || slot->assigned || slot->kicking ||
+            ds4_session_is_distributed(slot->session)) continue;
+        bool pinned = false;
+        for (const job *j = s->head; j && !pinned; j = j->next)
+            pinned = job_required_slot_locked(s, j) == slot->id;
+        if (pinned) continue;
+        const slot_kick_cost cost = slot_kick_cost_of(s, slot, NULL);
+        if (!best || cost < best_cost ||
+            (cost == best_cost && slot->last_used < best->last_used)) {
+            best = slot;
+            best_cost = cost;
+        }
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return best;
+}
+
+/* Take the session out of a slot together with everything that described
+ * it, leaving the slot as it was before its first request. */
+static ds4_session *slot_detach_session(server *s, server_slot *slot) {
+    ds4_session *session = slot->session;
+    slot->session = NULL;
+    request_live_state_clear(s, slot);
+    free(slot->live_text);
+    slot->live_text = NULL;
+    slot->live_text_len = 0;
+    slot->live_text_pos = 0;
+    slot->continued_last_store_tokens = 0;
+    slot->disk_frontier_tokens = 0;
+    slot->kick_unsaved_tokens = 0;
+    return session;
+}
+
+/* Save and free the session of a slot the caller claimed; the caller holds
+ * inference_mu.  Returns the bytes released; 0 when the state should have
+ * been saved and was not, in which case the slot keeps it and becomes a
+ * last-resort victim. */
+static uint64_t slot_kick(server *s, server_slot *slot, const char *reason) {
+    int tokens = 0;
+    const slot_kick_cost cost = slot_kick_cost_of(s, slot, &tokens);
+    uint64_t written = 0;
+    if (cost == KICK_ON_DISK || cost == KICK_SAVE) {
+        /* Every KV save holds inference_mu, so the delta is this save. */
+        uint64_t before[DS4_METRIC_COUNT], after[DS4_METRIC_COUNT];
+        ds4_metrics_snapshot(before);
+        const bool saved = kv_cache_store_current(s, slot, "evict");
+        ds4_metrics_snapshot(after);
+        written = after[DS4_METRIC_KV_SAVE_BYTES] - before[DS4_METRIC_KV_SAVE_BYTES];
+        if (!saved) {
+            slot->kick_unsaved_tokens = tokens;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: slot %d: kick reason=%s could not save "
+                       "%d tokens to the disk KV cache; kept as a last resort",
+                       slot->id, reason, tokens);
+            return 0;
+        }
+    }
+    ds4_session_free(slot_detach_session(s, slot));
+    __atomic_sub_fetch(&s->resident_sessions, 1, __ATOMIC_RELAXED);
+
+    metrics_note_slot_kick(cost != KICK_LOSSY, written);
+    const time_t now = time(NULL);
+    server_log(cost == KICK_LOSSY ? DS4_LOG_WARNING : DS4_LOG_KVCACHE,
+               "ds4-server: slot %d: kicked reason=%s tokens=%d idle=%lld s "
+               "state=%s written=%.2f MiB freed=%.2f GiB",
+               slot->id, reason, tokens,
+               (long long)(now > slot->last_used ? now - slot->last_used : 0),
+               cost == KICK_FREE ? "empty" :
+               cost == KICK_LOSSY ? "dropped (the conversation needs a new prefill)" :
+               written ? "saved" : "already on disk",
+               (double)written / (1024.0 * 1024.0),
+               (double)s->slot_session_bytes / (1024.0 * 1024.0 * 1024.0));
+    return s->slot_session_bytes;
+}
+
+/* Kick idle slots, cheapest first, until need_bytes are released or no
+ * victim is left.  Returns the bytes released.  Single-session mode has no
+ * idle slot to kick, and tensor-parallel sessions are mirrored on the
+ * worker, which this path does not coordinate with. */
+static uint64_t server_kick_idle_slots(server *s, uint64_t need_bytes,
+                                       const char *reason) {
+    if (!s->batched_mode || s->tp_leader) return 0;
+    uint64_t freed = 0;
+    /* Held from the claim to the free: a request for the victim's own
+     * conversation that arrives meanwhile is routed elsewhere, and must not
+     * reach its disk lookup before the checkpoint is written.  Every job
+     * takes inference_mu before it looks at its slot. */
+    pthread_mutex_lock(&s->inference_mu);
+    do {
+        pthread_mutex_lock(&s->mu);
+        server_slot *slot = slot_kick_victim_locked(s);
+        if (slot) slot->kicking = true;
+        pthread_mutex_unlock(&s->mu);
+        if (!slot) break;
+
+        freed += slot_kick(s, slot, reason);
+
+        /* A request that queued while the slot was claimed may fit now. */
+        pthread_mutex_lock(&s->mu);
+        slot->kicking = false;
+        dispatch_jobs_locked(s);
+        pthread_cond_broadcast(&s->cv);
+        pthread_mutex_unlock(&s->mu);
+    } while (freed < need_bytes);
+    pthread_mutex_unlock(&s->inference_mu);
+    return freed;
+}
+
+/* ds4_memory_pressure_fn: the engine could not grow a KV cache.  It calls
+ * from inside a session call of the active slot, so that thread holds
+ * inference_mu (and kv_mu during a disk restore, hence the recursive kv_mu);
+ * the active slot is busy and therefore never a victim. */
+static uint64_t server_memory_pressure(void *user, uint64_t need_bytes) {
+    return server_kick_idle_slots(user, need_bytes, "memory-pressure");
+}
+
+/* Slot sessions are created on first use: a slot nobody talked to, or one
+ * that was kicked, holds no KV memory.  When the context does not fit, idle
+ * slots are kicked one at a time until it does or none is left. */
+static bool slot_session_ensure(server *s, server_slot *slot) {
+    while (!slot->session) {
+        pthread_mutex_lock(&s->inference_mu);
+        const int rc = ds4_session_create(&slot->session, s->engine, s->ctx_size);
+        pthread_mutex_unlock(&s->inference_mu);
+        if (rc == 0) {
+            __atomic_add_fetch(&s->resident_sessions, 1, __ATOMIC_RELAXED);
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: slot %d: session created (ctx=%d)",
+                       slot->id, s->ctx_size);
+        } else if (server_kick_idle_slots(s, 1, "session-create") == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Keep cancellation installed for the entire request, including every early
  * return in the large protocol/generation path. The callback is cleared before
  * the client thread can destroy its stack-owned job. */
@@ -15237,9 +15460,21 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                sched_t(now_sec()), (unsigned long long)j->id, slot->id,
                (now_sec() - j->t_arrive) * 1000.0);
 
-    ds4_session_set_cancel(slot->session, job_cancelled, j);
-    if (!job_cancelled(j)) generate_job_inner(s, slot, j);
-    ds4_session_set_cancel(slot->session, NULL, NULL);
+    if (job_cancelled(j)) {
+        /* Nothing to run, and no reason to allocate a session for it. */
+    } else if (!slot_session_ensure(s, slot)) {
+        server_log(DS4_LOG_ERROR,
+                   "ds4-server: req#%llu slot %d: no memory for a %d token "
+                   "session and no idle slot left to kick",
+                   (unsigned long long)j->id, slot->id, s->ctx_size);
+        http_error(j->fd, s->enable_cors, 503,
+                   "not enough memory for another session context; "
+                   "retry when a running request has finished");
+    } else {
+        ds4_session_set_cancel(slot->session, job_cancelled, j);
+        generate_job_inner(s, slot, j);
+        ds4_session_set_cancel(slot->session, NULL, NULL);
+    }
     server_log(DS4_LOG_DEFAULT,
                "sched t=%.3f req#%llu slot %d: job finished "
                "(%.1f ms after arrival, prefill chunks=%d compute=%.1f ms "
@@ -15307,7 +15542,8 @@ static int job_required_slot_locked(server *s, const job *j) {
 
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot, time_t now) {
-    if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
+    if (!s || !slot || !j || slot->busy || slot->assigned || slot->kicking)
+        return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
     /* Reuse-aware routing: a slot is attractive only when this request would
@@ -15785,6 +16021,14 @@ static void metrics_render_prometheus(server *s, buf *b) {
                (unsigned long long)(m.kv_disk_lookups - m.kv_disk_hits));
     metrics_prom_u64(b, "ds4_server_kv_disk_stores_total", "counter",
                      "Disk KV cache checkpoints written.", m.kv_disk_stores);
+    metrics_prom_header(b, "ds4_server_slot_kicks_total", "counter",
+                        "Idle sessions freed for an active request, by what happened to their state.");
+    buf_printf(b, "ds4_server_slot_kicks_total{state=\"saved\"} %llu\n"
+                  "ds4_server_slot_kicks_total{state=\"dropped\"} %llu\n",
+               (unsigned long long)m.slot_kicks_saved,
+               (unsigned long long)m.slot_kicks_dropped);
+    metrics_prom_u64(b, "ds4_server_slot_kick_bytes_total", "counter",
+                     "KV payload bytes written to disk by kicks.", m.slot_kick_bytes);
     metrics_prom_header(b, "ds4_server_image_embeddings_total", "counter",
                         "Image embeddings by source.");
     buf_printf(b, "ds4_server_image_embeddings_total{result=\"cache_hit\"} %llu\n"
@@ -15794,7 +16038,10 @@ static void metrics_render_prometheus(server *s, buf *b) {
     const metrics_live live = metrics_live_state(s);
     metrics_prom_f64(b, "ds4_server_uptime_seconds", "gauge", "Seconds since the server started.",
                      m.t_start > 0.0 ? now_sec() - m.t_start : 0.0);
-    metrics_prom_u64(b, "ds4_server_slots", "gauge", "Resident sessions.", (uint64_t)s->slot_count);
+    metrics_prom_u64(b, "ds4_server_slots", "gauge", "Session slots.", (uint64_t)s->slot_count);
+    metrics_prom_u64(b, "ds4_server_resident_sessions", "gauge",
+                     "Slots that currently hold a session in memory.",
+                     (uint64_t)__atomic_load_n(&s->resident_sessions, __ATOMIC_RELAXED));
     metrics_prom_u64(b, "ds4_server_context_tokens", "gauge", "Context size per session.",
                      (uint64_t)s->ctx_size);
     metrics_prom_u64(b, "ds4_server_active_clients", "gauge", "Open client connections.",
@@ -15890,16 +16137,23 @@ static void metrics_render_json(server *s, buf *b) {
     buf_putc(b, ',');
     metrics_json_hist(b, "request_duration_seconds", &m.duration);
     buf_printf(b, ",\"kv_disk\":{\"lookups\":%llu,\"hits\":%llu,\"stores\":%llu},"
+                  "\"slot_kicks\":{\"saved\":%llu,\"dropped\":%llu,\"written_bytes\":%llu},"
                   "\"image_cache\":{\"hits\":%llu,\"encodes\":%llu},"
-                  "\"slots\":%d,\"context_tokens\":%d,\"active_clients\":%d,"
+                  "\"slots\":%d,\"resident_sessions\":%d,"
+                  "\"context_tokens\":%d,\"active_clients\":%d,"
                   "\"queued_requests\":%d,\"model_bytes\":%llu,"
                   "\"resident_memory_bytes\":%llu}}\n",
                (unsigned long long)m.kv_disk_lookups,
                (unsigned long long)m.kv_disk_hits,
                (unsigned long long)m.kv_disk_stores,
+               (unsigned long long)m.slot_kicks_saved,
+               (unsigned long long)m.slot_kicks_dropped,
+               (unsigned long long)m.slot_kick_bytes,
                (unsigned long long)m.image_cache_hits,
                (unsigned long long)m.image_encodes,
-               s->slot_count, s->ctx_size, live.clients, live.queued,
+               s->slot_count,
+               __atomic_load_n(&s->resident_sessions, __ATOMIC_RELAXED),
+               s->ctx_size, live.clients, live.queued,
                (unsigned long long)(s->engine ? ds4_engine_model_bytes(s->engine) : 0),
                (unsigned long long)metrics_resident_bytes());
 }
@@ -16125,6 +16379,20 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    /* Diagnostic: stand in for the engine's memory-pressure call, so kicks
+     * can be exercised on a machine with memory to spare.  The body is the
+     * byte count to ask for. */
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/debug/memory-pressure") &&
+        getenv("DS4_SERVER_DEBUG_MEMORY_PRESSURE")) {
+        const uint64_t need = hr.body ? strtoull(hr.body, NULL, 10) : 0;
+        char body[64];
+        snprintf(body, sizeof(body), "{\"freed_bytes\":%llu}\n",
+                 (unsigned long long)server_memory_pressure(s, need ? need : 1));
+        http_response(fd, s->enable_cors, 200, "application/json", body);
         http_request_free(&hr);
         goto done;
     }
@@ -16815,22 +17083,42 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
-    pthread_mutex_init(&s.kv_mu, NULL);
-    pthread_mutexattr_t inference_attr;
-    pthread_mutexattr_init(&inference_attr);
-    pthread_mutexattr_settype(&inference_attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&s.inference_mu, &inference_attr);
-    pthread_mutexattr_destroy(&inference_attr);
+    /* inference_mu nests in its own callers.  kv_mu must too: a kick saves
+     * a slot from inside the engine's memory-pressure call, which can come
+     * while a disk checkpoint is being restored under kv_mu.  The restore
+     * copied its index entry before touching the session, so a nested store
+     * may reshuffle the index. */
+    pthread_mutexattr_t recursive_attr;
+    pthread_mutexattr_init(&recursive_attr);
+    pthread_mutexattr_settype(&recursive_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s.kv_mu, &recursive_attr);
+    pthread_mutex_init(&s.inference_mu, &recursive_attr);
+    pthread_mutexattr_destroy(&recursive_attr);
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     g_sched_origin = now_sec();
     g_metrics.t_start = g_sched_origin;
     pthread_mutex_init(&s.trace_mu, NULL);
 
+    {
+        const ds4_context_memory m = ds4_context_memory_estimate_with_prefill_mode(
+            cfg.engine.backend, cfg.ctx_size, ds4_engine_prefill_chunk(engine),
+            cfg.engine.ssd_streaming);
+        s.slot_session_bytes = m.raw_bytes + m.compressed_bytes;
+        if (!s.slot_session_bytes) s.slot_session_bytes = m.total_bytes;
+    }
+    /* Slot 0 proves that one full-context session fits.  The other batched
+     * slots get theirs on first use (slot_session_ensure), which is also the
+     * state a kick returns a slot to.  Distributed and tensor-parallel
+     * sessions exist on other machines as well, so they keep the eager
+     * layout and are never kicked. */
+    const bool lazy_sessions = s.batched_mode && !tp_leader &&
+        cfg.engine.distributed.role == DS4_DISTRIBUTED_NONE;
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
         slot->srv = &s;
         slot->id = i;
+        if (lazy_sessions && i > 0) continue;
         if (ds4_session_create(&slot->session, engine, cfg.ctx_size) != 0) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create %s session %d/%d",
@@ -16838,7 +17126,9 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+        s.resident_sessions++;
     }
+    ds4_engine_set_memory_pressure_handler(engine, server_memory_pressure, &s);
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
@@ -16987,6 +17277,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
+        /* A slot without a session was never used, or was kicked to disk. */
         const ds4_tokens *tokens = ds4_session_tokens(slot->session);
         if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
         server_log(DS4_LOG_KVCACHE,
@@ -17638,6 +17929,218 @@ static void test_dispatch_routes_alien_request_to_empty_slot(void) {
     ds4_session_free_test_checkpoint(slots[1].session);
     pthread_mutex_destroy(&s.tool_mu);
     pthread_cond_destroy(&s.cv);
+}
+
+/* Slot kick policy.  The victim is the idle slot that is cheapest to lose:
+ * empty, then already on disk, then saveable, then state that would be lost;
+ * the longest idle within a class.  Slots that run, were handed a job, are
+ * being kicked, or are the only home of a queued continuation are never
+ * taken. */
+static void test_slot_kick_victim_order(void) {
+    server s = {0};
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.batched_mode = true;
+    s.kv.enabled = true;
+    s.kv.opt.min_tokens = 200;
+    server_slot slots[5] = {0};
+    s.slots = slots;
+    s.slot_count = 5;
+    int tok[300];
+    for (int i = 0; i < 300; i++) tok[i] = i + 1;
+    for (int i = 0; i < 5; i++) slots[i].id = i;
+
+    /* 0: saveable, idle longest.  1: saveable and on disk, used recently.
+     * 2: no checkpoint.  3: below the disk minimum, idle longest of all.
+     * 4: never used, no session. */
+    slots[0].session = ds4_session_new_test_checkpoint(tok, 300);
+    slots[0].last_used = 100;
+    slots[1].session = ds4_session_new_test_checkpoint(tok, 280);
+    slots[1].last_used = 900;
+    slots[1].disk_frontier_tokens = 280;
+    slots[2].session = ds4_session_new_test_checkpoint(NULL, 0);
+    slots[2].last_used = 950;
+    slots[3].session = ds4_session_new_test_checkpoint(tok, 50);
+    slots[3].last_used = 10;
+
+    int tokens = -1;
+    TEST_ASSERT(slot_kick_cost_of(&s, &slots[0], &tokens) == KICK_SAVE);
+    TEST_ASSERT(tokens == 300);
+    TEST_ASSERT(slot_kick_cost_of(&s, &slots[1], NULL) == KICK_ON_DISK);
+    TEST_ASSERT(slot_kick_cost_of(&s, &slots[2], NULL) == KICK_FREE);
+    TEST_ASSERT(slot_kick_cost_of(&s, &slots[3], NULL) == KICK_LOSSY);
+
+    /* Empty first, however recently it was used. */
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[2]);
+    slots[2].kicking = true;
+    /* On disk beats a staler slot that still has to be written. */
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[1]);
+    /* A frontier that moved past the stored one is no longer free. */
+    slots[1].disk_frontier_tokens = 256;
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[0]);
+    /* Same class: the longest idle goes. */
+    slots[1].last_used = 50;
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[1]);
+    /* Busy and assigned slots are never victims. */
+    job running = {0};
+    slots[1].busy = true;
+    slots[0].assigned = &running;
+    slots[0].busy = true;
+    /* Only the unsaveable slot is left: last resort. */
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[3]);
+    slots[3].busy = true;
+    TEST_ASSERT(slot_kick_victim_locked(&s) == NULL);
+    TEST_ASSERT(server_kick_idle_slots(&s, 1, "test") == 0);
+    slots[0].assigned = NULL;
+    slots[0].busy = slots[1].busy = slots[3].busy = false;
+
+    /* A failed save demotes the slot below everything that can be saved. */
+    slots[0].kick_unsaved_tokens = 300;
+    TEST_ASSERT(slot_kick_cost_of(&s, &slots[0], NULL) == KICK_LOSSY);
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[1]);
+    slots[0].kick_unsaved_tokens = 0;
+
+    /* Vision state has no disk key, and without a disk cache nothing has. */
+    ds4_vision_span img = {.token_start = 4};
+    img.embedding.token_count = 8;
+    ds4_session_set_test_images(slots[0].session, &img, 1);
+    TEST_ASSERT(slot_kick_cost_of(&s, &slots[0], NULL) == KICK_LOSSY);
+    ds4_session_set_test_images(slots[0].session, NULL, 0);
+    s.kv.enabled = false;
+    TEST_ASSERT(slot_kick_cost_of(&s, &slots[1], NULL) == KICK_LOSSY);
+    s.kv.enabled = true;
+
+    /* A queued continuation that only slot 1 can serve pins it. */
+    job pinned = {0};
+    pinned.req.responses_requires_live_tool_state = true;
+    id_list_push_unique(&pinned.req.responses_live_call_ids, "call-slot-1");
+    slots[1].responses_live.valid = true;
+    id_list_push_unique(&slots[1].responses_live.call_ids, "call-slot-1");
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[1]);
+    s.head = s.tail = &pinned;
+    TEST_ASSERT(slot_kick_victim_locked(&s) == &slots[0]);
+    s.head = s.tail = NULL;
+
+    /* Single-session mode never kicks. */
+    s.batched_mode = false;
+    TEST_ASSERT(server_kick_idle_slots(&s, 1, "test") == 0);
+    TEST_ASSERT(server_memory_pressure(&s, UINT64_MAX) == 0);
+    TEST_ASSERT(slots[0].session && slots[1].session && slots[3].session);
+
+    request_free(&pinned.req);
+    live_tool_state_free(&slots[1].responses_live);
+    for (int i = 0; i < 4; i++) ds4_session_free_test_checkpoint(slots[i].session);
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
+}
+
+/* A kicked slot must be indistinguishable from one that was never used: no
+ * session, no live bindings, no rendered-text cache, routed as empty.  The
+ * conversation then returns through the disk lookup, which leaves the slot
+ * holding a frontier that is free to kick again. */
+static void test_slot_kick_bookkeeping_round_trip(void) {
+    server s = {0};
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    s.batched_mode = true;
+    s.kv.enabled = true;
+    s.kv.opt.min_tokens = 4;
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    slots[1].id = 1;
+    const time_t now = 1000000;
+    int tok[10];
+    for (int i = 0; i < 10; i++) tok[i] = i + 1;
+
+    server_slot *slot = &slots[0];
+    slot->session = ds4_session_new_test_checkpoint(tok, 10);
+    slot->last_used = now;
+    slot->live_text = xstrdup("hello world");
+    slot->live_text_len = 11;
+    slot->live_text_pos = 10;
+    slot->continued_last_store_tokens = 8;
+    slot->disk_frontier_tokens = 8;
+    slot->kick_unsaved_tokens = 10;
+    slot->responses_live.valid = true;
+    slot->responses_live.live_tokens = 10;
+    slot->responses_live.visible_text = xstrdup("hello");
+    slot->responses_live.visible_len = 5;
+    id_list_push_unique(&slot->responses_live.call_ids, "call-a");
+    slot->anthropic_live.valid = true;
+    id_list_push_unique(&slot->anthropic_live.call_ids, "toolu-a");
+    slot->thinking_live.valid = true;
+    slot->thinking_live.live_tokens = 10;
+    slot->thinking_live.visible_text = xstrdup("hello");
+    slot->thinking_live.visible_len = 5;
+
+    /* The owner continues: the slot is pinned by reuse, and a request that
+     * names its live call id is bound to it. */
+    job cont = {0};
+    for (int i = 0; i < 10; i++) ds4_tokens_push(&cont.req.prompt, tok[i]);
+    ds4_tokens_push(&cont.req.prompt, 77);
+    cont.req.prompt_text = xstrdup("hello world again");
+    TEST_ASSERT(job_slot_score(&s, slot, &cont, -1, now) == 10);
+    job bound = {0};
+    bound.req.responses_requires_live_tool_state = true;
+    id_list_push_unique(&bound.req.responses_live_call_ids, "call-a");
+    TEST_ASSERT(job_required_slot_locked(&s, &bound) == 0);
+
+    /* While a kick has the slot claimed the router must not touch it. */
+    slot->kicking = true;
+    TEST_ASSERT(job_slot_score(&s, slot, &cont, -1, now) == INT_MIN);
+    TEST_ASSERT(slot_kick_victim_locked(&s) == NULL);
+    s.head = s.tail = &cont;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(slots[1].assigned == &cont && slots[1].busy);
+    TEST_ASSERT(slot->assigned == NULL && !slot->busy);
+    slots[1].assigned = NULL;
+    slots[1].busy = false;
+
+    ds4_session *session = slot_detach_session(&s, slot);
+    slot->kicking = false;
+    TEST_ASSERT(session != NULL);
+    TEST_ASSERT(slot->session == NULL);
+    TEST_ASSERT(slot->live_text == NULL && slot->live_text_len == 0 &&
+                slot->live_text_pos == 0);
+    TEST_ASSERT(slot->continued_last_store_tokens == 0);
+    TEST_ASSERT(slot->disk_frontier_tokens == 0);
+    TEST_ASSERT(slot->kick_unsaved_tokens == 0);
+    TEST_ASSERT(!slot->responses_live.valid && !slot->anthropic_live.valid &&
+                !slot->thinking_live.valid);
+    TEST_ASSERT(slot->responses_live.call_ids.len == 0);
+    ds4_session_free_test_checkpoint(session);
+
+    /* Kicked: scores as an empty slot, binds nothing, has nothing to kick,
+     * and the worker-side refresh copes with the missing session. */
+    TEST_ASSERT(slot_probe_reuse_locked(&s, slot, &cont.req).kind == REUSE_NONE);
+    TEST_ASSERT(job_slot_score(&s, slot, &cont, -1, now) == 0);
+    TEST_ASSERT(job_required_slot_locked(&s, &bound) == -1);
+    TEST_ASSERT(slot_kick_victim_locked(&s) == NULL);
+    slot_refresh_live_text(&s, slot);
+    TEST_ASSERT(slot->live_text == NULL);
+
+    /* Restored from disk on a later request (kv_cache_try_load_text records
+     * the loaded frontier): reusable again, and free to kick until the
+     * conversation moves past the stored frontier. */
+    slot->session = ds4_session_new_test_checkpoint(tok, 10);
+    slot->disk_frontier_tokens = 10;
+    TEST_ASSERT(job_slot_score(&s, slot, &cont, -1, now) == 10);
+    TEST_ASSERT(slot_kick_cost_of(&s, slot, NULL) == KICK_ON_DISK);
+    TEST_ASSERT(slot_kick_victim_locked(&s) == slot);
+    ds4_session_free_test_checkpoint(slot->session);
+    slot->session = ds4_session_new_test_checkpoint(tok, 9);
+    TEST_ASSERT(slot_kick_cost_of(&s, slot, NULL) == KICK_SAVE);
+
+    ds4_session_free_test_checkpoint(slot->session);
+    request_free(&cont.req);
+    request_free(&bound.req);
+    pthread_cond_destroy(&s.cv);
+    pthread_mutex_destroy(&s.tool_mu);
+    pthread_mutex_destroy(&s.mu);
 }
 
 static void test_multimodal_prefill_resume_frontier(void) {
@@ -24148,6 +24651,8 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
+    test_slot_kick_victim_order();
+    test_slot_kick_bookkeeping_round_trip();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();

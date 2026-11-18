@@ -252,6 +252,16 @@ void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 uint32_t ds4_engine_prefill_chunk(ds4_engine *e);
+/* Memory pressure: when a session's KV cache cannot grow, the engine asks the
+ * owner of the sessions for need_bytes before it evicts its own optional
+ * weight caches.  The handler runs on the inference thread, inside the
+ * session call that needs the memory; it may save and free other sessions of
+ * this engine, never the one being evaluated.  It returns the bytes it
+ * released, 0 when it could release nothing. */
+typedef uint64_t (*ds4_memory_pressure_fn)(void *user, uint64_t need_bytes);
+void ds4_engine_set_memory_pressure_handler(ds4_engine *e,
+                                            ds4_memory_pressure_fn fn,
+                                            void *user);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);

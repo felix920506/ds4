@@ -58,9 +58,27 @@ thinking object, or a non-thinking model alias for direct answers.
 ```
 
 Without `--batched-session`, there is one resident session. With it, the server
-preallocates independent KV states and queues requests when all slots are busy.
-Choose context and slot count together: a context that fits once may not fit
-four times. Idle slots can be cached before reuse; active requests are not evicted.
+has that many slots, each with an independent KV state, and queues requests
+when all slots are busy. One session is created at startup, which checks that
+the context fits; the other slots get theirs on their first request.
+
+A context that fits once may not fit four times. When an active request needs
+memory that is not there, the server kicks idle slots: it writes the slot's
+live state to the disk KV cache and frees its session. The conversation is not
+lost; its next request restores it from disk on whichever slot is free,
+through the same lookup as after a restart. Kicks take the cheapest idle slot
+first: one with no conversation, then one whose state is already on disk, then
+one that has to be written, the longest idle first. A slot that runs a request,
+or that a queued request can only continue on, is never kicked. If no idle slot
+is left, the request fails with HTTP 503.
+
+Kicking needs `--kv-disk-dir`. Without it, and for state the disk cache cannot
+hold (conversations with images, or shorter than `--kv-cache-min-tokens`), a
+kicked conversation is prefilled again; such slots are kicked last, and the log
+says so. A client that continues a tool call by id alone, without replaying the
+history, gets the usual 409 after a kick, as it does after any slot reuse.
+Distributed and tensor-parallel servers create all sessions at startup and do
+not kick.
 
 Where the model supports it, the slots share one prefill workspace instead of
 each keeping its own, so an extra slot costs only its caches. That matters most
@@ -125,6 +143,9 @@ Clients can resend complete conversation histories. The server first tries
 the live token prefix, then compatible rendered-text prefixes from disk, and
 prefills the new suffix. With multiple slots, each slot has its own live state;
 disk is the additional persistence layer, not the only way to retain sessions.
+It is also where a slot's conversation goes when the slot is kicked for memory
+(see Multiple sessions), so size `--kv-disk-space-mb` for the conversations
+that should survive that.
 
 TP cache loading rebuilds the saved token prefix on both ranks. It is not an
 instantaneous restoration of both GPUs. Pipeline loading redistributes the
@@ -156,7 +177,7 @@ so a request's cost is split into:
 | `ds4_kv_save_*`, `ds4_kv_load_*` | Disk KV payloads written and restored, bytes, seconds |
 | `ds4_net_*` | Bytes and blocked seconds exchanged with other nodes (pipeline or TP), gate count, and worker compute reported in pipeline telemetry |
 | `ds4_ssd_read_*` | Routed-expert bytes streamed from disk and seconds |
-| `ds4_server_*` | Requests by endpoint and finish reason, prompt/cached/completion tokens, queue-wait, time-to-first-token and request-duration histograms, disk KV and image cache hits, live gauges |
+| `ds4_server_*` | Requests by endpoint and finish reason, prompt/cached/completion tokens, queue-wait, time-to-first-token and request-duration histograms, disk KV and image cache hits, slot kicks (`ds4_server_slot_kicks_total` by `state="saved"` or `"dropped"`, `ds4_server_slot_kick_bytes_total`), live gauges including `ds4_server_resident_sessions` |
 
 On a distributed coordinator the network wait is nested inside prefill and
 decode time; `network_transport_seconds_estimate` in the JSON view subtracts
@@ -169,6 +190,10 @@ prompt processing, generation, or idle waiting for clients.
 curl -s http://127.0.0.1:8000/metrics | grep -E '^ds4_(prefill|decode)_'
 curl -s http://127.0.0.1:8000/metrics/json | python3 -m json.tool
 ```
+
+A kicked conversation that returns is an ordinary disk KV hit
+(`ds4_server_kv_disk_lookups_total{result="hit"}`, `ds4_kv_load_*`); there is
+no separate restore counter.
 
 `--metrics-log 60` additionally logs one line per minute with the interval's
 deltas: prefill and decode throughput, time shares, network and disk I/O,
