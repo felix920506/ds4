@@ -354,6 +354,10 @@ uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes);
  * that could be allocated with every such cache evicted, as pinned device
  * memory or as movable (managed) memory. */
 uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom);
+/* The engine's memory pressure handler, for allocations the graph does not
+ * route through its own reclaim (session buffers): asked first, as there. */
+void ds4_gpu_set_memory_pressure_handler(
+        uint64_t (*fn)(void *user, uint64_t need_bytes), void *user);
 uint64_t ds4_gpu_memory_ceiling(int movable);
 #endif
 void ds4_gpu_set_quality(bool quality);

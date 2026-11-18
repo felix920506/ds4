@@ -5513,15 +5513,33 @@ static int cuda_stream_model_cache_prepare_memory(
 
 extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom);
 
+static uint64_t (*g_memory_pressure_fn)(void *user, uint64_t need_bytes);
+static void *g_memory_pressure_user;
+
+extern "C" void ds4_gpu_set_memory_pressure_handler(
+        uint64_t (*fn)(void *user, uint64_t need_bytes), void *user) {
+    g_memory_pressure_fn = fn;
+    g_memory_pressure_user = user;
+}
+
 /* Before an allocation that must not fail (fixed weights, session buffers):
- * if it does not fit, give up optional memory, cheapest first.  Both steps
- * synchronize the device before they free anything. */
+ * if it does not fit, give up memory in the order of the reclaim chain: the
+ * owner's idle sessions, the F16 cache, routed experts.  The handler frees
+ * sessions and may allocate while it saves them, hence the guard; the other
+ * steps synchronize the device before they free anything. */
 static void cuda_memory_make_room(uint64_t bytes) {
+    static thread_local bool busy;
     uint64_t missing = ds4_gpu_memory_shortfall(bytes, 0);
+    if (!missing || busy) return;
+    busy = true;
+    if (g_memory_pressure_fn && g_memory_pressure_fn(g_memory_pressure_user, missing)) {
+        missing = ds4_gpu_memory_shortfall(bytes, 0);
+    }
     if (missing && cuda_q8_f16_cache_evict(missing)) {
         missing = ds4_gpu_memory_shortfall(bytes, 0);
     }
     if (missing) (void)ds4_gpu_reclaim_weights(missing);
+    busy = false;
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
@@ -6017,9 +6035,14 @@ extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_head
         (void)cudaGetLastError();
         return bytes;
     }
+    /* With the F16 cache gone nothing else keeps room for the temporaries of
+     * a kernel launch, which cannot reclaim (their caller holds weight
+     * pointers) and fail the request instead. */
+    const uint64_t transient = g_q8_f16_bytes == 0 && ds4_rocm_uses_host_ram()
+        ? 1ull << 30 : 0;
     const uint64_t need = bytes + (keep_cache_headroom && g_q8_f16_bytes != 0
         ? cuda_q8_f16_cache_reserve_bytes(total_b)
-        : cuda_memory_os_reserve_bytes());
+        : cuda_memory_os_reserve_bytes() + transient);
     return need > free_b ? need - free_b : 0;
 }
 

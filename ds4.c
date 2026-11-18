@@ -76014,6 +76014,9 @@ void ds4_engine_set_memory_pressure_handler(ds4_engine *e, ds4_memory_pressure_f
     if (!e) return;
     e->memory_pressure.fn = fn;
     e->memory_pressure.user = user;
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    ds4_gpu_set_memory_pressure_handler(fn, user);
+#endif
 }
 
 int ds4_engine_set_power(ds4_engine *e, int power_percent) {
