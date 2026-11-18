@@ -70,7 +70,9 @@ through the same lookup as after a restart. Kicks take the cheapest idle slot
 first: one with no conversation, then one whose state is already on disk, then
 one that has to be written, the longest idle first. A slot that runs a request,
 or that a queued request can only continue on, is never kicked. If no idle slot
-is left, the request fails with HTTP 503.
+is left, a request that needs a new session waits for a running request to
+finish and takes that slot's memory then (`ds4_server_memory_waits_total`).
+It fails with HTTP 503 only when no other slot could give memory back.
 
 Kicking needs `--kv-disk-dir`. Without it, and for state the disk cache cannot
 hold (conversations with images, or shorter than `--kv-cache-min-tokens`), a

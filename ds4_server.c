@@ -6987,6 +6987,8 @@ typedef struct {
     uint64_t slot_kicks_saved;   /* session freed, nothing lost: on disk or empty */
     uint64_t slot_kicks_dropped; /* session freed, conversation state lost */
     uint64_t slot_kick_bytes;    /* KV payload bytes written by kicks */
+    uint64_t memory_waits;       /* requests that waited for session memory */
+    double memory_wait_seconds;
     uint64_t image_cache_hits;
     uint64_t image_encodes;
 } server_metrics;
@@ -7060,6 +7062,13 @@ static void metrics_note_slot_kick(bool saved, uint64_t written_bytes) {
     if (saved) g_metrics.slot_kicks_saved++;
     else g_metrics.slot_kicks_dropped++;
     g_metrics.slot_kick_bytes += written_bytes;
+    pthread_mutex_unlock(&g_metrics.mu);
+}
+
+static void metrics_note_memory_wait(double seconds) {
+    pthread_mutex_lock(&g_metrics.mu);
+    g_metrics.memory_waits++;
+    g_metrics.memory_wait_seconds += seconds;
     pthread_mutex_unlock(&g_metrics.mu);
 }
 
@@ -10238,6 +10247,7 @@ struct server_slot {
     /* Claimed under mu by a kick that is saving and freeing the session: the
      * router skips the slot, so nobody else reads the session meanwhile. */
     bool kicking;
+    bool memory_waiting; /* Under mu: its request waits for session memory. */
     bool prefill_waiting;
 
     /* Prefill gate accounting for the running job, owned by the slot thread. */
@@ -15427,22 +15437,88 @@ static uint64_t server_memory_pressure(void *user, uint64_t need_bytes) {
     return server_kick_idle_slots(user, need_bytes, "memory-pressure");
 }
 
+/* True while waiting can still produce a slot to kick: another slot is
+ * running a request that will leave it idle, or holds a session a queued
+ * request is about to use.  A slot that is itself waiting here cannot help;
+ * without that exclusion two starved slots would wait on each other. */
+static bool slot_memory_wait_useful_locked(server *s, const server_slot *self) {
+    for (int i = 0; i < s->slot_count; i++) {
+        const server_slot *o = &s->slots[i];
+        if (o == self || o->memory_waiting) continue;
+        if (o->busy || o->assigned || o->kicking) return true;
+        if (o->session && !ds4_session_is_distributed(o->session)) return true;
+    }
+    return false;
+}
+
+/* Diagnostic: cap the sessions held at once, so the wait below can be
+ * exercised on a machine with memory to spare. */
+static int server_debug_max_sessions(void) {
+    const char *env = getenv("DS4_SERVER_DEBUG_MAX_SESSIONS");
+    return env && env[0] ? atoi(env) : 0;
+}
+
 /* Slot sessions are created on first use: a slot nobody talked to, or one
  * that was kicked, holds no KV memory.  When the context does not fit, idle
- * slots are kicked one at a time until it does or none is left. */
-static bool slot_session_ensure(server *s, server_slot *slot) {
+ * slots are kicked one at a time until it does.  When none is idle the
+ * request waits for a running one to finish and takes its memory then; it
+ * fails only when no other slot could ever give memory back. */
+static bool slot_session_ensure(server *s, server_slot *slot, job *j) {
+    const int max_sessions = server_debug_max_sessions();
+    double wait_start = 0.0;
     while (!slot->session) {
-        pthread_mutex_lock(&s->inference_mu);
-        const int rc = ds4_session_create(&slot->session, s->engine, s->ctx_size);
-        pthread_mutex_unlock(&s->inference_mu);
+        int rc = 1;
+        if (max_sessions <= 0 ||
+            __atomic_load_n(&s->resident_sessions, __ATOMIC_RELAXED) < max_sessions)
+        {
+            pthread_mutex_lock(&s->inference_mu);
+            rc = ds4_session_create(&slot->session, s->engine, s->ctx_size);
+            pthread_mutex_unlock(&s->inference_mu);
+        }
         if (rc == 0) {
             __atomic_add_fetch(&s->resident_sessions, 1, __ATOMIC_RELAXED);
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: slot %d: session created (ctx=%d)",
                        slot->id, s->ctx_size);
-        } else if (server_kick_idle_slots(s, 1, "session-create") == 0) {
-            return false;
+            break;
         }
+        if (server_kick_idle_slots(s, 1, "session-create") != 0) continue;
+
+        /* Nothing idle to kick.  The wake-ups are the broadcasts a slot
+         * sends when it goes idle; the timeout only bounds how long a
+         * cancelled request stays here. */
+        pthread_mutex_lock(&s->mu);
+        const bool useful = !s->stopping && !job_cancelled(j) &&
+                            slot_memory_wait_useful_locked(s, slot);
+        if (useful) {
+            if (wait_start == 0.0) {
+                wait_start = now_sec();
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: req#%llu slot %d: no memory for a "
+                           "session and no idle slot to kick; waiting for a "
+                           "running request to finish",
+                           (unsigned long long)j->id, slot->id);
+            }
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += 200 * 1000 * 1000;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            slot->memory_waiting = true;
+            (void)pthread_cond_timedwait(&s->cv, &s->mu, &deadline);
+            slot->memory_waiting = false;
+        }
+        pthread_mutex_unlock(&s->mu);
+        if (!useful) return false;
+    }
+    if (wait_start != 0.0) {
+        const double waited = now_sec() - wait_start;
+        metrics_note_memory_wait(waited);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: req#%llu slot %d: waited %.1f s for session memory",
+                   (unsigned long long)j->id, slot->id, waited);
     }
     return true;
 }
@@ -15467,14 +15543,13 @@ static void generate_job(server *s, server_slot *slot, job *j) {
 
     if (job_cancelled(j)) {
         /* Nothing to run, and no reason to allocate a session for it. */
-    } else if (!slot_session_ensure(s, slot)) {
+    } else if (!slot_session_ensure(s, slot, j)) {
         server_log(DS4_LOG_ERROR,
                    "ds4-server: req#%llu slot %d: no memory for a %d token "
-                   "session and no idle slot left to kick",
+                   "session and no other slot that could give any back",
                    (unsigned long long)j->id, slot->id, s->ctx_size);
         http_error(j->fd, s->enable_cors, 503,
-                   "not enough memory for another session context; "
-                   "retry when a running request has finished");
+                   "not enough memory for a session context");
     } else {
         ds4_session_set_cancel(slot->session, job_cancelled, j);
         generate_job_inner(s, slot, j);
@@ -15741,6 +15816,8 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
         dispatch_jobs_locked(s);
+        /* A request waiting for session memory can kick this slot now. */
+        pthread_cond_broadcast(&s->cv);
         pthread_mutex_unlock(&s->mu);
     }
     return NULL;
@@ -16034,6 +16111,11 @@ static void metrics_render_prometheus(server *s, buf *b) {
                (unsigned long long)m.slot_kicks_dropped);
     metrics_prom_u64(b, "ds4_server_slot_kick_bytes_total", "counter",
                      "KV payload bytes written to disk by kicks.", m.slot_kick_bytes);
+    metrics_prom_u64(b, "ds4_server_memory_waits_total", "counter",
+                     "Requests that waited for a running request to finish before a session fit.", m.memory_waits);
+    metrics_prom_header(b, "ds4_server_memory_wait_seconds_total", "counter",
+                        "Time requests spent waiting for session memory.");
+    buf_printf(b, "ds4_server_memory_wait_seconds_total %.6f\n", m.memory_wait_seconds);
     metrics_prom_header(b, "ds4_server_image_embeddings_total", "counter",
                         "Image embeddings by source.");
     buf_printf(b, "ds4_server_image_embeddings_total{result=\"cache_hit\"} %llu\n"
@@ -16143,6 +16225,7 @@ static void metrics_render_json(server *s, buf *b) {
     metrics_json_hist(b, "request_duration_seconds", &m.duration);
     buf_printf(b, ",\"kv_disk\":{\"lookups\":%llu,\"hits\":%llu,\"stores\":%llu},"
                   "\"slot_kicks\":{\"saved\":%llu,\"dropped\":%llu,\"written_bytes\":%llu},"
+                  "\"memory_waits\":{\"count\":%llu,\"seconds\":%.6f},"
                   "\"image_cache\":{\"hits\":%llu,\"encodes\":%llu},"
                   "\"slots\":%d,\"resident_sessions\":%d,"
                   "\"context_tokens\":%d,\"active_clients\":%d,"
@@ -16154,6 +16237,7 @@ static void metrics_render_json(server *s, buf *b) {
                (unsigned long long)m.slot_kicks_saved,
                (unsigned long long)m.slot_kicks_dropped,
                (unsigned long long)m.slot_kick_bytes,
+               (unsigned long long)m.memory_waits, m.memory_wait_seconds,
                (unsigned long long)m.image_cache_hits,
                (unsigned long long)m.image_encodes,
                s->slot_count,

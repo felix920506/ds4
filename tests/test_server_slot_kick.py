@@ -15,6 +15,12 @@ drop after the kick. On a server whose context is too large for all slots to
 hold a session at once, the kicks happen on their own; --min-kicks checks
 that they did.
 
+With --concurrent the conversations of a turn are sent at once. On a server
+that cannot hold a session per slot (DS4_SERVER_DEBUG_MAX_SESSIONS=1 stands in
+for that), a request then finds every other slot busy and has to wait for one
+to finish; --min-waits checks that it did, and every request must still
+succeed.
+
 Run it without --kick on a fresh server and KV directory with --out, then
 with --kick and --expect on another fresh server: the second-turn text must
 match. Start both servers with --prefill-chunk 16; larger ROCm prefill chunks
@@ -25,6 +31,7 @@ import argparse
 import glob
 import json
 import sys
+import threading
 import urllib.request
 
 TOPICS = ("tide pools", "steam locomotives", "alpine glaciers", "bronze casting")
@@ -61,6 +68,29 @@ def chat(base, messages, max_tokens):
         "prompt_tokens": usage.get("prompt_tokens", 0),
         "cached_tokens": details.get("cached_tokens", 0),
     }
+
+
+def chat_all(base, conversations, max_tokens, concurrent):
+    """One chat per conversation, in order or all at once; results in order."""
+    results = [None] * len(conversations)
+
+    def run(i):
+        try:
+            results[i] = chat(base, conversations[i], max_tokens)
+        except Exception as exc:  # reported by the caller, per conversation
+            results[i] = exc
+
+    if concurrent:
+        threads = [threading.Thread(target=run, args=(i,))
+                   for i in range(len(conversations))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    else:
+        for i in range(len(conversations)):
+            run(i)
+    return results
 
 
 def memory(pid):
@@ -106,6 +136,10 @@ def main():
                     help="kick the way the engine asks during a disk restore")
     ap.add_argument("--min-kicks", type=int, default=0,
                     help="fail unless the server kicked at least this often")
+    ap.add_argument("--concurrent", action="store_true",
+                    help="send the conversations of a turn at once")
+    ap.add_argument("--min-waits", type=int, default=0,
+                    help="fail unless this many requests waited for memory")
     ap.add_argument("--pid", type=int, default=0, help="server pid, for memory")
     ap.add_argument("--out", help="write the second-turn results here")
     ap.add_argument("--expect", help="second-turn results of an un-kicked run")
@@ -113,16 +147,19 @@ def main():
     failures = []
 
     start = http(args.base, "/metrics/json")["server"]
-    histories = []
-    for i in range(args.conversations):
-        messages = [{"role": "user", "content": first_message(i, args.words)}]
-        r = chat(args.base, messages, args.max_tokens)
+    histories = [[{"role": "user", "content": first_message(i, args.words)}]
+                 for i in range(args.conversations)]
+    first = chat_all(args.base, histories, args.max_tokens, args.concurrent)
+    for i, (messages, r) in enumerate(zip(histories, first)):
+        if isinstance(r, Exception):
+            print("FAIL: conversation %d first turn: %s" % (i, r))
+            print("slot kick test: FAILED")
+            return 1
         print("turn 1 conv %d: prompt=%d cached=%d text=%r" %
               (i, r["prompt_tokens"], r["cached_tokens"], r["text"][:60]))
         messages.append({"role": "assistant", "content": r["text"]})
         messages.append({"role": "user",
                          "content": "Now add one more sentence, then stop."})
-        histories.append(messages)
 
     before = http(args.base, "/metrics/json")["server"]
     mem_before = memory(args.pid)
@@ -155,14 +192,16 @@ def main():
                 mem_after["vram"] >= mem_before["vram"]:
             failures.append("GPU buffer bytes did not drop after the kick")
 
-    results = []
-    for i, messages in enumerate(histories):
-        r = chat(args.base, messages, args.max_tokens)
+    results = chat_all(args.base, histories, args.max_tokens, args.concurrent)
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            print("FAIL: conversation %d second turn: %s" % (i, r))
+            print("slot kick test: FAILED")
+            return 1
         print("turn 2 conv %d: prompt=%d cached=%d text=%r" %
               (i, r["prompt_tokens"], r["cached_tokens"], r["text"][:60]))
         if r["cached_tokens"] <= 0:
             failures.append("conversation %d was prefilled from scratch" % i)
-        results.append(r)
     final = http(args.base, "/metrics/json")["server"]
     restores = final["kv_disk"]["hits"] - start["kv_disk"]["hits"]
     kicks = sum(final["slot_kicks"][k] - start["slot_kicks"][k]
@@ -175,6 +214,12 @@ def main():
     if restores != kicks - on_disk_only:
         failures.append("%d kicks, %d conversations without a session, but "
                         "%d disk restores" % (kicks, on_disk_only, restores))
+    waits = final["memory_waits"]["count"] - start["memory_waits"]["count"]
+    print("memory waits: %d (%.1f s)" % (
+        waits, final["memory_waits"]["seconds"] - start["memory_waits"]["seconds"]))
+    if waits < args.min_waits:
+        failures.append("only %d requests waited for memory, wanted at least %d"
+                        % (waits, args.min_waits))
     if kicks < args.min_kicks:
         failures.append("only %d kicks, wanted at least %d" %
                         (kicks, args.min_kicks))
