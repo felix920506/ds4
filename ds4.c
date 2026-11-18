@@ -19753,7 +19753,7 @@ static bool metal_graph_alloc_raw_cap(
      * allocation; a managed cache that grows with the context measures like
      * device memory (465 vs 461 tok/s for a 2K-token prefill). */
     g->kv_managed = managed_kv_cache;
-    if (managed_kv_cache) {
+    if (managed_kv_cache && !g->kv_on_demand) {
         /*
          * CUDA device allocations are fastest, but a million-token KV cache is
          * large enough to starve DGX Spark's unified CPU/GPU memory once the
