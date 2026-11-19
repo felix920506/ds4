@@ -23814,6 +23814,105 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_score_ages_idle_entries(void) {
+    /* Issue #21: a months-old anchor whose hits have long decayed is denser
+     * than a small frontier and carries the anchor prior, so on density alone
+     * it outranked a frontier written minutes ago. */
+    const uint64_t day = 24u * 60u * 60u;
+    const uint64_t now = 200u * day;
+    kv_entry august = {.tokens = 102400, .hits = 40, .file_size = 1400u << 20,
+                       .reason = KV_REASON_COLD, .created_at = now - 90u * day,
+                       .last_used = now - 60u * day};
+    kv_entry week = august;
+    week.last_used = now - 7u * day;
+    kv_entry frontier = {.tokens = 10240, .hits = 0, .file_size = 157u << 20,
+                         .reason = KV_REASON_CONTINUED,
+                         .created_at = now - 20u * 60u,
+                         .last_used = now - 20u * 60u};
+
+    double s_august = kv_entry_eviction_score(&august, NULL, now, NULL);
+    double s_week = kv_entry_eviction_score(&week, NULL, now, NULL);
+    double s_frontier = kv_entry_eviction_score(&frontier, NULL, now, NULL);
+    TEST_ASSERT(s_august < s_week);
+    TEST_ASSERT(s_week < s_frontier);
+
+    /* Never used since it was written: age counts from created_at. */
+    kv_entry unused = august;
+    unused.hits = 0;
+    unused.last_used = 0;
+    TEST_ASSERT(kv_entry_eviction_score(&unused, NULL, now, NULL) < s_august);
+
+    /* A timestamp ahead of the clock is not penalized. */
+    kv_entry ahead = frontier;
+    ahead.last_used = now + day;
+    TEST_ASSERT(kv_entry_eviction_score(&ahead, NULL, now, NULL) ==
+                (double)ahead.tokens / (double)ahead.file_size);
+}
+
+static void test_kv_cache_eviction_drops_stale_before_fresh_frontier(void) {
+    /* Issue #21 on disk: a full cache holds a stale anchor, another session's
+     * newest frontier and this session's previous waypoint.  The store that
+     * supersedes the waypoint has to take the stale anchor, not either of the
+     * two entries written minutes ago. */
+    char tmpl[] = "/tmp/ds4-kv-idle-age-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *stale_sha = "1111111111111111111111111111111111111111";
+    const char *other_sha = "2222222222222222222222222222222222222222";
+    const char *waypoint_text = "system: hello world";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    const uint64_t day = 24u * 60u * 60u;
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, stale_sha, KV_REASON_COLD, 4096, 40,
+                      now - 60u * day, 2048);
+    test_kv_stub_file(dir, other_sha, KV_REASON_CONTINUED, 1024, 0,
+                      now - 20u * 60u, 2048);
+    test_kv_text_stub_file(dir, waypoint_text, KV_REASON_CONTINUED, 1024, 2048);
+
+    char waypoint_sha[41];
+    sha1_bytes_hex(waypoint_text, strlen(waypoint_text), waypoint_sha);
+    char stale_name[44], other_name[44], waypoint_name[44];
+    snprintf(stale_name, sizeof(stale_name), "%.40s.kv", stale_sha);
+    snprintf(other_name, sizeof(other_name), "%.40s.kv", other_sha);
+    snprintf(waypoint_name, sizeof(waypoint_name), "%.40s.kv", waypoint_sha);
+    char *stale_path = path_join(dir, stale_name);
+    char *other_path = path_join(dir, other_name);
+    char *waypoint_path = path_join(dir, waypoint_name);
+    TEST_ASSERT(ds4_kvstore_touch_file(waypoint_path, 0));
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    const uint64_t stub = KV_CACHE_FIXED_HEADER + 4u + 2048u;
+    uint64_t incoming_bytes = stub + strlen(incoming_text);
+    kc.budget_bytes = incoming_bytes + 2u * stub + strlen(waypoint_text);
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+    };
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(stale_path, F_OK) != 0);
+    TEST_ASSERT(access(other_path, F_OK) == 0);
+    TEST_ASSERT(access(waypoint_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(stale_path);
+    unlink(other_path);
+    unlink(waypoint_path);
+    free(stale_path);
+    free(other_path);
+    free(waypoint_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -24906,6 +25005,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
+    test_kv_cache_eviction_score_ages_idle_entries();
+    test_kv_cache_eviction_drops_stale_before_fresh_frontier();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 

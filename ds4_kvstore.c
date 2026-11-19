@@ -54,6 +54,14 @@
  * survive comparable continued entries, while still allowing pressure and poor
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
+/* Density and the reason priors say nothing about time, so without an idle
+ * term a full cache ranks a frontier written a minute ago level with (or, being
+ * smaller and so less dense, below) checkpoints nobody has touched in months:
+ * the old ones stay forever and every store evicts the previous one.  Scale the
+ * score by scale / (scale + idle).  The hyperbola is deliberate: an exponential
+ * would flatten to zero and leave everything older than a few days tied, while
+ * this keeps a week-old entry ahead of a three-month-old one. */
+#define KV_CACHE_IDLE_SCALE_SECONDS DS4_KVSTORE_HIT_HALF_LIFE_SECONDS
 
 typedef struct {
     char *ptr;
@@ -553,6 +561,11 @@ double ds4_kvstore_entry_eviction_score(
     }
     double score = (effective_hits + 1.0) *
                    (double)e->tokens / (double)e->file_size;
+    /* An entry with no timestamp at all counts as idle since the epoch. */
+    if (now > used_at) {
+        const double scale = (double)KV_CACHE_IDLE_SCALE_SECONDS;
+        score *= scale / (scale + (double)(now - used_at));
+    }
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
