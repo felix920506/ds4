@@ -251,8 +251,11 @@ The text GGUF stays the same. Download and add the encoder explicitly:
 ```
 
 Use `/read image.png` in `ds4`, or start `ds4-agent` with the same `--vision`
-argument to enable `view_image`. Agent sessions containing images cannot yet
-be saved with `/save`.
+argument to enable `view_image`. `/save` keeps the images of a session with its
+KV state, so `/switch` restores it without encoding or prefilling them again.
+Such a session cannot be stripped with `/strip`, and it cannot be saved once
+the context is full or under tensor parallelism: both would have to rebuild
+it from text, which holds no pixels.
 
 For two-Mac TP, pass the same encoder on both ranks. The coordinator encodes
 the image and sends the projected visual tokens to the worker.
