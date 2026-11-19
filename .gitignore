@@ -140,3 +140,4 @@ __pycache__/
 /speed-bench/rocm_prefill_variant_bench
 
 /tests/test_rocm_moe_down
+/tests/test_rocm_indexer

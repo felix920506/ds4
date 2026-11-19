@@ -195,6 +195,11 @@ generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and
 long-prefill throughput, not as a guaranteed decode speedup.
 
+On Strix Halo a stage decodes in bursts, idle while the other stages hold the
+token, and right after a long prefill the hot SoC runs those bursts at less
+than half speed until it has cooled. Measurements are in the
+[pipeline decode notes](../speed-bench/gfx1151-pipeline-decode.md).
+
 ### Full PRO Q4
 
 For two 512 GB Mac Studios, use the split artifacts:

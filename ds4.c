@@ -17494,7 +17494,7 @@ typedef struct ds4_gpu_graph {
      * comp_cap and layer_comp_cap stay the reserved full-context maximum; the
      * committed size is the tensor size. */
     const ds4_memory_pressure *kv_on_demand;
-    bool kv_managed; /* the KV caches live in managed (movable) memory */
+    bool kv_managed; /* the large KV caches live in managed (movable) memory */
     /* Non-NULL when the indexer scratch is the engine's, shared by its
      * sessions; kv_scratch_need is what this session last asked of it. */
     ds4_kv_scratch *kv_scratch;
@@ -18677,6 +18677,27 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
     return metal_graph_alloc_kv_cache_tensor_on(managed, 0, bytes);
 }
 
+/* Whether a KV cache of a layer with this compression ratio (0 for the raw
+ * window) follows the managed-memory choice.
+ *
+ * Managed memory is what lets a very large context fit, and on Strix Halo it
+ * is slower to attend over: the same decode attention takes 1.6 to 1.9 times
+ * as long from managed memory as from device memory, with or without huge
+ * pages (0.16 against 0.10 ms for an indexed layer, 0.33 against 0.17 ms for
+ * a ratio-128 layer at 262144 tokens).  The size is all in the ratio-4
+ * caches: of the 13 GiB a 1M-token context grows to, the raw windows are
+ * 0.36 GiB and the ratio-128 caches about as much.  So on ROCm only the
+ * ratio-4 caches are managed.  CUDA keeps every cache managed: the choice
+ * there protects DGX Spark's unified memory and was not measured again. */
+static bool metal_graph_kv_cache_managed(bool managed_kv, uint32_t ratio) {
+#ifdef DS4_ROCM_BUILD
+    return managed_kv && ratio == 4;
+#else
+    (void)ratio;
+    return managed_kv;
+#endif
+}
+
 /* =========================================================================
  * On-demand context memory (ROCm).
  * =========================================================================
@@ -18779,12 +18800,17 @@ static bool metal_graph_kv_admit(const ds4_gpu_graph *g, uint32_t ctx_size) {
             if (!cache) continue;
             const uint64_t reserved = g->layer_comp_cap[il] *
                                       metal_graph_comp_cache_row_bytes(indexer != 0);
-            caches += reserved - ds4_gpu_tensor_bytes(cache);
+            const uint64_t growth = reserved - ds4_gpu_tensor_bytes(cache);
+            if (!metal_graph_kv_cache_managed(g->kv_managed, ds4_layer_compress_ratio(il))) {
+                pinned += growth;
+                continue;
+            }
+            caches += growth;
             if (reserved > largest) largest = reserved;
         }
     }
-    pinned += g->kv_managed ? largest : caches;
-    const uint64_t total = pinned + (g->kv_managed ? caches - largest : 0);
+    pinned += largest;
+    const uint64_t total = pinned + caches - largest;
     const uint64_t ceiling = ds4_gpu_memory_ceiling(g->kv_managed);
     if (pinned <= ds4_gpu_memory_ceiling(false) && total <= ceiling) return true;
     fprintf(stderr,
@@ -18876,7 +18902,8 @@ static bool metal_graph_kv_reserve_rows(
     const uint32_t rows = metal_graph_kv_rows_for((uint32_t)have, (uint32_t)need,
                                                   g->layer_comp_cap[il]);
     return metal_graph_kv_resize(g, cache, rows * row_bytes, valid * row_bytes,
-                                 g->kv_managed);
+                                 metal_graph_kv_cache_managed(
+                                     g->kv_managed, ds4_layer_compress_ratio(il)));
 }
 
 /* Resize one of the two indexer scratch tensors (0 scores, 1 mask).  A shared
@@ -18981,7 +19008,9 @@ static bool metal_graph_kv_refit(
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid ? valid[il] : 0, g->layer_comp_cap[il]);
             if (bytes != ds4_gpu_tensor_bytes(*cache) &&
-                !metal_graph_kv_resize(g, cache, bytes, 0, g->kv_managed)) return false;
+                !metal_graph_kv_resize(g, cache, bytes, 0,
+                                       metal_graph_kv_cache_managed(
+                                           g->kv_managed, ds4_layer_compress_ratio(il)))) return false;
         }
     }
     return n_comp || metal_graph_kv_scratch_refit(g);
@@ -19008,7 +19037,9 @@ static bool metal_graph_kv_refit_layers(
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid, g->layer_comp_cap[il]);
             if (bytes != ds4_gpu_tensor_bytes(*cache) &&
-                !metal_graph_kv_resize(g, cache, bytes, 0, g->kv_managed)) return false;
+                !metal_graph_kv_resize(g, cache, bytes, 0,
+                                       metal_graph_kv_cache_managed(
+                                           g->kv_managed, ds4_layer_compress_ratio(il)))) return false;
         }
     }
     return true;
@@ -19950,14 +19981,14 @@ static bool metal_graph_alloc_raw_cap(
          * and ds4_gpu_tensor_alloc_ptr_on. */
         const int layer_tier = placement ? placement[il + 1] : 0;
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
-                managed_kv_cache,
+                metal_graph_kv_cache_managed(managed_kv_cache, 0),
                 layer_tier,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         const int layer_tp_partner = g->cuda_tp_attn_cache_dup
             ? metal_graph_cuda_tp_partner_tier(layer_tier) : -1;
         if (layer_tp_partner >= 0) {
             g->layer_raw_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
-                    managed_kv_cache,
+                    metal_graph_kv_cache_managed(managed_kv_cache, 0),
                     layer_tp_partner,
                     (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         }
@@ -19970,13 +20001,13 @@ static bool metal_graph_alloc_raw_cap(
                 ? metal_graph_kv_rows_for(0, 0, g->layer_comp_cap[il])
                 : g->layer_comp_cap[il];
             g->layer_attn_comp_cache[il] = metal_graph_alloc_kv_cache_tensor_on(
-                    managed_kv_cache,
+                    metal_graph_kv_cache_managed(managed_kv_cache, ratio),
                     layer_tier,
                     (uint64_t)comp_rows * DS4_N_HEAD_DIM *
                     (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
             if (layer_tp_partner >= 0) {
                 g->layer_attn_comp_cache_tp[il] = metal_graph_alloc_kv_cache_tensor_on(
-                        managed_kv_cache,
+                        metal_graph_kv_cache_managed(managed_kv_cache, ratio),
                         layer_tp_partner,
                         (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM *
                         (DS4_GPU_ATTN_COMP_CACHE_F16 ? sizeof(uint16_t) : sizeof(float)));
@@ -20181,7 +20212,7 @@ static bool metal_graph_alloc_raw_cap(
         g->mtp_state_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_next_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
         g->mtp_raw_cache = metal_graph_alloc_kv_cache_tensor(
-                managed_kv_cache,
+                metal_graph_kv_cache_managed(managed_kv_cache, 0),
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
         g->mtp_n_raw = 0;
     }
