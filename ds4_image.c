@@ -8,10 +8,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define JPEG_IMPLEMENTATION
-#define PNG_IMPLEMENTATION
-#include "third_party/iris/jpeg.h"
-#include "third_party/iris/png.h"
+/* Image decoding is done by Wuffs (third_party/wuffs). Only the modules the
+ * accepted formats need are compiled in. */
+#define WUFFS_IMPLEMENTATION
+#define WUFFS_CONFIG__STATIC_FUNCTIONS
+#define WUFFS_CONFIG__MODULES
+#define WUFFS_CONFIG__MODULE__ADLER32
+#define WUFFS_CONFIG__MODULE__BASE
+#define WUFFS_CONFIG__MODULE__BMP
+#define WUFFS_CONFIG__MODULE__CRC32
+#define WUFFS_CONFIG__MODULE__DEFLATE
+#define WUFFS_CONFIG__MODULE__GIF
+#define WUFFS_CONFIG__MODULE__JPEG
+#define WUFFS_CONFIG__MODULE__PNG
+#define WUFFS_CONFIG__MODULE__VP8
+#define WUFFS_CONFIG__MODULE__WEBP
+#define WUFFS_CONFIG__MODULE__ZLIB
+#include "third_party/wuffs/wuffs-v0.4.c"
 
 typedef struct {
     uint32_t state[8];
@@ -232,6 +245,166 @@ static int ds4_oriented_rgb(
     return 1;
 }
 
+typedef enum {
+    DS4_IMAGE_FORMAT_UNKNOWN = 0,
+    DS4_IMAGE_FORMAT_PNG,
+    DS4_IMAGE_FORMAT_JPEG,
+    DS4_IMAGE_FORMAT_GIF,
+    DS4_IMAGE_FORMAT_BMP,
+    DS4_IMAGE_FORMAT_WEBP,
+} ds4_image_format;
+
+static const char *const ds4_image_format_names[] = {
+    "", "PNG", "JPEG", "GIF", "BMP", "WebP",
+};
+
+/* The format comes from the file's first bytes, never from a media type or a
+ * file name: those are whatever the client chose to send. */
+static ds4_image_format ds4_image_sniff(const uint8_t *data, size_t len) {
+    if (len >= 8 && !memcmp(data, "\x89PNG\r\n\x1a\n", 8))
+        return DS4_IMAGE_FORMAT_PNG;
+    if (len >= 2 && data[0] == 0xff && data[1] == 0xd8)
+        return DS4_IMAGE_FORMAT_JPEG;
+    if (len >= 6 && (!memcmp(data, "GIF87a", 6) || !memcmp(data, "GIF89a", 6)))
+        return DS4_IMAGE_FORMAT_GIF;
+    if (len >= 12 && !memcmp(data, "RIFF", 4) && !memcmp(data + 8, "WEBP", 4))
+        return DS4_IMAGE_FORMAT_WEBP;
+    if (len >= 2 && data[0] == 'B' && data[1] == 'M')
+        return DS4_IMAGE_FORMAT_BMP;
+    return DS4_IMAGE_FORMAT_UNKNOWN;
+}
+
+/* Decode the first frame of an image with Wuffs into 8-bit pixels: RGB when
+ * the image is opaque, non-premultiplied RGBA otherwise (the caller drops the
+ * alpha). Wuffs converts every bit depth, color type and interlacing scheme
+ * of the format to the requested layout. On failure returns NULL and writes
+ * "<what> <format> image: <reason>" to error. */
+static uint8_t *ds4_wuffs_decode(
+        const uint8_t *encoded,
+        size_t encoded_len,
+        ds4_image_format format,
+        uint32_t *width,
+        uint32_t *height,
+        uint32_t *channels,
+        char *error,
+        size_t error_cap) {
+    const char *what = "invalid or unsupported";
+    const char *reason = NULL;
+    char reason_buf[96];
+    uint8_t *pixels = NULL, *work = NULL;
+    wuffs_base__status status = wuffs_base__make_status(NULL);
+
+    wuffs_base__image_decoder *dec = NULL;
+    switch (format) {
+        case DS4_IMAGE_FORMAT_PNG:
+            dec = wuffs_png__decoder__alloc_as__wuffs_base__image_decoder();
+            break;
+        case DS4_IMAGE_FORMAT_JPEG:
+            dec = wuffs_jpeg__decoder__alloc_as__wuffs_base__image_decoder();
+            break;
+        case DS4_IMAGE_FORMAT_GIF:
+            dec = wuffs_gif__decoder__alloc_as__wuffs_base__image_decoder();
+            break;
+        case DS4_IMAGE_FORMAT_BMP:
+            dec = wuffs_bmp__decoder__alloc_as__wuffs_base__image_decoder();
+            break;
+        case DS4_IMAGE_FORMAT_WEBP:
+            dec = wuffs_webp__decoder__alloc_as__wuffs_base__image_decoder();
+            break;
+        default:
+            break;
+    }
+    if (!dec) {
+        what = "unable to decode";
+        reason = "out of memory";
+        goto fail;
+    }
+
+    /* The reader never writes through the pointer; "closed" tells Wuffs that
+     * no more input follows, so a truncated file is an error, not a wait. */
+    wuffs_base__io_buffer src =
+        wuffs_base__ptr_u8__reader((uint8_t *)encoded, encoded_len, true);
+    wuffs_base__image_config config;
+    status = wuffs_base__image_decoder__decode_image_config(dec, &config, &src);
+    if (!wuffs_base__status__is_ok(&status)) goto wuffs_fail;
+
+    uint32_t w = wuffs_base__pixel_config__width(&config.pixcfg);
+    uint32_t h = wuffs_base__pixel_config__height(&config.pixcfg);
+    if (w == 0 || h == 0) {
+        reason = "zero width or height";
+        goto fail;
+    }
+    if (w > DS4_IMAGE_MAX_DIMENSION || h > DS4_IMAGE_MAX_DIMENSION ||
+        (uint64_t)w * h > DS4_IMAGE_MAX_PIXELS) {
+        snprintf(reason_buf, sizeof(reason_buf),
+                 "%ux%u exceeds the %u pixel side or %u megapixel limit",
+                 w, h, DS4_IMAGE_MAX_DIMENSION,
+                 DS4_IMAGE_MAX_PIXELS / (1024u * 1024u));
+        what = "unsupported";
+        reason = reason_buf;
+        goto fail;
+    }
+
+    bool opaque = wuffs_base__image_config__first_frame_is_opaque(&config);
+    uint32_t n = opaque ? 3 : 4;
+    wuffs_base__pixel_config__set(
+        &config.pixcfg,
+        opaque ? WUFFS_BASE__PIXEL_FORMAT__RGB
+               : WUFFS_BASE__PIXEL_FORMAT__RGBA_NONPREMUL,
+        WUFFS_BASE__PIXEL_SUBSAMPLING__NONE, w, h);
+
+    size_t pixel_bytes = (size_t)w * h * n;
+    uint64_t work_bytes = wuffs_base__image_decoder__workbuf_len(dec).max_incl;
+    if (work_bytes > SIZE_MAX) work_bytes = SIZE_MAX;
+    /* Zeroed: a GIF's first frame may cover only part of the canvas. */
+    pixels = calloc(pixel_bytes, 1);
+    work = malloc(work_bytes ? (size_t)work_bytes : 1);
+    if (!pixels || !work) {
+        what = "unable to decode";
+        reason = "out of memory";
+        goto fail;
+    }
+
+    wuffs_base__pixel_buffer pixbuf;
+    status = wuffs_base__pixel_buffer__set_from_slice(
+        &pixbuf, &config.pixcfg,
+        wuffs_base__make_slice_u8(pixels, pixel_bytes));
+    if (!wuffs_base__status__is_ok(&status)) goto wuffs_fail;
+    status = wuffs_base__image_decoder__decode_frame(
+        dec, &pixbuf, &src, WUFFS_BASE__PIXEL_BLEND__SRC,
+        wuffs_base__make_slice_u8(work, (size_t)work_bytes), NULL);
+    if (!wuffs_base__status__is_ok(&status)) goto wuffs_fail;
+
+    free(work);
+    free(dec);
+    *width = w;
+    *height = h;
+    *channels = n;
+    return pixels;
+
+wuffs_fail:
+    if (status.repr == wuffs_webp__error__unsupported_webp_file) {
+        what = "unsupported";
+        reason = "lossy and animated WebP are not supported, only lossless";
+    } else {
+        /* Wuffs messages look like "#png: bad checksum"; skip the status-kind
+         * character and the package name. */
+        reason = wuffs_base__status__message(&status);
+        const char *colon = reason ? strstr(reason, ": ") : NULL;
+        if (colon) reason = colon + 2;
+    }
+fail:
+    if (error && error_cap) {
+        snprintf(error, error_cap, "%s %s image: %s", what,
+                 ds4_image_format_names[format],
+                 reason ? reason : "decode failed");
+    }
+    free(pixels);
+    free(work);
+    free(dec);
+    return NULL;
+}
+
 int ds4_image_decode_memory(
         ds4_image *out,
         const uint8_t *encoded,
@@ -245,39 +418,24 @@ int ds4_image_decode_memory(
         return 0;
     }
 
-    if (encoded_len >= 8 &&
-        memcmp(encoded, "\x89PNG\r\n\x1a\n", 8) == 0) {
-        png_image *decoded = png_load_mem(encoded, encoded_len);
-        if (!decoded) {
-            ds4_image_error(error, error_cap, "invalid or unsupported PNG image");
-            return 0;
-        }
-        int ok = ds4_oriented_rgb(out, decoded->data,
-                                  (uint32_t)decoded->width,
-                                  (uint32_t)decoded->height,
-                                  (uint32_t)decoded->channels, 1);
-        png_free(decoded);
-        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded PNG pixels");
-        return ok;
-    }
-    if (encoded_len >= 2 && encoded[0] == 0xff && encoded[1] == 0xd8) {
-        jpeg_image *decoded = jpeg_load_mem(encoded, encoded_len);
-        if (!decoded) {
-            ds4_image_error(error, error_cap, "invalid or unsupported JPEG image");
-            return 0;
-        }
-        int orientation = ds4_jpeg_orientation(encoded, encoded_len);
-        int ok = ds4_oriented_rgb(out, decoded->data,
-                                  (uint32_t)decoded->width,
-                                  (uint32_t)decoded->height,
-                                  (uint32_t)decoded->channels, orientation);
-        jpeg_free(decoded);
-        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded JPEG pixels");
-        return ok;
+    ds4_image_format format = ds4_image_sniff(encoded, encoded_len);
+    if (format == DS4_IMAGE_FORMAT_UNKNOWN) {
+        ds4_image_error(error, error_cap,
+                        "image must be JPEG, PNG, GIF, BMP or lossless WebP");
+        return 0;
     }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
-    return 0;
+    uint32_t width = 0, height = 0, channels = 0;
+    uint8_t *pixels = ds4_wuffs_decode(encoded, encoded_len, format,
+                                       &width, &height, &channels,
+                                       error, error_cap);
+    if (!pixels) return 0;
+    int orientation = format == DS4_IMAGE_FORMAT_JPEG
+        ? ds4_jpeg_orientation(encoded, encoded_len) : 1;
+    int ok = ds4_oriented_rgb(out, pixels, width, height, channels, orientation);
+    free(pixels);
+    if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded image pixels");
+    return ok;
 }
 
 int ds4_image_decode_file(

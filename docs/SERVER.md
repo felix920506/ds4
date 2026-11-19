@@ -121,7 +121,8 @@ For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-use
 Start with the matching language GGUF and `--vision FILE`; see
 [model-specific instructions](MODELS.md#vision).
 
-OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
+OpenAI chat and Responses accept inline PNG, JPEG, GIF, BMP and lossless WebP
+data URIs. An animated GIF is read as its first frame. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.
 Image blocks preserve their order in the request. A request is rejected when
 its tokens, image blocks included, do not fit the context window; the only

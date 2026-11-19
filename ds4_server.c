@@ -501,11 +501,17 @@ static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len
     return true;
 }
 
+/* The media type only gates the request: the decoder identifies the format
+ * from the image bytes. */
 static bool server_image_media_type(const char *media_type) {
-    return media_type &&
-           (!strcasecmp(media_type, "image/png") ||
-            !strcasecmp(media_type, "image/jpeg") ||
-            !strcasecmp(media_type, "image/jpg"));
+    static const char *const accepted[] = {
+        "image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp",
+        "image/webp",
+    };
+    if (!media_type) return false;
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++)
+        if (!strcasecmp(media_type, accepted[i])) return true;
+    return false;
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
@@ -546,20 +552,17 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
 static bool server_image_inputs_push_data_uri(
         server_image_inputs *images, const char *uri,
         char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    static const char png[] = "data:image/png;base64,";
-    static const char jpeg[] = "data:image/jpeg;base64,";
-    static const char jpg[] = "data:image/jpg;base64,";
-    if (!uri) return false;
-    if (!strncmp(uri, png, sizeof(png) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/png", uri + sizeof(png) - 1, marker);
-    if (!strncmp(uri, jpeg, sizeof(jpeg) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/jpeg", uri + sizeof(jpeg) - 1, marker);
-    if (!strncmp(uri, jpg, sizeof(jpg) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/jpg", uri + sizeof(jpg) - 1, marker);
-    return false;
+    static const char scheme[] = "data:";
+    static const char encoding[] = ";base64,";
+    if (!uri || strncmp(uri, scheme, sizeof(scheme) - 1)) return false;
+    const char *type = uri + sizeof(scheme) - 1;
+    const char *end = strstr(type, encoding);
+    char media_type[32];
+    if (!end || (size_t)(end - type) >= sizeof(media_type)) return false;
+    memcpy(media_type, type, (size_t)(end - type));
+    media_type[end - type] = '\0';
+    return server_image_inputs_push_base64(
+        images, media_type, end + sizeof(encoding) - 1, marker);
 }
 
 static void append_owned_text(char **dst, const char *text) {
@@ -24142,12 +24145,30 @@ static void test_http_image_paths_and_urls_are_rejected(void) {
         "\"image_url\":{\"url\":\"https://example.com/a.png\"}}]}]",
         "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
         "\"image_url\":{\"url\":\"/tmp/a.png\"}}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/tiff;base64,AAAA\"}}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png,AAAA\"}}]}]",
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         const char *p = cases[i];
         chat_msgs msgs = {0};
         TEST_ASSERT(!parse_messages(&p, &msgs));
         chat_msgs_free(&msgs);
+    }
+}
+
+static void test_http_image_media_types(void) {
+    const char *types[] = {"image/png", "image/jpeg", "image/jpg",
+                           "image/gif", "image/bmp", "image/webp"};
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        char uri[64];
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        server_image_inputs images = {0};
+        snprintf(uri, sizeof(uri), "data:%s;base64,AAAA", types[i]);
+        TEST_ASSERT(server_image_inputs_push_data_uri(&images, uri, marker));
+        TEST_ASSERT(images.len == 1 && images.v[0].encoded_len == 3);
+        server_image_inputs_free(&images);
     }
 }
 
@@ -24861,6 +24882,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
+    test_http_image_media_types();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
     test_tool_separator_whitespace_is_not_content();
