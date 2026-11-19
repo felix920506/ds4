@@ -77,6 +77,10 @@ typedef struct {
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
+    /* Text signatures of the listed files, kept between eviction passes. */
+    struct ds4_kvstore_sig *sig;
+    int sig_len;
+    int sig_cap;
 } ds4_kvstore;
 
 typedef struct {
@@ -86,6 +90,8 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    /* DS4_KVSTORE_REASON_* of the checkpoint being stored. */
+    uint8_t reason;
 } ds4_kvstore_eviction_context;
 
 typedef struct {

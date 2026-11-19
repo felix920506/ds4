@@ -39,6 +39,7 @@
 /tests/test_mxfp4_metal
 /tests/test_mxfp4_rocm
 /tests/test_prompt_prefix
+/tests/kv_evict_sim
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_web_recovery

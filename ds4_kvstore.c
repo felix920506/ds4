@@ -43,25 +43,46 @@
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
  * the workload still resembles the one that produced those hits. */
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
-/* A continued checkpoint that is a strict prefix of the incoming store is a
- * routine waypoint on the same path. Keep recent hits meaningful, but make
- * never-hit or stale waypoints cheap victims while pre-evicting for the new
- * store. */
-#define KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR 0.05
-#define KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR 0.45
-/* Cold/evict/shutdown checkpoints are intentional anchors, not just automatic
- * waypoints in a single growing conversation. Give them a soft prior so they
- * survive comparable continued entries, while still allowing pressure and poor
- * density to evict them. */
-#define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
-/* Density and the reason priors say nothing about time, so without an idle
- * term a full cache ranks a frontier written a minute ago level with (or, being
- * smaller and so less dense, below) checkpoints nobody has touched in months:
- * the old ones stay forever and every store evicts the previous one.  Scale the
- * score by scale / (scale + idle).  The hyperbola is deliberate: an exponential
- * would flatten to zero and leave everything older than a few days tied, while
- * this keeps a week-old entry ahead of a three-month-old one. */
-#define KV_CACHE_IDLE_SCALE_SECONDS DS4_KVSTORE_HIT_HALF_LIFE_SECONDS
+
+/* Eviction policy.
+ *
+ * The cache is least-recently-used first: an entry's score falls with the time
+ * since it was last stored or loaded, as scale / (scale + idle).  A hyperbola
+ * and not an exponential, so that entries idle for a week and for three months
+ * are still told apart.  Without this term a full cache keeps old dense
+ * checkpoints for ever and evicts every new frontier within a minute.
+ *
+ * Three things adjust that order, each because it changes what evicting the
+ * entry would cost in prefill:
+ *
+ *   - Recent hits and tokens per byte, as before.
+ *   - Cold checkpoints sit on a prompt prefix that new conversations start
+ *     from, so they get a fixed bonus.
+ *   - A checkpoint that a longer one extends is redundant while the longer one
+ *     is there: a prompt that reaches the longer one never loads the shorter.
+ *     It keeps only the share of its score that a fork between the two would
+ *     need it for, the gap between them as a fraction of the longer text.
+ *     A conversation's old tips, a few turns short of the current one, go
+ *     first; a frontier at half its length keeps half its score.
+ *
+ * A tip written when a slot gave up its state ends in generated text that the
+ * client may rewrite, so until something loads it, it is not known to be a
+ * prefix of any later prompt.  What it extends is discounted less: that entry
+ * is the fallback if the tip turns out to be dead. */
+#define KV_CACHE_IDLE_SCALE_SECONDS (2ull * 60ull * 60ull)
+#define KV_CACHE_COLD_SCORE_FACTOR 2.0
+#define KV_CACHE_COVERED_MIN_FACTOR 0.02
+#define KV_CACHE_COVERED_BY_UNPROVEN_TIP_MIN_FACTOR 0.25
+
+/* Whether one checkpoint extends another is decided on a signature of its
+ * text: a running hash sampled every KV_SIG_GRID bytes, computed once per file
+ * and kept for as long as the file is listed.  Two texts match up to block k
+ * when sample k is equal.  An entry counts as extended when all but its last
+ * eighth matches, which also catches a dead tip whose tail was rewritten.
+ * Texts under KV_SIG_MIN_BLOCKS blocks are compared exactly instead, against
+ * the incoming store only. */
+#define KV_SIG_GRID 256
+#define KV_SIG_MIN_BLOCKS 8
 
 typedef struct {
     char *ptr;
@@ -515,11 +536,10 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     return ok;
 }
 
-static bool kv_cache_incoming_supersedes_continued(
+static bool kv_cache_incoming_compatible(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -529,57 +549,217 @@ static bool kv_cache_incoming_supersedes_continued(
     /* A smaller-context checkpoint can be loaded by a larger context, but not
      * the reverse.  The incoming checkpoint dominates this one only if it is at
      * least as widely reusable. */
-    if (incoming->ctx_size > e->ctx_size) return false;
+    return incoming->ctx_size <= e->ctx_size;
+}
 
+static bool kv_cache_incoming_extends_exactly(
+        const ds4_kvstore_entry *e,
+        const ds4_kvstore_eviction_context *incoming) {
+    if (!kv_cache_incoming_compatible(e, incoming)) return false;
     char prefix_sha[41];
     ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
                                prefix_sha);
     return !strcmp(prefix_sha, e->sha);
 }
 
-static bool kv_cache_reason_is_anchor(uint8_t reason) {
-    return reason == DS4_KVSTORE_REASON_COLD ||
-           reason == DS4_KVSTORE_REASON_EVICT ||
-           reason == DS4_KVSTORE_REASON_SHUTDOWN;
+static uint64_t kv_entry_used_at(const ds4_kvstore_entry *e) {
+    return e->last_used ? e->last_used : e->created_at;
 }
 
+static bool kv_cache_tip_unproven(uint8_t reason, uint32_t hits) {
+    return hits == 0 && (reason == DS4_KVSTORE_REASON_EVICT ||
+                         reason == DS4_KVSTORE_REASON_SHUTDOWN);
+}
+
+/* The longer checkpoints that extend an entry: the text length of the shortest
+ * proven one, and of the shortest unproven tip.  Zero when there is none. */
+typedef struct {
+    uint64_t proven_bytes;
+    uint64_t unproven_bytes;
+} kv_cover;
+
+static void kv_cover_add(kv_cover *c, uint64_t text_bytes, bool unproven) {
+    uint64_t *slot = unproven ? &c->unproven_bytes : &c->proven_bytes;
+    if (*slot == 0 || text_bytes < *slot) *slot = text_bytes;
+}
+
+static double kv_cover_factor(const ds4_kvstore_entry *e, const kv_cover *c) {
+    if (e->reason == DS4_KVSTORE_REASON_COLD) return 1.0;
+    uint64_t by = c->proven_bytes;
+    double least = KV_CACHE_COVERED_MIN_FACTOR;
+    if (by == 0) {
+        by = c->unproven_bytes;
+        least = KV_CACHE_COVERED_BY_UNPROVEN_TIP_MIN_FACTOR;
+    }
+    if (by == 0) return 1.0;
+    double gap = by > e->text_bytes ?
+        (double)(by - e->text_bytes) / (double)by : 0.0;
+    return gap > least ? gap : least;
+}
+
+static double kv_cache_score(const ds4_kvstore_entry *e, uint64_t now,
+                             const kv_cover *cover) {
+    if (!e || e->file_size == 0) return 0.0;
+    double effective_hits = (double)e->hits;
+    const uint64_t used_at = kv_entry_used_at(e);
+    /* An entry with no timestamp at all counts as idle since the epoch. */
+    const double idle = now > used_at ? (double)(now - used_at) : 0.0;
+    if (used_at == 0) {
+        effective_hits = 0.0;
+    } else {
+        effective_hits *= exp2(-idle / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+        if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+    }
+    const double scale = (double)KV_CACHE_IDLE_SCALE_SECONDS;
+    double score = (effective_hits + 1.0) *
+                   (double)e->tokens / (double)e->file_size *
+                   scale / (scale + idle);
+    if (e->reason == DS4_KVSTORE_REASON_COLD)
+        score *= KV_CACHE_COLD_SCORE_FACTOR;
+    return score * kv_cover_factor(e, cover);
+}
+
+/* Scores one entry against the incoming store alone, by exact prefix.  The
+ * eviction pass also counts the checkpoints already on disk. */
 double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_entry *e,
         const ds4_tokens *live,
         uint64_t now,
         const ds4_kvstore_eviction_context *incoming) {
-    if (!e || e->file_size == 0) return 0.0;
     (void)live;
-    double effective_hits = (double)e->hits;
-    uint64_t used_at = e->last_used ? e->last_used : e->created_at;
-    if (used_at == 0) {
-        effective_hits = 0.0;
-    } else if (now > used_at) {
-        double elapsed = (double)(now - used_at);
-        effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
-        if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+    kv_cover cover = {0};
+    if (kv_cache_incoming_extends_exactly(e, incoming))
+        kv_cover_add(&cover, incoming->text_len,
+                     kv_cache_tip_unproven(incoming->reason, 0));
+    return kv_cache_score(e, now, &cover);
+}
+
+struct ds4_kvstore_sig {
+    char sha[41];
+    bool seen;
+    uint32_t n;
+    uint64_t *v;
+};
+typedef struct ds4_kvstore_sig kv_sig;
+
+static void kv_sig_compute(const char *text, size_t len, kv_sig *sig) {
+    sig->n = (uint32_t)(len / KV_SIG_GRID);
+    sig->v = sig->n ? kv_xmalloc((size_t)sig->n * sizeof(sig->v[0])) : NULL;
+    uint64_t h = 0x9e3779b97f4a7c15ull;
+    for (uint32_t k = 0; k < sig->n; k++) {
+        const char *p = text + (size_t)k * KV_SIG_GRID;
+        for (int i = 0; i < KV_SIG_GRID; i += 8) {
+            uint64_t w;
+            memcpy(&w, p + i, 8);
+            h = (h ^ w) * 0xff51afd7ed558ccdull;
+            h ^= h >> 32;
+        }
+        sig->v[k] = h;
     }
-    double score = (effective_hits + 1.0) *
-                   (double)e->tokens / (double)e->file_size;
-    /* An entry with no timestamp at all counts as idle since the epoch. */
-    if (now > used_at) {
-        const double scale = (double)KV_CACHE_IDLE_SCALE_SECONDS;
-        score *= scale / (scale + (double)(now - used_at));
+}
+
+/* Index of the entry's signature in kc->sig, reading the file's text the
+ * first time the entry is seen. */
+static int kv_sig_for_entry(ds4_kvstore *kc, const ds4_kvstore_entry *e) {
+    for (int i = 0; i < kc->sig_len; i++) {
+        if (!memcmp(kc->sig[i].sha, e->sha, 41)) {
+            kc->sig[i].seen = true;
+            return i;
+        }
     }
-    if (kv_cache_reason_is_anchor(e->reason))
-        score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
-    if (kv_cache_incoming_supersedes_continued(e, incoming)) {
-        double h = effective_hits > 0.0 ?
-            effective_hits / (effective_hits + 1.0) : 0.0;
-        score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
-                 KV_CACHE_CONTINUED_PREFIX_HIT_FACTOR * h;
+    if (kc->sig_len == kc->sig_cap) {
+        kc->sig_cap = kc->sig_cap ? kc->sig_cap * 2 : 64;
+        kc->sig = kv_xrealloc(kc->sig, (size_t)kc->sig_cap * sizeof(kc->sig[0]));
     }
-    return score;
+    kv_sig *sig = &kc->sig[kc->sig_len];
+    memset(sig, 0, sizeof(*sig));
+    memcpy(sig->sha, e->sha, 41);
+    sig->seen = true;
+    FILE *fp = e->text_bytes >= KV_SIG_GRID && e->text_bytes <= UINT32_MAX ?
+               fopen(e->path, "rb") : NULL;
+    if (fp) {
+        char *text = kv_xmalloc((size_t)e->text_bytes);
+        if (fseek(fp, DS4_KVSTORE_FIXED_HEADER + 4, SEEK_SET) == 0 &&
+            fread(text, 1, (size_t)e->text_bytes, fp) == (size_t)e->text_bytes)
+            kv_sig_compute(text, (size_t)e->text_bytes, sig);
+        free(text);
+        fclose(fp);
+    }
+    return kc->sig_len++;
+}
+
+static void kv_sig_free_all(ds4_kvstore *kc) {
+    for (int i = 0; i < kc->sig_len; i++) free(kc->sig[i].v);
+    free(kc->sig);
+    kc->sig = NULL;
+    kc->sig_len = kc->sig_cap = 0;
+}
+
+/* Whether a text with signature `e` matches all but the last eighth of the
+ * text with signature `w`. */
+static bool kv_sig_extends(const kv_sig *e, const kv_sig *w) {
+    const uint32_t need = w->n - w->n / 8;
+    return e->n >= need && e->v[need - 1] == w->v[need - 1];
+}
+
+/* For every listed entry, the longer checkpoints that extend it: the incoming
+ * store, and entries on disk used no earlier than the entry itself.  One that
+ * was loaded after a longer one was written was needed in spite of it. */
+static kv_cover *kv_cache_covers(ds4_kvstore *kc,
+                                 const ds4_kvstore_eviction_context *incoming) {
+    const int n = kc->len;
+    kv_cover *cover = kv_xmalloc((size_t)(n ? n : 1) * sizeof(cover[0]));
+    int *sig = kv_xmalloc((size_t)(n ? n : 1) * sizeof(sig[0]));
+    for (int i = 0; i < kc->sig_len; i++) kc->sig[i].seen = false;
+    for (int i = 0; i < n; i++) sig[i] = kv_sig_for_entry(kc, &kc->entry[i]);
+
+    kv_sig in = {0};
+    const bool in_unproven =
+        incoming && kv_cache_tip_unproven(incoming->reason, 0);
+    if (incoming && incoming->text && incoming->text_len >= KV_SIG_GRID)
+        kv_sig_compute(incoming->text, incoming->text_len, &in);
+
+    for (int w = 0; w < n; w++) {
+        const ds4_kvstore_entry *W = &kc->entry[w];
+        const kv_sig *ws = &kc->sig[sig[w]];
+        memset(&cover[w], 0, sizeof(cover[w]));
+        if (ws->n < KV_SIG_MIN_BLOCKS) {
+            if (kv_cache_incoming_extends_exactly(W, incoming))
+                kv_cover_add(&cover[w], incoming->text_len, in_unproven);
+            continue;
+        }
+        if (kv_cache_incoming_compatible(W, incoming) &&
+            kv_sig_extends(&in, ws))
+            kv_cover_add(&cover[w], incoming->text_len, in_unproven);
+        for (int x = 0; x < n; x++) {
+            const ds4_kvstore_entry *E = &kc->entry[x];
+            if (E->text_bytes <= W->text_bytes) continue;
+            if (E->model_id != W->model_id || E->ctx_size > W->ctx_size) continue;
+            if (kc->reject_different_quant && E->quant_bits != W->quant_bits)
+                continue;
+            if (kv_entry_used_at(E) < kv_entry_used_at(W)) continue;
+            if (kv_sig_extends(&kc->sig[sig[x]], ws))
+                kv_cover_add(&cover[w], E->text_bytes,
+                             kv_cache_tip_unproven(E->reason, E->hits));
+        }
+    }
+    free(in.v);
+    free(sig);
+
+    /* Forget the signatures of files that are gone. */
+    int keep = 0;
+    for (int i = 0; i < kc->sig_len; i++) {
+        if (kc->sig[i].seen) kc->sig[keep++] = kc->sig[i];
+        else free(kc->sig[i].v);
+    }
+    kc->sig_len = keep;
+    return cover;
 }
 
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming) {
+    (void)live;
     if (!kc->enabled || kc->budget_bytes == 0) return;
     if (extra_bytes > kc->budget_bytes) return;
     kv_cache_refresh(kc);
@@ -587,22 +767,21 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
+    if (total <= target) return;
+
+    /* Nothing below changes a score between victims, so score once. */
+    kv_cover *cover = kv_cache_covers(kc, incoming);
+    double *score = kv_xmalloc((size_t)kc->len * sizeof(score[0]));
+    for (int i = 0; i < kc->len; i++)
+        score[i] = kv_cache_score(&kc->entry[i], now, &cover[i]);
+    free(cover);
     while (total > target && kc->len > 0) {
         int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
         for (int i = 1; i < kc->len; i++) {
-            double score =
-                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
-                                                 incoming);
-            if (score < victim_score ||
-                (score == victim_score &&
+            if (score[i] < score[victim] ||
+                (score[i] == score[victim] &&
                  kc->entry[i].last_used < kc->entry[victim].last_used))
-            {
                 victim = i;
-                victim_score = score;
-            }
         }
         ds4_kvstore_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
@@ -619,10 +798,11 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
             total = 0;
         }
         ds4_kvstore_entry_free(&e);
-        memmove(kc->entry + victim, kc->entry + victim + 1,
-                (size_t)(kc->len - victim - 1) * sizeof(kc->entry[0]));
         kc->len--;
+        kc->entry[victim] = kc->entry[kc->len];
+        score[victim] = score[kc->len];
     }
+    free(score);
 }
 
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
@@ -665,6 +845,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
 
 void ds4_kvstore_close(ds4_kvstore *kc) {
     ds4_kvstore_clear(kc);
+    kv_sig_free_all(kc);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
 }
@@ -1067,6 +1248,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .reason = reason_code,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
