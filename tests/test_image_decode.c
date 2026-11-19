@@ -53,6 +53,41 @@ static const struct {
     {"gray2_adam7.png", 13u, 11u, "75194fa2300eeca09e7a06cb05e18c9d0bbc7b8d1e8877dd70abbf8b1689868f"},
 };
 
+/* Rejected inputs must say why, so API clients can tell a corrupt upload
+ * from a size limit or an unsupported encoding. */
+static int check_error(const char *path, const uint8_t *data, size_t len,
+                       const char *expected) {
+    ds4_image image = {0};
+    char error[160] = {0};
+    int ok = path ? ds4_image_decode_file(&image, path, error, sizeof(error))
+                  : ds4_image_decode_memory(&image, data, len, error, sizeof(error));
+    if (ok) {
+        fprintf(stderr, "%s: invalid image was accepted\n", path ? path : "memory");
+        ds4_image_free(&image);
+        return 0;
+    }
+    if (!strstr(error, expected)) {
+        fprintf(stderr, "%s: error \"%s\" does not contain \"%s\"\n",
+                path ? path : "memory", error, expected);
+        return 0;
+    }
+    return 1;
+}
+
+static const struct {
+    const char *name;
+    const char *expected;
+} error_cases[] = {
+    {"png_truncated.png", "corrupt PNG: IDAT chunk extends past the end of the file (file truncated?)"},
+    {"png_bad_crc.png", "corrupt PNG: CRC mismatch in IDAT chunk"},
+    {"png_too_large.png", "PNG image too large: 20000x8 exceeds the 16384 pixel limit per side"},
+    {"jpeg_truncated.jpg", "corrupt JPEG: image data ends early (file truncated?)"},
+    {"jpeg_cmyk.jpg", "unsupported JPEG: CMYK"},
+    {"jpeg_arithmetic.jpg", "unsupported JPEG: arithmetic coding"},
+    {"jpeg_12bit.jpg", "unsupported JPEG: 12-bit sample precision"},
+    {"jpeg_too_large.jpg", "JPEG image too large: 32x20000 exceeds the 16384 pixel limit per side"},
+};
+
 static int check_jpeg_rejected(const char *path) {
     ds4_image image = {0};
     char error[160] = {0};
@@ -123,5 +158,26 @@ int main(void) {
                         png_cases[i].fp))
             return 1;
     }
+    for (size_t i = 0; i < sizeof(error_cases) / sizeof(error_cases[0]); i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "tests/vision-fixtures/errors/%s",
+                 error_cases[i].name);
+        if (!check_error(path, NULL, 0, error_cases[i].expected)) return 1;
+    }
+    if (!check_error("tests/vision-fixtures/jpeg/prog_sos_se_oob.jpg", NULL, 0,
+                     "corrupt JPEG: invalid progressive scan parameters"))
+        return 1;
+    static const uint8_t webp[] = "RIFF\x10\0\0\0WEBPVP8 ";
+    if (!check_error(NULL, webp, sizeof(webp) - 1,
+                     "unsupported image format: WebP (only JPEG and PNG are accepted)"))
+        return 1;
+    static const uint8_t gif[] = "GIF89a\x01\0\x01\0";
+    if (!check_error(NULL, gif, sizeof(gif) - 1, "unsupported image format: GIF"))
+        return 1;
+    static const uint8_t junk[] = "hello world";
+    if (!check_error(NULL, junk, sizeof(junk) - 1,
+                     "unrecognized image data: not a JPEG or PNG file"))
+        return 1;
+    if (!check_error(NULL, junk, 0, "image is empty")) return 1;
     return 0;
 }

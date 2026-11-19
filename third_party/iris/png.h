@@ -70,6 +70,14 @@ png_image *png_load(const char *path);
 png_image *png_load_mem(const uint8_t *data, size_t len);
 
 /*
+ * Like png_load_mem, but on failure writes a one-line reason to error
+ * (if non-NULL). Reasons start with "corrupt PNG:", "unsupported PNG:",
+ * "PNG image too large:", "not a PNG file" or "out of memory".
+ */
+png_image *png_load_mem_ex(const uint8_t *data, size_t len,
+                           char *error, size_t error_cap);
+
+/*
  * Save PNG image to file.
  * Returns 0 on success, -1 on error.
  */
@@ -111,6 +119,7 @@ png_image *png_clone(const png_image *img);
 
 #ifdef PNG_IMPLEMENTATION
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -585,11 +594,14 @@ static int png_build_dynamic_huffman(png_bitstream *bs, png_huffman *litlen, png
 }
 
 /* Zlib inflate (stored, fixed, and dynamic blocks) */
-static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expected_len) {
+static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expected_len,
+                                 const char **why) {
+    *why = "corrupt PNG: compressed image data is too short";
     if (len < 6) return NULL;
 
     uint8_t cmf = data[0];
     uint8_t flg = data[1];
+    *why = "corrupt PNG: invalid zlib header in image data";
     if ((cmf & 0x0f) != 8) return NULL;
     if (((cmf << 8) + flg) % 31 != 0) return NULL;
 
@@ -604,8 +616,12 @@ static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expecte
     png_bitstream bs = {data + pos, deflate_len, 0, 0, 0};
 
     uint8_t *out = (uint8_t *)malloc(expected_len);
-    if (!out) return NULL;
+    if (!out) {
+        *why = "out of memory decoding PNG";
+        return NULL;
+    }
     size_t out_pos = 0;
+    *why = NULL;
 
     static const int len_base[29] = {
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13,
@@ -641,7 +657,7 @@ static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expecte
             if (!png_bitstream_get(&bs, 16, &stored_len)) goto fail;
             if (!png_bitstream_get(&bs, 16, &stored_nlen)) goto fail;
             if ((stored_len ^ 0xffffu) != stored_nlen) goto fail;
-            if (out_pos + stored_len > expected_len) goto fail;
+            if (out_pos + stored_len > expected_len) goto too_long;
             if (!png_bitstream_read_bytes(&bs, out + out_pos, stored_len)) goto fail;
             out_pos += stored_len;
         } else if (btype == 1 || btype == 2) {
@@ -656,7 +672,7 @@ static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expecte
                 int sym;
                 if (!png_huffman_decode(&bs, &litlen, &sym)) goto fail;
                 if (sym < 256) {
-                    if (out_pos >= expected_len) goto fail;
+                    if (out_pos >= expected_len) goto too_long;
                     out[out_pos++] = (uint8_t)sym;
                 } else if (sym == 256) {
                     break;
@@ -677,7 +693,7 @@ static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expecte
                         distance += (int)dist_extra_bits;
                     }
                     if (distance <= 0 || (size_t)distance > out_pos) goto fail;
-                    if (out_pos + length > expected_len) goto fail;
+                    if (out_pos + length > expected_len) goto too_long;
                     for (int i = 0; i < length; i++) {
                         out[out_pos] = out[out_pos - distance];
                         out_pos++;
@@ -691,17 +707,30 @@ static uint8_t *png_inflate_zlib(const uint8_t *data, size_t len, size_t expecte
         }
     }
 
-    if (out_pos != expected_len) goto fail;
+    if (out_pos != expected_len) {
+        *why = "corrupt PNG: image data is shorter than the header's dimensions require";
+        goto fail;
+    }
 
     uint32_t expected_adler = ((uint32_t)data[len - 4] << 24) |
                               ((uint32_t)data[len - 3] << 16) |
                               ((uint32_t)data[len - 2] << 8) |
                               (uint32_t)data[len - 1];
-    if (png_adler32(out, expected_len) != expected_adler) goto fail;
+    if (png_adler32(out, expected_len) != expected_adler) {
+        *why = "corrupt PNG: image data checksum (Adler-32) mismatch";
+        goto fail;
+    }
 
     return out;
 
+too_long:
+    *why = "corrupt PNG: image data is longer than the header's dimensions allow";
 fail:
+    if (!*why) {
+        *why = bs.bytepos >= bs.len
+            ? "corrupt PNG: image data ends early (file truncated?)"
+            : "corrupt PNG: compressed image data is invalid";
+    }
     free(out);
     return NULL;
 }
@@ -787,12 +816,48 @@ static uint32_t png_read_be32_mem(const uint8_t *p) {
            ((uint32_t)p[2] << 8) | p[3];
 }
 
+static void png_set_error(char *error, size_t cap, const char *fmt, ...) {
+    if (!error || cap == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(error, cap, fmt, ap);
+    va_end(ap);
+}
+
+/* Chunk type as printable text for error messages. */
+static void png_chunk_name(const uint8_t *type, char out[5]) {
+    for (int i = 0; i < 4; i++) {
+        out[i] = (type[i] >= 0x20 && type[i] < 0x7f) ? (char)type[i] : '?';
+    }
+    out[4] = 0;
+}
+
 png_image *png_load_mem(const uint8_t *data, size_t len) {
-    if (!data || len < 8 || len > PNG_MAX_INPUT_BYTES) return NULL;
+    return png_load_mem_ex(data, len, NULL, 0);
+}
+
+#define PNG_FAIL(...) do { png_set_error(error, error_cap, __VA_ARGS__); goto fail; } while (0)
+
+png_image *png_load_mem_ex(const uint8_t *data, size_t len,
+                           char *error, size_t error_cap) {
+    if (!data || len == 0) {
+        png_set_error(error, error_cap, "corrupt PNG: file is empty");
+        return NULL;
+    }
+    if (len > PNG_MAX_INPUT_BYTES) {
+        png_set_error(error, error_cap,
+                      "PNG image too large: %zu bytes exceeds the %u byte limit",
+                      len, (unsigned)PNG_MAX_INPUT_BYTES);
+        return NULL;
+    }
 
     /* Verify signature */
     const uint8_t expected[8] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
-    if (memcmp(data, expected, 8) != 0) return NULL;
+    if (len < 8 || memcmp(data, expected, 8) != 0) {
+        png_set_error(error, error_cap, "not a PNG file (bad signature)");
+        return NULL;
+    }
+    png_set_error(error, error_cap, "corrupt PNG");
 
     int width = 0, height = 0, color_type = -1, bit_depth = 0;
     int interlace = 0;
@@ -812,30 +877,40 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
     while (pos + 8 <= len) {
         uint32_t chunk_len = png_read_be32_mem(data + pos);
         const uint8_t *chunk_type = data + pos + 4;
+        char name[5];
+        png_chunk_name(chunk_type, name);
         pos += 8;
 
-        if ((size_t)chunk_len > len - pos || len - pos - chunk_len < 4) goto fail;
+        if ((size_t)chunk_len > len - pos || len - pos - chunk_len < 4) {
+            PNG_FAIL("corrupt PNG: %s chunk extends past the end of the file (file truncated?)", name);
+        }
         const uint8_t *chunk_data = data + pos;
         uint32_t stored_crc = png_read_be32_mem(data + pos + chunk_len);
         uint32_t actual_crc = png_update_crc(0xffffffffu, chunk_type, 4);
         actual_crc = png_update_crc(actual_crc, chunk_data, chunk_len) ^ 0xffffffffu;
-        if (actual_crc != stored_crc) goto fail;
+        if (actual_crc != stored_crc) PNG_FAIL("corrupt PNG: CRC mismatch in %s chunk", name);
 
         if (memcmp(chunk_type, "IHDR", 4) == 0) {
-            if (seen_ihdr || seen_idat || chunk_len != 13) goto fail;
+            if (seen_ihdr || seen_idat) PNG_FAIL("corrupt PNG: misplaced or duplicate IHDR chunk");
+            if (chunk_len != 13) PNG_FAIL("corrupt PNG: IHDR chunk has length %u, expected 13", chunk_len);
             uint32_t parsed_width = png_read_be32_mem(chunk_data);
             uint32_t parsed_height = png_read_be32_mem(chunk_data + 4);
-            if (parsed_width == 0 || parsed_height == 0 ||
-                parsed_width > PNG_MAX_DIMENSION ||
-                parsed_height > PNG_MAX_DIMENSION ||
-                (size_t)parsed_width * (size_t)parsed_height > PNG_MAX_PIXELS) {
-                goto fail;
+            if (parsed_width == 0 || parsed_height == 0) {
+                PNG_FAIL("corrupt PNG: image has zero width or height (%ux%u)",
+                         parsed_width, parsed_height);
+            }
+            if (parsed_width > PNG_MAX_DIMENSION || parsed_height > PNG_MAX_DIMENSION) {
+                PNG_FAIL("PNG image too large: %ux%u exceeds the %u pixel limit per side",
+                         parsed_width, parsed_height, (unsigned)PNG_MAX_DIMENSION);
+            }
+            if ((size_t)parsed_width * (size_t)parsed_height > PNG_MAX_PIXELS) {
+                PNG_FAIL("PNG image too large: %ux%u exceeds the %u pixel total limit",
+                         parsed_width, parsed_height, (unsigned)PNG_MAX_PIXELS);
             }
             bit_depth = chunk_data[8];
-            if (chunk_data[10] != 0 || chunk_data[11] != 0 ||
-                chunk_data[12] > 1) {
-                goto fail;
-            }
+            if (chunk_data[10] != 0) PNG_FAIL("corrupt PNG: unknown compression method %u", chunk_data[10]);
+            if (chunk_data[11] != 0) PNG_FAIL("corrupt PNG: unknown filter method %u", chunk_data[11]);
+            if (chunk_data[12] > 1) PNG_FAIL("corrupt PNG: unknown interlace method %u", chunk_data[12]);
             interlace = chunk_data[12];
             width = (int)parsed_width;
             height = (int)parsed_height;
@@ -846,57 +921,75 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
                 case 3: source_channels = 1; break;
                 case 4: source_channels = 2; break;
                 case 6: source_channels = 4; break;
-                default: goto fail;
+                default: PNG_FAIL("corrupt PNG: invalid color type %d", color_type);
             }
             /* Allowed combinations per PNG spec, table 11.1. */
+            int depth_ok;
             if (color_type == 0) {
-                if (bit_depth != 1 && bit_depth != 2 && bit_depth != 4 &&
-                    bit_depth != 8 && bit_depth != 16) goto fail;
+                depth_ok = bit_depth == 1 || bit_depth == 2 || bit_depth == 4 ||
+                           bit_depth == 8 || bit_depth == 16;
             } else if (color_type == 3) {
-                if (bit_depth != 1 && bit_depth != 2 &&
-                    bit_depth != 4 && bit_depth != 8) goto fail;
-            } else if (bit_depth != 8 && bit_depth != 16) {
-                goto fail;
+                depth_ok = bit_depth == 1 || bit_depth == 2 ||
+                           bit_depth == 4 || bit_depth == 8;
+            } else {
+                depth_ok = bit_depth == 8 || bit_depth == 16;
+            }
+            if (!depth_ok) {
+                PNG_FAIL("corrupt PNG: bit depth %d is invalid for color type %d",
+                         bit_depth, color_type);
             }
             seen_ihdr = 1;
         } else if (memcmp(chunk_type, "IDAT", 4) == 0) {
             /* Accumulate IDAT chunks */
-            if (!seen_ihdr || seen_iend ||
-                (size_t)chunk_len > PNG_MAX_INPUT_BYTES - idat_len) goto fail;
+            if (!seen_ihdr) PNG_FAIL("corrupt PNG: IDAT chunk before IHDR");
+            if ((size_t)chunk_len > PNG_MAX_INPUT_BYTES - idat_len) {
+                PNG_FAIL("PNG image too large: compressed image data exceeds %u bytes",
+                         (unsigned)PNG_MAX_INPUT_BYTES);
+            }
             uint8_t *grown = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
-            if (!grown && chunk_len != 0) goto fail;
+            if (!grown && chunk_len != 0) PNG_FAIL("out of memory decoding PNG");
             idat_data = grown;
             memcpy(idat_data + idat_len, chunk_data, chunk_len);
             idat_len += chunk_len;
             seen_idat = 1;
         } else if (memcmp(chunk_type, "PLTE", 4) == 0) {
-            if (!seen_ihdr || seen_idat || chunk_len == 0 ||
-                chunk_len > sizeof(palette) || chunk_len % 3 != 0) goto fail;
+            if (!seen_ihdr || seen_idat) PNG_FAIL("corrupt PNG: misplaced PLTE chunk");
+            if (chunk_len == 0 || chunk_len > sizeof(palette) || chunk_len % 3 != 0) {
+                PNG_FAIL("corrupt PNG: PLTE chunk has invalid length %u", chunk_len);
+            }
             memcpy(palette, chunk_data, chunk_len);
             palette_entries = chunk_len / 3;
         } else if (memcmp(chunk_type, "tRNS", 4) == 0) {
-            if (!seen_ihdr || seen_idat) goto fail;
+            if (!seen_ihdr || seen_idat) PNG_FAIL("corrupt PNG: misplaced tRNS chunk");
             if (color_type == 3) {
-                if (chunk_len > sizeof(palette_alpha)) goto fail;
+                if (chunk_len > sizeof(palette_alpha)) {
+                    PNG_FAIL("corrupt PNG: tRNS chunk has invalid length %u", chunk_len);
+                }
                 memcpy(palette_alpha, chunk_data, chunk_len);
                 palette_alpha_entries = chunk_len;
             } else if (!((color_type == 0 && chunk_len == 2) ||
                          (color_type == 2 && chunk_len == 6))) {
-                goto fail;
+                PNG_FAIL("corrupt PNG: tRNS chunk is invalid for color type %d", color_type);
             }
         } else if (memcmp(chunk_type, "IEND", 4) == 0) {
-            if (!seen_ihdr || !seen_idat || chunk_len != 0) goto fail;
+            if (!seen_ihdr || !seen_idat) PNG_FAIL("corrupt PNG: no image data (IDAT) before IEND");
+            if (chunk_len != 0) PNG_FAIL("corrupt PNG: IEND chunk is not empty");
             seen_iend = 1;
             break;
         } else if ((chunk_type[0] & 0x20) == 0) {
             /* Unknown critical chunks change pixel interpretation. */
-            goto fail;
+            if (memcmp(chunk_type, "CgBI", 4) == 0) {
+                PNG_FAIL("unsupported PNG: Apple CgBI (iOS-optimized) PNG; re-save it as a standard PNG");
+            }
+            PNG_FAIL("unsupported PNG: unknown critical chunk %s", name);
         }
         pos += (size_t)chunk_len + 4;
     }
 
-    if (!seen_ihdr || !seen_idat || !seen_iend || !idat_data) goto fail;
-    if (color_type == 3 && palette_entries == 0) goto fail;
+    if (!seen_ihdr) PNG_FAIL("corrupt PNG: missing IHDR chunk (file truncated?)");
+    if (!seen_idat || !idat_data) PNG_FAIL("corrupt PNG: no image data (file truncated?)");
+    if (!seen_iend) PNG_FAIL("corrupt PNG: missing IEND chunk (file truncated?)");
+    if (color_type == 3 && palette_entries == 0) PNG_FAIL("corrupt PNG: palette image without a PLTE chunk");
 
     /* Determine channels from color type */
     int channels;
@@ -906,7 +999,7 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
         case 3: channels = palette_alpha_entries ? 4 : 3; break; /* Palette */
         case 4: channels = 2; break;  /* Grayscale + Alpha */
         case 6: channels = 4; break;  /* RGBA */
-        default: goto fail;
+        default: PNG_FAIL("corrupt PNG: invalid color type %d", color_type);
     }
 
     /* Decompress. Each non-empty pass row is a filter byte plus its packed
@@ -921,18 +1014,23 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
         size_t ph = png_pass_extent(height, g[1], g[3]);
         if (pw == 0 || ph == 0) continue;
         size_t row_bytes = 1 + (pw * pixel_bits + 7) / 8;
-        if (ph > (SIZE_MAX - raw_len) / row_bytes) goto fail;
+        if (ph > (SIZE_MAX - raw_len) / row_bytes) PNG_FAIL("out of memory decoding PNG");
         raw_len += ph * row_bytes;
     }
-    uint8_t *raw = png_inflate_zlib(idat_data, idat_len, raw_len);
+    const char *inflate_error = NULL;
+    uint8_t *raw = png_inflate_zlib(idat_data, idat_len, raw_len, &inflate_error);
     free(idat_data);
     idat_data = NULL;
 
-    if (!raw) return NULL;
+    if (!raw) {
+        png_set_error(error, error_cap, "%s", inflate_error);
+        return NULL;
+    }
 
     /* Create image and apply filters */
     png_image *img = png_create(width, height, channels);
     if (!img) {
+        png_set_error(error, error_cap, "out of memory decoding PNG");
         free(raw);
         return NULL;
     }
@@ -952,6 +1050,10 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
             int filter = row_data[0];
             uint8_t *row = row_data + 1;
             if (!png_unfilter_row(row, prev_row, filter, row_payload, filter_bpp)) {
+                png_set_error(error, error_cap,
+                              "corrupt PNG: invalid filter type %d in row %zu%s",
+                              filter, g[1] + py * g[3],
+                              interlace ? " (interlaced)" : "");
                 png_free(img);
                 free(raw);
                 return NULL;
@@ -964,6 +1066,9 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
                 if (color_type == 3) {
                     size_t index = png_row_sample(row, px, bit_depth);
                     if (index >= palette_entries) {
+                        png_set_error(error, error_cap,
+                                      "corrupt PNG: palette index %zu out of range (palette has %zu entries)",
+                                      index, palette_entries);
                         png_free(img);
                         free(raw);
                         return NULL;
@@ -992,6 +1097,8 @@ fail:
     free(idat_data);
     return NULL;
 }
+
+#undef PNG_FAIL
 
 png_image *png_load(const char *path) {
     FILE *f = fopen(path, "rb");

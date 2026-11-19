@@ -232,6 +232,26 @@ static int ds4_oriented_rgb(
     return 1;
 }
 
+/* Name a common non-JPEG/PNG format so the client knows what it sent. */
+static const char *ds4_image_format_name(const uint8_t *p, size_t n) {
+    if (n >= 6 && (memcmp(p, "GIF87a", 6) == 0 || memcmp(p, "GIF89a", 6) == 0)) return "GIF";
+    if (n >= 12 && memcmp(p, "RIFF", 4) == 0 && memcmp(p + 8, "WEBP", 4) == 0) return "WebP";
+    if (n >= 4 && (memcmp(p, "II*\0", 4) == 0 || memcmp(p, "MM\0*", 4) == 0)) return "TIFF";
+    if (n >= 2 && p[0] == 'B' && p[1] == 'M') return "BMP";
+    if (n >= 4 && memcmp(p, "\0\0\1\0", 4) == 0) return "ICO";
+    if ((n >= 2 && p[0] == 0xff && p[1] == 0x0a) ||
+        (n >= 12 && memcmp(p, "\0\0\0\x0cJXL \r\n\x87\n", 12) == 0)) return "JPEG XL";
+    if (n >= 12 && memcmp(p + 4, "ftyp", 4) == 0) {
+        if (memcmp(p + 8, "avif", 4) == 0 || memcmp(p + 8, "avis", 4) == 0) return "AVIF";
+        if (memcmp(p + 8, "hei", 3) == 0 || memcmp(p + 8, "mif1", 4) == 0 ||
+            memcmp(p + 8, "msf1", 4) == 0) return "HEIC/HEIF";
+    }
+    size_t i = 0;
+    while (i < n && i < 64 && (p[i] == ' ' || p[i] == '\t' || p[i] == '\r' || p[i] == '\n')) i++;
+    if (i < n && p[i] == '<') return "SVG/XML";
+    return NULL;
+}
+
 int ds4_image_decode_memory(
         ds4_image *out,
         const uint8_t *encoded,
@@ -240,18 +260,23 @@ int ds4_image_decode_memory(
         size_t error_cap) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
-    if (!encoded || encoded_len == 0 || encoded_len > DS4_IMAGE_MAX_ENCODED_BYTES) {
-        ds4_image_error(error, error_cap, "image is empty or exceeds the 64 MiB encoded limit");
+    if (!encoded || encoded_len == 0) {
+        ds4_image_error(error, error_cap, "image is empty");
+        return 0;
+    }
+    if (encoded_len > DS4_IMAGE_MAX_ENCODED_BYTES) {
+        if (error && error_cap) {
+            snprintf(error, error_cap,
+                     "image too large: %zu bytes exceeds the 64 MiB encoded limit",
+                     encoded_len);
+        }
         return 0;
     }
 
     if (encoded_len >= 8 &&
         memcmp(encoded, "\x89PNG\r\n\x1a\n", 8) == 0) {
-        png_image *decoded = png_load_mem(encoded, encoded_len);
-        if (!decoded) {
-            ds4_image_error(error, error_cap, "invalid or unsupported PNG image");
-            return 0;
-        }
+        png_image *decoded = png_load_mem_ex(encoded, encoded_len, error, error_cap);
+        if (!decoded) return 0;
         int ok = ds4_oriented_rgb(out, decoded->data,
                                   (uint32_t)decoded->width,
                                   (uint32_t)decoded->height,
@@ -261,11 +286,8 @@ int ds4_image_decode_memory(
         return ok;
     }
     if (encoded_len >= 2 && encoded[0] == 0xff && encoded[1] == 0xd8) {
-        jpeg_image *decoded = jpeg_load_mem(encoded, encoded_len);
-        if (!decoded) {
-            ds4_image_error(error, error_cap, "invalid or unsupported JPEG image");
-            return 0;
-        }
+        jpeg_image *decoded = jpeg_load_mem_ex(encoded, encoded_len, error, error_cap);
+        if (!decoded) return 0;
         int orientation = ds4_jpeg_orientation(encoded, encoded_len);
         int ok = ds4_oriented_rgb(out, decoded->data,
                                   (uint32_t)decoded->width,
@@ -276,7 +298,14 @@ int ds4_image_decode_memory(
         return ok;
     }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+    const char *format = ds4_image_format_name(encoded, encoded_len);
+    if (format && error && error_cap) {
+        snprintf(error, error_cap,
+                 "unsupported image format: %s (only JPEG and PNG are accepted)", format);
+    } else {
+        ds4_image_error(error, error_cap,
+                        "unrecognized image data: not a JPEG or PNG file");
+    }
     return 0;
 }
 
@@ -298,7 +327,12 @@ int ds4_image_decode_file(
     long end = ftell(fp);
     if (end <= 0 || (unsigned long)end > DS4_IMAGE_MAX_ENCODED_BYTES) {
         fclose(fp);
-        ds4_image_error(error, error_cap, "image is empty or exceeds the 64 MiB encoded limit");
+        if (end <= 0) {
+            ds4_image_error(error, error_cap, "image is empty");
+        } else if (error && error_cap) {
+            snprintf(error, error_cap,
+                     "image too large: %ld bytes exceeds the 64 MiB encoded limit", end);
+        }
         return 0;
     }
     if (fseek(fp, 0, SEEK_SET) != 0) goto io_error;

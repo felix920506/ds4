@@ -77,6 +77,14 @@ jpeg_image *jpeg_load(const char *path);
 jpeg_image *jpeg_load_mem(const uint8_t *data, size_t len);
 
 /*
+ * Like jpeg_load_mem, but on failure writes a one-line reason to error
+ * (if non-NULL). Reasons start with "corrupt JPEG:", "unsupported JPEG:",
+ * "JPEG image too large:", "not a JPEG file" or "out of memory".
+ */
+jpeg_image *jpeg_load_mem_ex(const uint8_t *data, size_t len,
+                             char *error, size_t error_cap);
+
+/*
  * Create a new image with given dimensions.
  * Allocates zeroed pixel data.
  */
@@ -104,6 +112,7 @@ jpeg_image *jpeg_clone(const jpeg_image *img);
 
 #ifdef JPEG_IMPLEMENTATION
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1177,12 +1186,51 @@ static void jpeg_prog_finish(jpeg_decoder *dec, uint8_t **planes, int *strides) 
  * JPEG Loading
  * ======================================================================== */
 
+static void jpeg_set_error(char *error, size_t cap, const char *fmt, ...) {
+    if (!error || cap == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(error, cap, fmt, ap);
+    va_end(ap);
+}
+
+/* Name of a frame type this decoder cannot handle, or NULL. */
+static const char *jpeg_unsupported_sof(uint8_t marker) {
+    switch (marker) {
+        case 0xC1: return "extended sequential (SOF1) encoding";
+        case 0xC3: return "lossless (SOF3) encoding";
+        case 0xC5: case 0xC6: case 0xC7: return "hierarchical encoding";
+        case 0xC9: case 0xCA: case 0xCB:
+        case 0xCD: case 0xCE: case 0xCF: return "arithmetic coding";
+        default: return NULL;
+    }
+}
+
 jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
-    /* Check SOI marker */
-    if (!file_data || file_size < 2 || file_size > JPEG_MAX_INPUT_BYTES ||
-        file_data[0] != 0xFF || file_data[1] != JPEG_SOI) {
+    return jpeg_load_mem_ex(file_data, file_size, NULL, 0);
+}
+
+#define JPEG_FAIL(...) do { jpeg_set_error(error, error_cap, __VA_ARGS__); goto fail; } while (0)
+
+jpeg_image *jpeg_load_mem_ex(const uint8_t *file_data, size_t file_size,
+                             char *error, size_t error_cap) {
+    if (!file_data || file_size == 0) {
+        jpeg_set_error(error, error_cap, "corrupt JPEG: file is empty");
         return NULL;
     }
+    if (file_size > JPEG_MAX_INPUT_BYTES) {
+        jpeg_set_error(error, error_cap,
+                       "JPEG image too large: %zu bytes exceeds the %u byte limit",
+                       file_size, (unsigned)JPEG_MAX_INPUT_BYTES);
+        return NULL;
+    }
+    /* Check SOI marker */
+    if (file_size < 2 || file_data[0] != 0xFF || file_data[1] != JPEG_SOI) {
+        jpeg_set_error(error, error_cap, "not a JPEG file (missing SOI marker)");
+        return NULL;
+    }
+    jpeg_set_error(error, error_cap, "corrupt JPEG");
+    const char *unsupported_frame = NULL;
 
     jpeg_decoder dec;
     memset(&dec, 0, sizeof(dec));
@@ -1212,25 +1260,42 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         uint16_t seg_len = (file_data[pos] << 8) | file_data[pos + 1];
         if (pos + seg_len > file_size) break;
 
+        if (!unsupported_frame) unsupported_frame = jpeg_unsupported_sof(marker);
+
         if (marker == JPEG_SOF0 || marker == JPEG_SOF2) {
             /* Start of frame */
             dec.is_progressive = (marker == JPEG_SOF2);
 
-            if (seg_len < 8) goto fail;
+            if (seg_len < 8) JPEG_FAIL("corrupt JPEG: frame header (SOF) is too short");
 
             dec.height = (file_data[pos + 3] << 8) | file_data[pos + 4];
             dec.width = (file_data[pos + 5] << 8) | file_data[pos + 6];
             dec.num_components = file_data[pos + 7];
 
-            if (file_data[pos + 2] != 8) goto fail;
-            if (dec.width <= 0 || dec.height <= 0 ||
-                dec.width > JPEG_MAX_DIMENSION ||
-                dec.height > JPEG_MAX_DIMENSION ||
-                (size_t)dec.width * (size_t)dec.height > JPEG_MAX_PIXELS) {
-                goto fail;
+            if (file_data[pos + 2] != 8) {
+                JPEG_FAIL("unsupported JPEG: %d-bit sample precision (only 8-bit is supported)",
+                          file_data[pos + 2]);
             }
-            if (dec.num_components != 1 && dec.num_components != 3) goto fail;
-            if (seg_len < 8 + dec.num_components * 3) goto fail;
+            if (dec.width <= 0 || dec.height <= 0) {
+                JPEG_FAIL("corrupt JPEG: image has zero width or height (%dx%d)",
+                          dec.width, dec.height);
+            }
+            if (dec.width > JPEG_MAX_DIMENSION || dec.height > JPEG_MAX_DIMENSION) {
+                JPEG_FAIL("JPEG image too large: %dx%d exceeds the %u pixel limit per side",
+                          dec.width, dec.height, (unsigned)JPEG_MAX_DIMENSION);
+            }
+            if ((size_t)dec.width * (size_t)dec.height > JPEG_MAX_PIXELS) {
+                JPEG_FAIL("JPEG image too large: %dx%d exceeds the %u pixel total limit",
+                          dec.width, dec.height, (unsigned)JPEG_MAX_PIXELS);
+            }
+            if (dec.num_components == 4) {
+                JPEG_FAIL("unsupported JPEG: CMYK/YCCK color (4 components); convert it to RGB");
+            }
+            if (dec.num_components != 1 && dec.num_components != 3) {
+                JPEG_FAIL("unsupported JPEG: %d color components (only grayscale and YCbCr are supported)",
+                          dec.num_components);
+            }
+            if (seg_len < 8 + dec.num_components * 3) JPEG_FAIL("corrupt JPEG: frame header (SOF) is too short");
 
             dec.max_h_samp = dec.max_v_samp = 1;
 
@@ -1242,9 +1307,12 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 dec.comp[i].qt_idx = file_data[offset + 2];
 
                 /* Validate sampling factors and table index */
-                if (dec.comp[i].h_samp == 0 || dec.comp[i].h_samp > 4) goto fail;
-                if (dec.comp[i].v_samp == 0 || dec.comp[i].v_samp > 4) goto fail;
-                if (dec.comp[i].qt_idx > 3) goto fail;
+                if (dec.comp[i].h_samp == 0 || dec.comp[i].h_samp > 4 ||
+                    dec.comp[i].v_samp == 0 || dec.comp[i].v_samp > 4) {
+                    JPEG_FAIL("corrupt JPEG: invalid sampling factors %dx%d for component %d",
+                              dec.comp[i].h_samp, dec.comp[i].v_samp, i);
+                }
+                if (dec.comp[i].qt_idx > 3) JPEG_FAIL("corrupt JPEG: invalid quantization table index %d", dec.comp[i].qt_idx);
 
                 if (dec.comp[i].h_samp > dec.max_h_samp) dec.max_h_samp = dec.comp[i].h_samp;
                 if (dec.comp[i].v_samp > dec.max_v_samp) dec.max_v_samp = dec.comp[i].v_samp;
@@ -1267,7 +1335,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 for (int i = 0; i < dec.num_components; i++) {
                     size_t num_blocks = (size_t)dec.comp[i].blocks_x * dec.comp[i].blocks_y;
                     dec.comp[i].coefs = (int16_t *)calloc(num_blocks * 64, sizeof(int16_t));
-                    if (!dec.comp[i].coefs) goto fail;
+                    if (!dec.comp[i].coefs) JPEG_FAIL("out of memory decoding JPEG");
                 }
             }
             break;  /* Found SOF, stop first pass */
@@ -1276,7 +1344,10 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         pos += seg_len;
     }
 
-    if (dec.width == 0 || dec.height == 0) goto fail;
+    if (dec.width == 0 || dec.height == 0) {
+        if (unsupported_frame) JPEG_FAIL("unsupported JPEG: %s (only baseline and progressive JPEGs are supported)", unsupported_frame);
+        JPEG_FAIL("corrupt JPEG: no frame header (SOF) found (file truncated?)");
+    }
 
     /* Second pass - process DHT, DQT, DRI, and SOS markers */
     pos = 2;
@@ -1309,20 +1380,20 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 int tc = th >> 4;
                 int idx = th & 0x0F;
 
-                if (tc > 1 || idx > 1) goto fail;
+                if (tc > 1 || idx > 1) JPEG_FAIL("corrupt JPEG: invalid Huffman table id (class %d, index %d)", tc, idx);
                 int table_idx = tc * 2 + idx;
 
-                if (off + 16 > end) goto fail;
+                if (off + 16 > end) JPEG_FAIL("corrupt JPEG: Huffman table (DHT) is truncated");
                 uint8_t bits[16];
                 memcpy(bits, file_data + off, 16);
                 off += 16;
 
                 int total = 0;
                 for (int i = 0; i < 16; i++) total += bits[i];
-                if (off + total > end) goto fail;
+                if (off + total > end) JPEG_FAIL("corrupt JPEG: Huffman table (DHT) is truncated");
 
                 if (!jpeg_build_huffman(&dec.huff[table_idx], bits, file_data + off)) {
-                    goto fail;
+                    JPEG_FAIL("corrupt JPEG: invalid Huffman table");
                 }
 
                 off += total;
@@ -1338,16 +1409,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 int precision = pq_tq >> 4;
                 int tq = pq_tq & 0x0F;
 
-                if (tq > 3) goto fail;
+                if (tq > 3) JPEG_FAIL("corrupt JPEG: invalid quantization table index %d", tq);
 
                 if (precision == 0) {
-                    if (off + 64 > end) goto fail;
+                    if (off + 64 > end) JPEG_FAIL("corrupt JPEG: quantization table (DQT) is truncated");
                     for (int i = 0; i < 64; i++) {
                         dec.qt[tq][i] = file_data[off + i];
                     }
                     off += 64;
                 } else {
-                    if (off + 128 > end) goto fail;
+                    if (off + 128 > end) JPEG_FAIL("corrupt JPEG: quantization table (DQT) is truncated");
                     for (int i = 0; i < 64; i++) {
                         dec.qt[tq][i] = (file_data[off + i * 2] << 8) | file_data[off + i * 2 + 1];
                     }
@@ -1356,16 +1427,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             }
 
         } else if (marker == JPEG_DRI) {
-            if (seg_len < 4) goto fail;
+            if (seg_len < 4) JPEG_FAIL("corrupt JPEG: restart interval (DRI) segment is too short");
             dec.restart_interval = (file_data[pos + 2] << 8) | file_data[pos + 3];
 
         } else if (marker == JPEG_SOS) {
             /* Start of scan */
-            if (seg_len < 6) goto fail;
+            if (seg_len < 6) JPEG_FAIL("corrupt JPEG: scan header (SOS) is too short");
 
             int ns = file_data[pos + 2];
-            if (ns < 1 || ns > 4) goto fail;
-            if (seg_len < 6 + ns * 2) goto fail;
+            if (ns < 1 || ns > 4) JPEG_FAIL("corrupt JPEG: scan header has %d components", ns);
+            if (seg_len < 6 + ns * 2) JPEG_FAIL("corrupt JPEG: scan header (SOS) is too short");
 
             int scan_comps[4];
             for (int i = 0; i < ns; i++) {
@@ -1380,12 +1451,13 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                         dec.comp[j].dc_idx = td_ta >> 4;
                         dec.comp[j].ac_idx = td_ta & 0x0F;
                         /* Validate Huffman table indices (DC: 0-1, AC: 0-1) */
-                        if (dec.comp[j].dc_idx > 1) goto fail;
-                        if (dec.comp[j].ac_idx > 1) goto fail;
+                        if (dec.comp[j].dc_idx > 1 || dec.comp[j].ac_idx > 1) {
+                            JPEG_FAIL("corrupt JPEG: scan uses invalid Huffman table index");
+                        }
                         break;
                     }
                 }
-                if (comp_idx < 0) goto fail;
+                if (comp_idx < 0) JPEG_FAIL("corrupt JPEG: scan references unknown component %d", cs);
                 scan_comps[i] = comp_idx;
             }
 
@@ -1400,10 +1472,13 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 /* Validate spectral selection and successive approximation
                  * (T.81 G.1.1.1.1). Se bounds the jpeg_zigzag[64] index in
                  * the AC decoders. */
-                if (dec.se > 63 || dec.ss > dec.se) goto fail;
-                if (dec.ss == 0 && dec.se != 0) goto fail;  /* DC scan */
-                if (dec.ss > 0 && ns != 1) goto fail;       /* AC scan */
-                if (dec.ah > 13 || dec.al > 13) goto fail;
+                if (dec.se > 63 || dec.ss > dec.se ||
+                    (dec.ss == 0 && dec.se != 0) ||  /* DC scan */
+                    (dec.ss > 0 && ns != 1) ||       /* AC scan */
+                    dec.ah > 13 || dec.al > 13) {
+                    JPEG_FAIL("corrupt JPEG: invalid progressive scan parameters (Ss=%d Se=%d Ah=%d Al=%d)",
+                              dec.ss, dec.se, dec.ah, dec.al);
+                }
             }
 
             /* Setup bitstream for scan data */
@@ -1427,18 +1502,24 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
 
             if (dec.is_progressive) {
                 /* Decode progressive scan */
-                if (jpeg_decode_progressive_scan(&dec, scan_comps, ns) < 0) goto fail;
+                if (jpeg_decode_progressive_scan(&dec, scan_comps, ns) < 0) {
+                    JPEG_FAIL(scan_end >= file_size - 1
+                              ? "corrupt JPEG: image data ends early (file truncated?)"
+                              : "corrupt JPEG: invalid compressed data in progressive scan");
+                }
                 pos = scan_end;
                 continue;  /* Continue to next scan */
             } else {
                 /* Baseline: single scan with all components */
-                if (ns != dec.num_components) goto fail;
+                if (ns != dec.num_components) {
+                    JPEG_FAIL("unsupported JPEG: baseline image with non-interleaved scans");
+                }
 
                 /* Allocate component planes */
                 int y_stride = dec.mcus_x * dec.comp[0].h_samp * 8;
                 int y_height = dec.mcus_y * dec.comp[0].v_samp * 8;
                 uint8_t *y_data = (uint8_t *)calloc(y_stride * y_height, 1);
-                if (!y_data) goto fail;
+                if (!y_data) JPEG_FAIL("out of memory decoding JPEG");
 
                 uint8_t *cb_data = NULL;
                 uint8_t *cr_data = NULL;
@@ -1457,7 +1538,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                         free(y_data);
                         free(cb_data);
                         free(cr_data);
-                        goto fail;
+                        JPEG_FAIL("out of memory decoding JPEG");
                     }
                 }
 
@@ -1466,7 +1547,9 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                     free(y_data);
                     free(cb_data);
                     free(cr_data);
-                    goto fail;
+                    JPEG_FAIL(scan_end >= file_size - 1
+                              ? "corrupt JPEG: image data ends early (file truncated?)"
+                              : "corrupt JPEG: invalid compressed data in scan");
                 }
 
                 /* Create output image */
@@ -1476,7 +1559,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                     free(y_data);
                     free(cb_data);
                     free(cr_data);
-                    goto fail;
+                    JPEG_FAIL("out of memory decoding JPEG");
                 }
 
                 /* Convert to RGB */
@@ -1519,7 +1602,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             planes[i] = (uint8_t *)calloc(strides[i] * dec.comp[i].blocks_y * 8, 1);
             if (!planes[i]) {
                 for (int j = 0; j < i; j++) free(planes[j]);
-                goto fail;
+                JPEG_FAIL("out of memory decoding JPEG");
             }
         }
 
@@ -1531,7 +1614,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         img = jpeg_create(dec.width, dec.height, out_channels);
         if (!img) {
             for (int i = 0; i < dec.num_components; i++) free(planes[i]);
-            goto fail;
+            JPEG_FAIL("out of memory decoding JPEG");
         }
 
         /* Convert to RGB */
@@ -1558,12 +1641,15 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         return img;
     }
 
+    jpeg_set_error(error, error_cap, "corrupt JPEG: no image data (missing scan; file truncated?)");
 fail:
     for (int i = 0; i < 4; i++) {
         if (dec.comp[i].coefs) free(dec.comp[i].coefs);
     }
     return NULL;
 }
+
+#undef JPEG_FAIL
 
 jpeg_image *jpeg_load(const char *path) {
     FILE *f = fopen(path, "rb");
