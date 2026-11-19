@@ -80,6 +80,7 @@ struct cuda_q8_f16_range {
     uint64_t in_dim;
     uint64_t out_dim;
     __half *device_ptr;
+    uint64_t last_use; /* g_q8_f16_clock at the last lookup; orders eviction */
 };
 
 struct cuda_stream_selected_cache {
@@ -274,6 +275,8 @@ static uint64_t g_q8_f16_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_disabled_for_multi_model;
 static int g_q8_f16_budget_notice_printed;
+static uint64_t g_q8_f16_clock;
+static int g_q8_f16_evicted; /* the context pushed entries out; refill with hysteresis */
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -366,6 +369,8 @@ static int cuda_stream_batch_selected_reuse_wait(const char *what);
 static int cuda_stream_batch_selected_upload_wait_host(const char *what);
 static void cuda_stream_batch_selected_stage_release(void);
 static void cuda_stream_read_pool_shutdown(void);
+static void cuda_elastic_release_all(void);
+static uint64_t cuda_elastic_resident_bytes(void);
 
 static int cuda_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out) return 0;
@@ -4750,6 +4755,43 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
     g_q8_f16_bytes = 0;
+    g_q8_f16_evicted = 0;
+}
+
+/* Reclaim step: give expanded weights back to a growing context.  They are
+ * rebuilt from the resident Q8 weights, so losing one only sends its matmuls
+ * back to the Q8 kernels.  Least recently used go first: a long decode keeps
+ * the entries it reads and drops the ones only prefill wanted. */
+static uint64_t cuda_q8_f16_cache_evict(uint64_t need_bytes) {
+    if (need_bytes == 0 || g_q8_f16_ranges.empty()) return 0;
+    /* Kernels already launched may still read the expanded weights. */
+    if (!cuda_ok(cudaDeviceSynchronize(), "q8 fp16 cache eviction sync")) return 0;
+    std::sort(g_q8_f16_ranges.begin(), g_q8_f16_ranges.end(),
+              [](const cuda_q8_f16_range &a, const cuda_q8_f16_range &b) {
+                  return a.last_use > b.last_use;
+              });
+    uint64_t freed = 0;
+    while (freed < need_bytes && !g_q8_f16_ranges.empty()) {
+        const cuda_q8_f16_range &r = g_q8_f16_ranges.back();
+        freed += r.in_dim * r.out_dim * sizeof(__half);
+        (void)cudaFree(r.device_ptr);
+        g_q8_f16_ranges.pop_back();
+    }
+    g_q8_f16_by_offset.clear();
+    for (size_t i = 0; i < g_q8_f16_ranges.size(); i++) {
+        g_q8_f16_by_offset[g_q8_f16_ranges[i].offset] = i;
+    }
+    const uint64_t before = g_q8_f16_bytes;
+    g_q8_f16_bytes -= freed;
+    g_q8_f16_evicted = 1;
+    /* Growth evicts a little at every step; report each GiB given back. */
+    if ((before >> 30) != (g_q8_f16_bytes >> 30) || g_q8_f16_bytes == 0) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "q8 fp16 cache shrinking for the growing context "
+                "(%.2f GiB left)\n",
+                (double)g_q8_f16_bytes / 1073741824.0);
+    }
+    return freed;
 }
 
 static int cuda_env_present(const char *env) {
@@ -4916,6 +4958,11 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
     return pct_reserve > min_reserve ? pct_reserve : min_reserve;
 }
 
+/* Once a growing context has evicted entries, the cache refills only when this
+ * much is free beyond its reserve: memory the next growth step is about to
+ * take back must not be spent on an expansion first. */
+static const uint64_t DS4_ROCM_Q8_F16_REFILL_HYSTERESIS_BYTES = 1ull << 30;
+
 static void cuda_q8_f16_cache_budget_notice(
         const char *reason,
         uint64_t request_bytes,
@@ -4957,6 +5004,8 @@ static void cuda_q8_f16_cache_budget_notice(
     }
 }
 
+static int cuda_elastic_weights_evicted(void); /* ds4_rocm_elastic.cuh */
+
 static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
     (void)label;
     const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
@@ -4965,6 +5014,10 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
         cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
         return 0;
     }
+
+    /* Evicted routed experts cost disk reads on every miss; free memory goes
+     * back to them (cuda_elastic_maybe_grow) before it expands any weight. */
+    if (cuda_elastic_weights_evicted()) return 0;
 
     size_t free_b = 0;
     size_t total_b = 0;
@@ -4978,7 +5031,8 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
 
     const uint64_t free_bytes = (uint64_t)free_b;
     const uint64_t total_bytes = (uint64_t)total_b;
-    const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
+    const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes) +
+        (g_q8_f16_evicted ? DS4_ROCM_Q8_F16_REFILL_HYSTERESIS_BYTES : 0);
     if (request_bytes > free_bytes ||
         free_bytes - request_bytes < reserve_bytes) {
         cuda_q8_f16_cache_budget_notice("budget exhausted", request_bytes,
@@ -5062,16 +5116,18 @@ static const __half *cuda_q8_f16_ptr(
         const char *label) {
     auto exact = g_q8_f16_by_offset.find(offset);
     if (exact != g_q8_f16_by_offset.end()) {
-        const cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
+        cuda_q8_f16_range &r = g_q8_f16_ranges[exact->second];
         if (r.host_base == model_map && r.weight_bytes == weight_bytes &&
             r.in_dim == in_dim && r.out_dim == out_dim) {
+            r.last_use = ++g_q8_f16_clock;
             return r.device_ptr;
         }
     }
-    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+    for (cuda_q8_f16_range &r : g_q8_f16_ranges) {
         if (r.host_base == model_map && r.offset == offset &&
             r.weight_bytes == weight_bytes &&
             r.in_dim == in_dim && r.out_dim == out_dim) {
+            r.last_use = ++g_q8_f16_clock;
             return r.device_ptr;
         }
     }
@@ -5105,7 +5161,8 @@ static const __half *cuda_q8_f16_ptr(
         cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
         return NULL;
     }
-    g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
+    g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev,
+                               ++g_q8_f16_clock});
     g_q8_f16_by_offset[offset] = g_q8_f16_ranges.size() - 1u;
     g_q8_f16_bytes += out_bytes;
     return dev;
@@ -5454,6 +5511,37 @@ static int cuda_stream_model_cache_prepare_memory(
     return 1;
 }
 
+extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom);
+
+static uint64_t (*g_memory_pressure_fn)(void *user, uint64_t need_bytes);
+static void *g_memory_pressure_user;
+
+extern "C" void ds4_gpu_set_memory_pressure_handler(
+        uint64_t (*fn)(void *user, uint64_t need_bytes), void *user) {
+    g_memory_pressure_fn = fn;
+    g_memory_pressure_user = user;
+}
+
+/* Before an allocation that must not fail (fixed weights, session buffers):
+ * if it does not fit, give up memory in the order of the reclaim chain: the
+ * owner's idle sessions, the F16 cache, routed experts.  The handler frees
+ * sessions and may allocate while it saves them, hence the guard; the other
+ * steps synchronize the device before they free anything. */
+static void cuda_memory_make_room(uint64_t bytes) {
+    static thread_local bool busy;
+    uint64_t missing = ds4_gpu_memory_shortfall(bytes, 0);
+    if (!missing || busy) return;
+    busy = true;
+    if (g_memory_pressure_fn && g_memory_pressure_fn(g_memory_pressure_user, missing)) {
+        missing = ds4_gpu_memory_shortfall(bytes, 0);
+    }
+    if (missing && cuda_q8_f16_cache_evict(missing)) {
+        missing = ds4_gpu_memory_shortfall(bytes, 0);
+    }
+    if (missing) (void)ds4_gpu_reclaim_weights(missing);
+    busy = false;
+}
+
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -5473,6 +5561,10 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
     const uint64_t chunk = ds4_rocm_model_arena_bytes(aligned);
+    /* The weights every token needs load after the elastic expert tables.
+     * When they do not fit, routed experts give way: those can be read back
+     * on demand, these cannot. */
+    cuda_memory_make_room(chunk);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -5588,7 +5680,8 @@ static const char *cuda_model_range_ptr_from_fd(
         cuda_model_drop_file_pages(offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
         copied += n;
-        cuda_model_load_progress_note(g_model_range_bytes + copied);
+        cuda_model_load_progress_note(g_model_range_bytes +
+                                      cuda_elastic_resident_bytes() + copied);
         chunk_idx++;
     }
     err = cudaStreamSynchronize(g_model_upload_stream);
@@ -5602,7 +5695,7 @@ static const char *cuda_model_range_ptr_from_fd(
     g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
-    cuda_model_load_progress_note(g_model_range_bytes);
+    cuda_model_load_progress_note(g_model_range_bytes + cuda_elastic_resident_bytes());
     return (const char *)dev;
 }
 
@@ -5701,6 +5794,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_ranges_only(void) {
+    cuda_elastic_release_all();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -5863,6 +5957,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    cuda_memory_make_room(bytes);
     if (!cuda_ok(cudaMalloc(&t->ptr, (size_t)bytes), "tensor alloc")) {
         free(t);
         return NULL;
@@ -5876,6 +5971,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
+    cuda_memory_make_room(bytes);
     if (!cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes), "managed tensor alloc")) {
         free(t);
         return NULL;
@@ -5919,6 +6015,53 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
     const uint64_t reserve_bytes = cuda_managed_kv_reserve_bytes(total_bytes);
     if (context_bytes > free_bytes) return 1;
     return free_bytes - context_bytes < reserve_bytes;
+}
+
+/* Memory a growing context may take.  Every allocation leaves the OS
+ * reserve.  While optional caches remain, the context also leaves the
+ * transient headroom they leave (BLAS workspaces and lazily allocated scratch
+ * still need it) and takes the caches instead: that is the shortfall with
+ * keep_cache_headroom set.  The ceiling is what it all adds up to: free memory
+ * plus the evictable caches, plus the CMA region for movable (managed)
+ * memory, which pinned device memory cannot use. */
+static uint64_t cuda_memory_os_reserve_bytes(void) {
+    return ds4_rocm_uses_host_ram() ? DS4_ROCM_OS_RESERVE_BYTES : 0;
+}
+
+extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return bytes;
+    }
+    /* With the F16 cache gone nothing else keeps room for the temporaries of
+     * a kernel launch, which cannot reclaim (their caller holds weight
+     * pointers) and fail the request instead. */
+    const uint64_t transient = g_q8_f16_bytes == 0 && ds4_rocm_uses_host_ram()
+        ? 1ull << 30 : 0;
+    const uint64_t need = bytes + (keep_cache_headroom && g_q8_f16_bytes != 0
+        ? cuda_q8_f16_cache_reserve_bytes(total_b)
+        : cuda_memory_os_reserve_bytes() + transient);
+    return need > free_b ? need - free_b : 0;
+}
+
+extern "C" uint64_t ds4_gpu_memory_ceiling(int movable) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const uint64_t reserve = cuda_memory_os_reserve_bytes();
+    /* Evictable routed experts are pinned device memory like the F16 cache. */
+    return (free_b > reserve ? (uint64_t)free_b - reserve : 0) + g_q8_f16_bytes +
+           ds4_gpu_reclaimable_weight_bytes() +
+           (movable && ds4_rocm_uses_host_ram() ? ds4_linux_cma_free_memory() : 0);
+}
+
+extern "C" uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes) {
+    return cuda_q8_f16_cache_evict(need_bytes);
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
@@ -6307,6 +6450,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
     fprintf(stderr,
             DS4_GPU_LOG_PREFIX "memory %s: used=%.2f GiB free=%.2f GiB total=%.2f GiB "
             "placement=%s model_image=%.2f GiB range_cache=%.2f GiB "
+            "elastic_experts=%.2f GiB "
             "q8_f16_cache=%.2f GiB scratch=%.2f GiB",
             label ? label : "",
             (double)used_b / 1073741824.0,
@@ -6315,6 +6459,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             placement,
             (double)cuda_model_image_bytes() / 1073741824.0,
             (double)g_model_range_bytes / 1073741824.0,
+            (double)cuda_elastic_resident_bytes() / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
             (double)g_cuda_tmp_bytes / 1073741824.0);
     fprintf(stderr, "\n");

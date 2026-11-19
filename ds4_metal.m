@@ -4737,6 +4737,16 @@ void ds4_gpu_set_glm_model(bool enabled) {
     g_glm_model_mode = enabled ? 1 : 0;
 }
 
+/* Weight eviction is a ROCm unified-memory feature; nothing to reclaim here. */
+uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
+    (void)need_bytes;
+    return 0;
+}
+
+uint64_t ds4_gpu_reclaimable_weight_bytes(void) {
+    return 0;
+}
+
 void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
@@ -9455,6 +9465,9 @@ int ds4_gpu_weight_residency(ds4_gpu_tensor *const *tensors, uint32_t n) {
 #endif
     return 1;
 }
+
+/* Metal allocates the context up front and keeps no evictable cache. */
+uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes) { (void)need_bytes; return 0; }
 
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes) {
     (void)kv_cache_bytes;

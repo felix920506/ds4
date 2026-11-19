@@ -17,10 +17,13 @@ static inline bool ds4_rocm_uses_host_ram(void) {
            hipGetDeviceProperties(&prop, device) == hipSuccess && prop.integrated;
 }
 
+/* Host memory no allocation may take on a unified-memory device. */
+static const uint64_t DS4_ROCM_OS_RESERVE_BYTES = 2ull << 30;
+
 static inline bool ds4_rocm_allocation_fits(size_t bytes, bool host = false) {
     if (!host && !ds4_rocm_uses_host_ram()) return true;
     uint64_t available;
-    const uint64_t reserve = 2ull << 30;
+    const uint64_t reserve = DS4_ROCM_OS_RESERVE_BYTES;
     if (!ds4_linux_nonmovable_memory(&available)) {
         fprintf(stderr, "ds4: ROCm cannot read usable host memory; allocation refused\n");
         return false;

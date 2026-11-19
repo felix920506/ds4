@@ -1,0 +1,51 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+.viz{font-family:var(--font-sans,system-ui);color:var(--foreground,#111)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:20px}
+h3{font-size:14px;font-weight:600;margin:0 0 2px}
+.sub{font-size:12px;color:var(--muted-foreground,#666);margin:0 0 6px;min-height:30px}
+svg{width:100%;height:220px;display:block;overflow:visible}
+.ax{font-size:10.5px;fill:var(--muted-foreground,#666)}
+.grd{stroke:var(--border,#ddd);stroke-width:1}
+.tip{position:fixed;pointer-events:none;background:var(--popover,#fff);color:var(--popover-foreground,#111);border:1px solid var(--border,#ccc);border-radius:6px;padding:6px 8px;font-size:12px;display:none;box-shadow:0 2px 8px rgba(0,0,0,.15);white-space:nowrap}
+.leg{display:flex;gap:14px;font-size:11.5px;color:var(--muted-foreground,#666);margin-top:4px;flex-wrap:wrap}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.note{font-size:11.5px;color:var(--muted-foreground,#666);margin-top:14px;line-height:1.45}
+</style></head><body><div class="viz">
+<div class="grid">
+<div><h3>Memory actually in use</h3><p class="sub">Model weights + KV cache holding the context (GiB)</p><svg id="m"></svg>
+<div class="leg"><span><span class="sw" style="background:var(--chart-1)"></span>Weights 80.76 GiB</span><span><span class="sw" style="background:var(--chart-2)"></span>KV cache in use</span><span><span class="sw" style="border-top:2px dashed var(--muted-foreground);height:0;border-radius:0"></span>Held by a 1M session</span></div></div>
+<div><h3>KV cache in use</h3><p class="sub">Live session state, ~13.4 KiB per token (GiB)</p><svg id="k"></svg></div>
+<div><h3>Prefill speed</h3><p class="sub">Tokens/s for the segment since the previous point</p><svg id="p"></svg></div>
+<div><h3>Decode speed</h3><p class="sub">Steady-state tokens/s, 128 greedy tokens at each length</p><svg id="d"></svg></div>
+</div>
+<p class="note">DeepSeek V4 Flash Vision Exp (IQ2XXS/Q2K), Strix Halo gfx1151, 128 GB, ds4 @ 1a746ff in Docker (ROCm). One session allocated for 1,048,576 tokens, filled in doubling steps. KV in use is the session snapshot size at each point; the ~1M value is extrapolated from that linear growth (no snapshot is taken at the last point). Physically, a 1M session holds ≈108 GiB from the first token (93.7 GiB GPU buffers + 13.8 GiB demand-paged KV that the engine touches up front), so the dashed line barely moves.</p>
+<div class="tip" id="tip"></div></div>
+<script>
+const D={"pts": [{"ctx": 2048, "prefill": 152.7, "decode": 17.21, "first": 58.012, "kv": 52184460, "kvg": 0.049}, {"ctx": 4096, "prefill": 176.58, "decode": 17.05, "first": 61.088, "kv": 80373132, "kvg": 0.075}, {"ctx": 8192, "prefill": 173.62, "decode": 16.7, "first": 61.51, "kv": 136750476, "kvg": 0.127}, {"ctx": 16384, "prefill": 178.23, "decode": 16.49, "first": 61.482, "kv": 249505164, "kvg": 0.232}, {"ctx": 32768, "prefill": 175.65, "decode": 15.51, "first": 64.932, "kv": 475014540, "kvg": 0.442}, {"ctx": 65536, "prefill": 168.71, "decode": 14.28, "first": 70.434, "kv": 926033292, "kvg": 0.862}, {"ctx": 131072, "prefill": 159.56, "decode": 11.98, "first": 82.415, "kv": 1828070796, "kvg": 1.703}, {"ctx": 262144, "prefill": 142.89, "decode": 9.33, "first": 109.118, "kv": 3632145804, "kvg": 3.383}, {"ctx": 524288, "prefill": 116.98, "decode": 6.43, "first": 159.471, "kv": 7240295820, "kvg": 6.743}, {"ctx": 1048447, "prefill": 87.05, "decode": 3.86, "first": 258.812, "kv": 14454820296, "kv_est": true, "kvg": 13.462}], "weights": 80.76, "held": 107.8, "slope": 13764.0}, P=D.pts, NS='http://www.w3.org/2000/svg', tip=document.getElementById('tip');
+const fmtC=c=>c>=1e6?'1M':(c>=1024?Math.round(c/1024)+'K':c);
+const fmtFull=c=>c.toLocaleString('en-US');
+function el(t,a,p){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);p&&p.appendChild(e);return e}
+function chart(id,{ymax,yticks,unit,series,stack,ref,tipf}){
+ const s=document.getElementById(id),W=s.clientWidth||340,H=220,L=40,R=10,T=8,B=24;s.setAttribute('viewBox',`0 0 ${W} ${H}`);
+ const lx=Math.log2(2048),hx=Math.log2(1048576),x=c=>L+(Math.log2(c)-lx)/(hx-lx)*(W-L-R),y=v=>T+(1-v/ymax)*(H-T-B);
+ yticks.forEach(v=>{el('line',{x1:L,x2:W-R,y1:y(v),y2:y(v),class:'grd'},s);el('text',{x:L-6,y:y(v)+3.5,'text-anchor':'end',class:'ax'},s).textContent=v});
+ [2048,8192,32768,131072,524288,1048576].forEach(c=>{el('text',{x:x(c),y:H-6,'text-anchor':'middle',class:'ax'},s).textContent=fmtC(c)});
+ if(stack){const bw=Math.min(18,(W-L-R)/P.length*0.6);P.forEach(p=>{let base=0;stack.forEach(([f,col])=>{const v=f(p),y0=y(base),y1=y(base+v);el('rect',{x:x(p.ctx)-bw/2,y:y1,width:bw,height:Math.max(0,y0-y1-(base?0:0)),fill:col,rx:base+v>=ymax*0.999?0:2},s);base+=v;})})}
+ if(ref){el('line',{x1:L,x2:W-R,y1:y(ref),y2:y(ref),stroke:'var(--muted-foreground)','stroke-dasharray':'4 3','stroke-width':1.5},s)}
+ (series||[]).forEach(([f,col])=>{el('path',{d:P.map((p,i)=>(i?'L':'M')+x(p.ctx)+','+y(f(p))).join(''),fill:'none',stroke:col,'stroke-width':2,'stroke-linejoin':'round'},s);
+  P.forEach(p=>el('circle',{cx:x(p.ctx),cy:y(f(p)),r:p.kv_est&&id=='k'?4:3.5,fill:p.kv_est&&id=='k'?'var(--background)':col,stroke:col,'stroke-width':2},s));
+  const last=P[P.length-1];el('text',{x:x(last.ctx)-6,y:y(f(last))-9,'text-anchor':'end',class:'ax',style:'fill:var(--foreground);font-weight:600'},s).textContent=f(last).toFixed(f(last)<20?2:0)+' '+unit;
+  const first=P[0];el('text',{x:x(first.ctx)+6,y:y(f(first))-9,class:'ax',style:'fill:var(--foreground);font-weight:600'},s).textContent=f(first).toFixed(f(first)<20?2:0);});
+ const hair=el('line',{y1:T,y2:H-B,stroke:'var(--muted-foreground)','stroke-width':1,opacity:0},s);
+ s.addEventListener('mousemove',ev=>{const r=s.getBoundingClientRect(),mx=(ev.clientX-r.left)*W/r.width;let b=P[0];P.forEach(p=>{if(Math.abs(x(p.ctx)-mx)<Math.abs(x(b.ctx)-mx))b=p});
+  hair.setAttribute('x1',x(b.ctx));hair.setAttribute('x2',x(b.ctx));hair.setAttribute('opacity',.5);tip.style.display='block';tip.innerHTML='<b>'+fmtFull(b.ctx)+' tokens</b><br>'+tipf(b);
+  tip.style.left=Math.min(ev.clientX+12,innerWidth-tip.offsetWidth-8)+'px';tip.style.top=(ev.clientY+12)+'px'});
+ s.addEventListener('mouseleave',()=>{tip.style.display='none';hair.setAttribute('opacity',0)});
+}
+const est=p=>p.kv_est?' (extrapolated)':'';
+chart('m',{ymax:120,yticks:[0,40,80,120],unit:'GiB',stack:[[p=>D.weights,'var(--chart-1)'],[p=>p.kvg,'var(--chart-2)']],ref:D.held,
+ tipf:p=>'In use: '+(D.weights+p.kvg).toFixed(2)+' GiB<br>Weights: 80.76 GiB<br>KV in use: '+p.kvg.toFixed(2)+' GiB'+est(p)+'<br>Held by 1M session: ≈108 GiB'});
+chart('k',{ymax:15,yticks:[0,5,10,15],unit:'GiB',series:[[p=>p.kvg,'var(--chart-2)']],tipf:p=>'KV in use: '+p.kvg.toFixed(3)+' GiB'+est(p)});
+chart('p',{ymax:200,yticks:[0,50,100,150,200],unit:'tok/s',series:[[p=>p.prefill,'var(--chart-1)']],tipf:p=>'Prefill: '+p.prefill.toFixed(1)+' tok/s'});
+chart('d',{ymax:20,yticks:[0,5,10,15,20],unit:'tok/s',series:[[p=>p.decode,'var(--chart-1)']],tipf:p=>'Decode: '+p.decode.toFixed(2)+' tok/s<br>First token: '+p.first.toFixed(0)+' ms'});
+</script></body></html>
