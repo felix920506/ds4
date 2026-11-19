@@ -164,6 +164,13 @@ To compare the smaller Q2_K routed-down blocks, use
 same command. `make test-rocm-moe-down` covers the production routing path.
 See [routed-down measurements](gfx1151-moe-down/README.md).
 
+### Pipeline decode on Strix Halo
+
+[gfx1151-pipeline-decode.md](gfx1151-pipeline-decode.md) has two-node decode
+numbers from 1.6K to 410K tokens, where a step goes, and how to tell a
+thermally throttled stage from a slow one. `make test-rocm-indexer` checks
+the long-context indexer score and top-k kernels it describes.
+
 ### Concurrency: many requests at once
 
 `session_concurrency_bench` measures the engine without HTTP overhead.

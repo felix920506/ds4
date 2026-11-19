@@ -430,6 +430,14 @@ struct ds4_dist_session {
     uint64_t session_id;
     uint64_t request_id;
     uint64_t snapshot_request_id;
+    /* Hash of the timeline as the last decode step left it, so the next step
+     * does not hash the whole context again (4 ms at a million tokens).  It
+     * holds while the timeline still has prefix_len tokens and request_id is
+     * still prefix_request: everything else that moves the timeline sends a
+     * request, except a snapshot load, which clears prefix_request. */
+    uint64_t prefix_hash;
+    uint64_t prefix_request;
+    uint32_t prefix_len;
     /* Set once the route shows it cannot draft, so later cycles skip the
      * round trip. */
     bool dspark_unavailable;
@@ -2857,6 +2865,7 @@ static int dist_coordinator_eval_span(
         uint64_t session_id,
         uint64_t request_id,
         bool reset_session,
+        const uint64_t *known_prefix_hash,
         float *logits,
         char *err,
         size_t errlen) {
@@ -2874,6 +2883,8 @@ static int dist_coordinator_eval_span(
             if (errlen) snprintf(err, errlen, "distributed reset span must start at position 0");
             return 1;
         }
+    } else if (known_prefix_hash) {
+        prefix_hash = *known_prefix_hash;
     } else if (dist_session_token_hash_prefix(session,
                                               pos0,
                                               &prefix_hash,
@@ -3235,7 +3246,7 @@ static int dist_write_logprobs_dump(
         if (dist_coordinator_eval_span(state, session, plan,
                                        &token, 1, token_pos,
                                        session_id, (*request_id)++,
-                                       false, logits, err, sizeof(err)) != 0) {
+                                       false, NULL, logits, err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "ds4: distributed decode failed while dumping logprobs: %s\n",
                     err);
@@ -4090,7 +4101,7 @@ static int dist_coordinator_prefill_prompt(
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
-                                                 pos == 0, logits, err, errlen);
+                                                 pos == 0, NULL, logits, err, errlen);
         if (eval_rc != 0) {
             return eval_rc;
         }
@@ -4329,7 +4340,7 @@ static int dist_run_coordinator_generation(
         int decode_rc = dist_coordinator_eval_span(state, session, &plan,
                                                    &token, 1, token_pos,
                                                    session_id, request_id++,
-                                                   false, logits, err, sizeof(err));
+                                                   false, NULL, logits, err, sizeof(err));
         if (decode_rc != 0) {
             fprintf(stderr, "\nds4: distributed decode failed: %s\n", err);
             if (dist_coordinator_rebuild_from_transcript(state,
@@ -5530,6 +5541,7 @@ int ds4_dist_session_load_payload(
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
     if (dist_kv_route_validate(d, err, errlen) != 0) return 1;
+    d->prefix_request = 0;
 
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
@@ -5925,6 +5937,7 @@ int ds4_dist_session_sync(
                                                      d->session_id,
                                                      d->request_id++,
                                                      false,
+                                                     NULL,
                                                      logits,
                                                      err,
                                                      errlen);
@@ -5981,6 +5994,30 @@ int ds4_dist_session_sync(
         d->plan_ready = true;
     }
     return 0;
+}
+
+/* The hash of the first pos0 tokens of a session's timeline, taken from the
+ * last decode step when that step is what brought the timeline here. */
+static int dist_session_prefix_hash(
+        const ds4_dist_session *d,
+        ds4_session *owner,
+        uint32_t pos0,
+        uint64_t *hash,
+        char *err,
+        size_t errlen) {
+    if (d->prefix_request == d->request_id && d->prefix_len == pos0) {
+        *hash = d->prefix_hash;
+        return 0;
+    }
+    return dist_session_token_hash_prefix(owner, pos0, hash, err, errlen);
+}
+
+/* Record a completed decode step; call it after the step's request ids are
+ * taken, so that any later request retires the record. */
+static void dist_session_note_prefix(ds4_dist_session *d, uint32_t len, uint64_t hash) {
+    d->prefix_hash = hash;
+    d->prefix_len = len;
+    d->prefix_request = d->request_id;
 }
 
 /* One decode step across several coordinator sessions at once.
@@ -6047,14 +6084,15 @@ static int dist_batch_submit_member(
     const uint32_t pos0 = (uint32_t)item->checkpoint->len;
     member->pos0 = pos0;
     uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
-    if (dist_session_token_hash_prefix(item->owner, pos0, &prefix_hash,
-                                       err, errlen) != 0) {
+    if (dist_session_prefix_hash(d, item->owner, pos0, &prefix_hash,
+                                 err, errlen) != 0) {
         return 1;
     }
 
     /* A route with no remote hop means the whole model is local: an ordinary
      * decode, with nothing to overlap. */
     if (d->plan.count == 0) {
+        d->prefix_request = 0;
         return ds4_session_eval_layer_slice(item->owner, &item->token, 1, pos0,
                                             state->local_start, state->local_end,
                                             NULL, NULL, true, item->logits,
@@ -6191,6 +6229,9 @@ int ds4_dist_sessions_eval(
         if (rc != 0) {
             members[i].rc = rc;
             if (!failed++) snprintf(report_err, sizeof(report_err), "%s", member_err);
+        } else {
+            dist_session_note_prefix(items[i].dist, members[i].pos0 + 1u,
+                                     members[i].result_hash);
         }
     }
 
@@ -6237,6 +6278,8 @@ int ds4_dist_session_eval(
      * timeline; the recovery below has to replay from here, not from where the
      * checkpoint ends up. */
     const uint32_t pos0 = (uint32_t)checkpoint->len;
+    uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
+    if (dist_session_prefix_hash(d, owner, pos0, &prefix_hash, err, errlen) != 0) return 1;
 
     int rc = dist_coordinator_eval_span(&d->coord->state,
                                         owner,
@@ -6247,10 +6290,14 @@ int ds4_dist_session_eval(
                                         d->session_id,
                                         d->request_id++,
                                         false,
+                                        &prefix_hash,
                                         logits,
                                         err,
                                         errlen);
-    if (rc != 0) {
+    if (rc == 0) {
+        dist_session_note_prefix(d, pos0 + 1u,
+                                 dist_token_hash_update_span(prefix_hash, &token, 1));
+    } else {
         ds4_tokens transcript = {0};
         dist_recovery_transcript(&transcript, checkpoint, pos0, token);
         if (dist_coordinator_rebuild_from_transcript(&d->coord->state,

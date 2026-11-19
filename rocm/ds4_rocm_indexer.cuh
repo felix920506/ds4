@@ -125,6 +125,79 @@ __global__ static void indexer_score_one_direct_kernel(
     if (tid == 0) scores[c] = total;
 }
 
+/* indexer_score_one_direct_kernel for long contexts, with the same scores bit
+ * for bit.  That kernel spends a block of four waves on every compressed row
+ * and crosses LDS for each head, which is fine for a few thousand rows and
+ * half of a decode step at a million tokens.  Here a lane owns a row: its 128
+ * key values stay in registers, the query is the same for every lane, and a
+ * wave scores 32 rows with no LDS and no barrier.
+ *
+ * The rounding is the original's, so the top-k that follows picks the same
+ * rows: a four-term fused dot per original lane, the pairwise tree that
+ * warp_sum_f32 leaves in lane 0, then the heads added in order.  The build
+ * uses -ffast-math, so three things hold that order in place: the fp pragma,
+ * the fused multiply-adds spelled out, and the empty asm statements.  The
+ * backend fuses a multiply into an add whatever the pragma says, and a value
+ * that passes through an asm operand is opaque to it.  The "memory" barrier is
+ * for speed: it keeps a batch of query loads ahead of their sums, so a wave
+ * waits for memory once per batch instead of once per load.  So is restrict:
+ * knowing the scores do not alias the query, the compiler reads the query
+ * with scalar loads, 16 values at a time for the whole wave. */
+__device__ __forceinline__ static float indexer_score_dot4(float4 a, float4 b) {
+#pragma clang fp reassociate(off) contract(off)
+    return __builtin_fmaf(a.w, b.w, __builtin_fmaf(a.z, b.z, __builtin_fmaf(a.y, b.y, a.x * b.x)));
+}
+
+__global__ static void indexer_score_one_rows_kernel(
+        float *__restrict__ scores,
+        const float *__restrict__ q,
+        const float *__restrict__ weights,
+        const float *__restrict__ index_comp,
+        uint32_t n_comp,
+        float scale) {
+#pragma clang fp reassociate(off) contract(off)
+    enum { AHEAD = 8 };
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_comp) return;
+
+    float4 k[32];
+    const float4 *krow = (const float4 *)(index_comp + (uint64_t)c * 128u);
+#pragma unroll
+    for (int i = 0; i < 32; i++) k[i] = krow[i];
+
+    float total = 0.0f;
+    for (uint32_t h = 0; h < 64u; h++) {
+        const float4 *qh = (const float4 *)(q + (uint64_t)h * 128u);
+        float s[16];
+#pragma unroll
+        for (int b = 0; b < 16; b += AHEAD) {
+            float4 qlo[AHEAD], qhi[AHEAD];
+#pragma unroll
+            for (int j = 0; j < AHEAD; j++) {
+                qlo[j] = qh[b + j];
+                qhi[j] = qh[b + j + 16];
+            }
+            __asm__ volatile("" ::: "memory");
+#pragma unroll
+            for (int j = 0; j < AHEAD; j++) {
+                s[b + j] = indexer_score_dot4(qlo[j], k[b + j]) +
+                           indexer_score_dot4(qhi[j], k[b + j + 16]);
+                __asm__ volatile("" : "+v"(s[b + j]));
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i++) s[i] = s[i] + s[i + 8];
+#pragma unroll
+        for (int i = 0; i < 4; i++) s[i] = s[i] + s[i + 4];
+        s[0] = s[0] + s[2];
+        s[1] = s[1] + s[3];
+        float p = (fmaxf(s[0] + s[1], 0.0f) * scale) * weights[h];
+        __asm__ volatile("" : "+v"(p));
+        total = total + p;
+    }
+    scores[c] = total;
+}
+
 /* Indexer scores for a 16-token x 128-key tile: score(t, c) = sum over heads of
  * w[t][h] * relu(q[t][h] . k[c]).  The key tile is staged once; the query rows
  * are staged four heads at a time, and every wave keeps its 16x16 score tile
@@ -645,196 +718,123 @@ __global__ static void indexer_topk_pow2_u16_kernel(
     }
 }
 
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_chunk_pow2_kernel(
-        uint32_t *candidates,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k,
-        uint32_t candidate_stride) {
-    uint32_t t = blockIdx.x;
-    uint32_t chunk = blockIdx.y;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-
-    const uint32_t chunk_start = chunk * SORT_N;
-    if (chunk_start >= n_comp) return;
-    const uint32_t chunk_n = n_comp - chunk_start < SORT_N ? n_comp - chunk_start : SORT_N;
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < chunk_n) {
-            vals[i] = row[chunk_start + i];
-            idxs[i] = chunk_start + i;
-        } else {
-            vals[i] = -INFINITY;
-            idxs[i] = UINT32_MAX;
-        }
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    uint32_t *out = candidates + (uint64_t)t * candidate_stride + chunk * top_k;
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        out[i] = idxs[i];
-    }
+/* Top-k of a long score row by radix select.
+ *
+ * The result is the TOP_K best rows under the order every other top-k kernel
+ * here uses (score descending, then row ascending), best first.  A row's key
+ * puts its score above its reversed row number, so keys are distinct and the
+ * selection is exact: ten bits a pass, a histogram in LDS finds the next digit
+ * of the TOP_K-th largest key, then the keys at or above it are gathered and
+ * sorted.  That reads the scores five or six times.  Sorting them in 4096-row
+ * chunks and merging the chunks eight at a time took 0.12 ms at 32768 rows
+ * and 1.2 ms for 64 prefill tokens over 40000; this takes 0.03 and 0.1 ms. */
+__device__ __forceinline__ static uint64_t indexer_topk_key(float v, uint32_t row, uint32_t row_bits) {
+    /* +0 and -0 compare equal, so they share a key; then the bits of a float
+     * order like the float once the sign is folded in. */
+    uint32_t u = v == 0.0f ? 0u : __float_as_uint(v);
+    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    return ((uint64_t)u << row_bits) | (uint64_t)((uint32_t)((1ull << row_bits) - 1u) - row);
 }
 
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_merge_pow2_kernel(
+template <uint32_t TOP_K>
+__global__ static void indexer_topk_select_kernel(
         uint32_t *selected,
-        const uint32_t *candidates,
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k,
-        uint32_t candidate_count,
-        uint32_t candidate_stride) {
-    uint32_t t = blockIdx.x;
-    uint32_t tid = threadIdx.x;
+        uint32_t row_bits) {
+    enum { AHEAD = 8 };
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
     const float *row = scores + (uint64_t)t * n_comp;
-    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        uint32_t idx = UINT32_MAX;
-        float v = -INFINITY;
-        if (i < candidate_count) {
-            idx = cand[i];
-            if (idx < n_comp) v = row[idx];
+    __shared__ uint32_t hist[2][1024];
+    __shared__ uint32_t key_hi[TOP_K];
+    __shared__ uint32_t key_lo[TOP_K];
+    __shared__ uint64_t s_prefix;
+    __shared__ uint32_t s_want;
+    __shared__ uint32_t s_exact;
+    __shared__ uint32_t s_count;
+
+    const uint32_t passes = (32u + row_bits + 9u) / 10u;
+    uint64_t prefix = 0;    /* digits of the TOP_K-th key found so far */
+    uint32_t want = TOP_K;  /* its rank among the keys that share them */
+    uint64_t threshold = 0;
+    for (uint32_t p = 0; p < passes; p++) {
+        const uint32_t shift = 10u * (passes - 1u - p);
+        hist[0][tid] = 0;
+        __syncthreads();
+        for (uint32_t i = tid; i < n_comp; i += AHEAD * 1024u) {
+            float v[AHEAD];
+#pragma unroll
+            for (uint32_t j = 0; j < AHEAD; j++) {
+                v[j] = i + j * 1024u < n_comp ? row[i + j * 1024u] : 0.0f;
+            }
+#pragma unroll
+            for (uint32_t j = 0; j < AHEAD; j++) {
+                const uint64_t digits = indexer_topk_key(v[j], i + j * 1024u, row_bits) >> shift;
+                if (i + j * 1024u < n_comp && digits >> 10u == prefix) {
+                    atomicAdd(&hist[0][(uint32_t)digits & 1023u], 1u);
+                }
+            }
         }
-        vals[i] = v;
-        idxs[i] = idx;
+        __syncthreads();
+        /* hist[cur][d] becomes the number of those keys with digit >= d. */
+        uint32_t cur = 0;
+        for (uint32_t off = 1u; off < 1024u; off <<= 1u) {
+            hist[cur ^ 1u][tid] = hist[cur][tid] + (tid + off < 1024u ? hist[cur][tid + off] : 0u);
+            cur ^= 1u;
+            __syncthreads();
+        }
+        const uint32_t at = hist[cur][tid];
+        const uint32_t above = tid + 1u < 1024u ? hist[cur][tid + 1u] : 0u;
+        if (at >= want && above < want) {
+            s_prefix = (prefix << 10u) | tid;
+            s_want = want - above;
+            s_exact = at == want;
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        want = s_want;
+        threshold = prefix << shift;
+        /* Every key with these digits or better is wanted, so the lower
+         * digits of the TOP_K-th key no longer matter. */
+        if (s_exact) break;
+    }
+
+    if (tid == 0) s_count = 0;
+    __syncthreads();
+    for (uint32_t i = tid; i < n_comp; i += 1024u) {
+        const uint64_t key = indexer_topk_key(row[i], i, row_bits);
+        if (key >= threshold) {
+            const uint32_t slot = atomicAdd(&s_count, 1u);
+            key_hi[slot] = (uint32_t)(key >> 32u);
+            key_lo[slot] = (uint32_t)key;
+        }
     }
     __syncthreads();
 
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
+    for (uint32_t k = 2u; k <= TOP_K; k <<= 1u) {
         for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
+            for (uint32_t i = tid; i < TOP_K; i += 1024u) {
+                const uint32_t other = i ^ j;
+                if (other > i) {
+                    const uint64_t a = ((uint64_t)key_hi[i] << 32u) | key_lo[i];
+                    const uint64_t b = ((uint64_t)key_hi[other] << 32u) | key_lo[other];
+                    if ((i & k) == 0u ? b > a : a > b) {
+                        key_hi[i] = (uint32_t)(b >> 32u);
+                        key_lo[i] = (uint32_t)b;
+                        key_hi[other] = (uint32_t)(a >> 32u);
+                        key_lo[other] = (uint32_t)a;
                     }
                 }
             }
             __syncthreads();
         }
     }
-
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        selected[(uint64_t)t * top_k + i] = idxs[i];
-    }
-}
-
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_tree_merge_pow2_kernel(
-        uint32_t *out,
-        const uint32_t *candidates,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k,
-        uint32_t n_sets,
-        uint32_t merge_group,
-        uint32_t candidate_stride,
-        uint32_t out_stride) {
-    uint32_t t = blockIdx.x;
-    uint32_t group = blockIdx.y;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-
-    const uint32_t set0 = group * merge_group;
-    if (set0 >= n_sets) return;
-    uint32_t set_count = n_sets - set0;
-    if (set_count > merge_group) set_count = merge_group;
-    const uint32_t candidate_count = set_count * top_k;
-
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        uint32_t idx = UINT32_MAX;
-        float v = -INFINITY;
-        if (i < candidate_count) {
-            idx = cand[i];
-            if (idx < n_comp) v = row[idx];
-        }
-        vals[i] = v;
-        idxs[i] = idx;
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    uint32_t *dst = out + (uint64_t)t * out_stride + group * top_k;
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        dst[i] = idxs[i];
+    const uint32_t row_mask = (uint32_t)((1ull << row_bits) - 1u);
+    for (uint32_t i = tid; i < TOP_K; i += 1024u) {
+        selected[(uint64_t)t * TOP_K + i] = row_mask - (key_lo[i] & row_mask);
     }
 }
 
@@ -909,6 +909,16 @@ static int indexer_scores_launch(
         return 0;
     }
     if (causal && ratio == 0) return 0;
+    /* Below a couple of thousand rows the block-per-row kernel is quicker: a
+     * lone wave of the rows kernel takes over 30 us for its 64 heads. */
+    if (n_tokens == 1u && head_dim == 128u && n_head == 64u && !causal && n_comp > 2048u) {
+        indexer_score_one_rows_kernel<<<(n_comp + 255u) / 256u, 256>>>((float *)scores->ptr,
+                                                                      (const float *)q->ptr,
+                                                                      (const float *)weights->ptr,
+                                                                      (const float *)index_comp->ptr,
+                                                                      n_comp, scale);
+        return cuda_ok(cudaGetLastError(), "indexer score one rows launch");
+    }
     if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
         indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
@@ -1154,66 +1164,18 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         return cuda_ok(cudaGetLastError(), "indexer topk 8192x2048 launch");
     }
     if (top_k == 512u || top_k == 1024u || top_k == 2048u) {
-        const uint32_t chunk_n = 4096u;
-        const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
-        const uint32_t merge_group = chunk_n / top_k;
-        const uint64_t candidate_stride64 = (uint64_t)n_chunks * top_k;
-        if (candidate_stride64 > UINT32_MAX) return 0;
-        const uint32_t candidate_stride = (uint32_t)candidate_stride64;
-        uint32_t n_sets = n_chunks;
-        uint64_t scratch_u32_per_token = candidate_stride;
-        while (n_sets > merge_group) {
-            n_sets = (n_sets + merge_group - 1u) / merge_group;
-            scratch_u32_per_token += (uint64_t)n_sets * top_k;
+        uint32_t row_bits = 1;
+        while (row_bits < 32u && (1ull << row_bits) < n_comp) row_bits++;
+        uint32_t *sel = (uint32_t *)selected->ptr;
+        const float *sc = (const float *)scores->ptr;
+        if (top_k == 512u) {
+            indexer_topk_select_kernel<512><<<n_tokens, 1024>>>(sel, sc, n_comp, n_tokens, row_bits);
+        } else if (top_k == 1024u) {
+            indexer_topk_select_kernel<1024><<<n_tokens, 1024>>>(sel, sc, n_comp, n_tokens, row_bits);
+        } else {
+            indexer_topk_select_kernel<2048><<<n_tokens, 1024>>>(sel, sc, n_comp, n_tokens, row_bits);
         }
-        if (scratch_u32_per_token > UINT64_MAX / n_tokens / sizeof(uint32_t)) return 0;
-        const uint64_t tmp_bytes = (uint64_t)n_tokens * scratch_u32_per_token * sizeof(uint32_t);
-        uint32_t *scratch = (uint32_t *)cuda_tmp_alloc(tmp_bytes, "indexer topk tree");
-        if (!scratch) return 0;
-
-        uint32_t *cur = scratch;
-        n_sets = n_chunks;
-        uint32_t cur_stride = candidate_stride;
-        dim3 grid_chunks(n_tokens, n_chunks, 1);
-        indexer_topk_chunk_pow2_kernel<4096><<<grid_chunks, 1024>>>(cur,
-                                                                    (const float *)scores->ptr,
-                                                                    n_comp,
-                                                                    n_tokens,
-                                                                    top_k,
-                                                                    candidate_stride);
-        if (!cuda_ok(cudaGetLastError(), "indexer topk chunk launch")) return 0;
-
-        while (n_sets > merge_group) {
-            const uint32_t next_sets = (n_sets + merge_group - 1u) / merge_group;
-            const uint32_t next_stride = next_sets * top_k;
-            uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
-            dim3 grid_merge(n_tokens, next_sets, 1);
-            indexer_topk_tree_merge_pow2_kernel<4096><<<grid_merge, 1024>>>(
-                    next,
-                    cur,
-                    (const float *)scores->ptr,
-                    n_comp,
-                    n_tokens,
-                    top_k,
-                    n_sets,
-                    merge_group,
-                    cur_stride,
-                    next_stride);
-            if (!cuda_ok(cudaGetLastError(), "indexer topk tree merge launch")) return 0;
-            cur = next;
-            n_sets = next_sets;
-            cur_stride = next_stride;
-        }
-
-        indexer_topk_merge_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                                 cur,
-                                                                 (const float *)scores->ptr,
-                                                                 n_comp,
-                                                                 n_tokens,
-                                                                 top_k,
-                                                                 n_sets * top_k,
-                                                                 cur_stride);
-        return cuda_ok(cudaGetLastError(), "indexer topk tree final launch");
+        return cuda_ok(cudaGetLastError(), "indexer topk select launch");
     }
     indexer_topk_kernel<<<n_tokens, 1>>>((uint32_t *)selected->ptr,
                                          (const float *)scores->ptr,
