@@ -26,7 +26,8 @@
 #include <stdint.h>
 
 /* DS4 imports IRIS at commit 9873887d4aa0646c650adc5b86b986d2f653b7e0.
- * These limits make the memory decoder suitable for untrusted server input. */
+ * These limits make the memory decoder suitable for untrusted server input.
+ * DS4 also decodes 1/2/4/16-bit samples and Adam7 interlacing (issue #13). */
 #ifndef PNG_MAX_INPUT_BYTES
 #define PNG_MAX_INPUT_BYTES (64u * 1024u * 1024u)
 #endif
@@ -712,33 +713,31 @@ fail:
 static int png_abs(int x) { return x < 0 ? -x : x; }
 
 static int png_unfilter_row(uint8_t *row, const uint8_t *prev_row,
-                            int filter, int width, int channels) {
-    int bpp = channels;
-
+                            int filter, size_t len, size_t bpp) {
     switch (filter) {
         case 0:  /* None */
             break;
         case 1:  /* Sub */
-            for (int i = bpp; i < width * channels; i++) {
+            for (size_t i = bpp; i < len; i++) {
                 row[i] = row[i] + row[i - bpp];
             }
             break;
         case 2:  /* Up */
             if (prev_row) {
-                for (int i = 0; i < width * channels; i++) {
+                for (size_t i = 0; i < len; i++) {
                     row[i] = row[i] + prev_row[i];
                 }
             }
             break;
         case 3:  /* Average */
-            for (int i = 0; i < width * channels; i++) {
+            for (size_t i = 0; i < len; i++) {
                 int a = (i >= bpp) ? row[i - bpp] : 0;
                 int b = prev_row ? prev_row[i] : 0;
                 row[i] = row[i] + (a + b) / 2;
             }
             break;
         case 4:  /* Paeth */
-            for (int i = 0; i < width * channels; i++) {
+            for (size_t i = 0; i < len; i++) {
                 int a = (i >= bpp) ? row[i - bpp] : 0;
                 int b = prev_row ? prev_row[i] : 0;
                 int c = (prev_row && i >= bpp) ? prev_row[i - bpp] : 0;
@@ -754,6 +753,28 @@ static int png_unfilter_row(uint8_t *row, const uint8_t *prev_row,
             return 0;
     }
     return 1;
+}
+
+/* Read sample `index` from an unfiltered scanline. 16-bit samples keep their
+ * high byte; 1/2/4-bit samples are returned unscaled. */
+static unsigned png_row_sample(const uint8_t *row, size_t index, int bit_depth) {
+    if (bit_depth == 8) return row[index];
+    if (bit_depth == 16) return row[index * 2];
+    size_t bit = index * (size_t)bit_depth;
+    unsigned shift = 8u - (unsigned)bit_depth - (unsigned)(bit & 7u);
+    return (row[bit >> 3] >> shift) & ((1u << bit_depth) - 1u);
+}
+
+/* Adam7 pass geometry: x0, y0, dx, dy. Pass 0 of a non-interlaced image
+ * uses {0, 0, 1, 1}. */
+static const uint8_t png_adam7[7][4] = {
+    {0, 0, 8, 8}, {4, 0, 8, 8}, {0, 4, 4, 8}, {2, 0, 4, 4},
+    {0, 2, 2, 4}, {1, 0, 2, 2}, {0, 1, 1, 2},
+};
+static const uint8_t png_single_pass[4] = {0, 0, 1, 1};
+
+static size_t png_pass_extent(int size, int start, int step) {
+    return size > start ? (size_t)(size - start + step - 1) / (size_t)step : 0;
 }
 
 /* ========================================================================
@@ -774,6 +795,7 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
     if (memcmp(data, expected, 8) != 0) return NULL;
 
     int width = 0, height = 0, color_type = -1, bit_depth = 0;
+    int interlace = 0;
     int source_channels = 0;
     int seen_ihdr = 0, seen_idat = 0, seen_iend = 0;
     uint8_t *idat_data = NULL;
@@ -811,9 +833,10 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
             }
             bit_depth = chunk_data[8];
             if (chunk_data[10] != 0 || chunk_data[11] != 0 ||
-                chunk_data[12] != 0) {
+                chunk_data[12] > 1) {
                 goto fail;
             }
+            interlace = chunk_data[12];
             width = (int)parsed_width;
             height = (int)parsed_height;
             color_type = chunk_data[9];
@@ -825,10 +848,14 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
                 case 6: source_channels = 4; break;
                 default: goto fail;
             }
-            if (color_type == 3) {
+            /* Allowed combinations per PNG spec, table 11.1. */
+            if (color_type == 0) {
+                if (bit_depth != 1 && bit_depth != 2 && bit_depth != 4 &&
+                    bit_depth != 8 && bit_depth != 16) goto fail;
+            } else if (color_type == 3) {
                 if (bit_depth != 1 && bit_depth != 2 &&
                     bit_depth != 4 && bit_depth != 8) goto fail;
-            } else if (bit_depth != 8) {
+            } else if (bit_depth != 8 && bit_depth != 16) {
                 goto fail;
             }
             seen_ihdr = 1;
@@ -882,13 +909,21 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
         default: goto fail;
     }
 
-    /* Decompress */
-    size_t row_payload = color_type == 3
-        ? ((size_t)width * (size_t)bit_depth + 7) / 8
-        : (size_t)width * (size_t)source_channels;
-    size_t row_bytes = 1 + row_payload;
-    if ((size_t)height > SIZE_MAX / row_bytes) goto fail;
-    size_t raw_len = (size_t)height * row_bytes;
+    /* Decompress. Each non-empty pass row is a filter byte plus its packed
+     * samples; empty Adam7 passes contribute no bytes. */
+    size_t pixel_bits = (size_t)source_channels * (size_t)bit_depth;
+    size_t filter_bpp = pixel_bits >= 8 ? pixel_bits / 8 : 1;
+    int passes = interlace ? 7 : 1;
+    size_t raw_len = 0;
+    for (int pass = 0; pass < passes; pass++) {
+        const uint8_t *g = interlace ? png_adam7[pass] : png_single_pass;
+        size_t pw = png_pass_extent(width, g[0], g[2]);
+        size_t ph = png_pass_extent(height, g[1], g[3]);
+        if (pw == 0 || ph == 0) continue;
+        size_t row_bytes = 1 + (pw * pixel_bits + 7) / 8;
+        if (ph > (SIZE_MAX - raw_len) / row_bytes) goto fail;
+        raw_len += ph * row_bytes;
+    }
     uint8_t *raw = png_inflate_zlib(idat_data, idat_len, raw_len);
     free(idat_data);
     idat_data = NULL;
@@ -902,44 +937,52 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
         return NULL;
     }
 
-    uint8_t *prev_row = NULL;
+    /* Grayscale below 8 bits is scaled to the full 0..255 range. */
+    unsigned gray_scale = bit_depth < 8 ? 255u / ((1u << bit_depth) - 1u) : 1u;
+    uint8_t *row_data = raw;
+    for (int pass = 0; pass < passes; pass++) {
+        const uint8_t *g = interlace ? png_adam7[pass] : png_single_pass;
+        size_t pw = png_pass_extent(width, g[0], g[2]);
+        size_t ph = png_pass_extent(height, g[1], g[3]);
+        if (pw == 0 || ph == 0) continue;
+        size_t row_payload = (pw * pixel_bits + 7) / 8;
+        uint8_t *prev_row = NULL;
 
-    for (int y = 0; y < height; y++) {
-        uint8_t *row_data = raw + (size_t)y * row_bytes;
-        int filter = row_data[0];
-        uint8_t *row = row_data + 1;
-
-        int filter_width = color_type == 3 ? (int)row_payload : width;
-        int filter_channels = color_type == 3 ? 1 : source_channels;
-        if (!png_unfilter_row(row, prev_row, filter,
-                              filter_width, filter_channels)) {
-            png_free(img);
-            free(raw);
-            return NULL;
-        }
-
-        uint8_t *dst = img->data + (size_t)y * (size_t)width * (size_t)channels;
-        if (color_type == 3) {
-            for (int x = 0; x < width; x++) {
-                size_t bit = (size_t)x * (size_t)bit_depth;
-                unsigned shift = 8u - (unsigned)bit_depth -
-                                 (unsigned)(bit & 7u);
-                size_t index = (row[bit >> 3] >> shift) &
-                               ((1u << bit_depth) - 1u);
-                if (index >= palette_entries) {
-                    png_free(img);
-                    free(raw);
-                    return NULL;
-                }
-                dst[(size_t)x * channels + 0] = palette[index * 3 + 0];
-                dst[(size_t)x * channels + 1] = palette[index * 3 + 1];
-                dst[(size_t)x * channels + 2] = palette[index * 3 + 2];
-                if (channels == 4) dst[(size_t)x * 4 + 3] = palette_alpha[index];
+        for (size_t py = 0; py < ph; py++) {
+            int filter = row_data[0];
+            uint8_t *row = row_data + 1;
+            if (!png_unfilter_row(row, prev_row, filter, row_payload, filter_bpp)) {
+                png_free(img);
+                free(raw);
+                return NULL;
             }
-        } else {
-            memcpy(dst, row, (size_t)width * (size_t)channels);
+
+            size_t y = g[1] + py * g[3];
+            uint8_t *dst_row = img->data + y * (size_t)width * (size_t)channels;
+            for (size_t px = 0; px < pw; px++) {
+                uint8_t *dst = dst_row + (g[0] + px * g[2]) * (size_t)channels;
+                if (color_type == 3) {
+                    size_t index = png_row_sample(row, px, bit_depth);
+                    if (index >= palette_entries) {
+                        png_free(img);
+                        free(raw);
+                        return NULL;
+                    }
+                    dst[0] = palette[index * 3 + 0];
+                    dst[1] = palette[index * 3 + 1];
+                    dst[2] = palette[index * 3 + 2];
+                    if (channels == 4) dst[3] = palette_alpha[index];
+                } else {
+                    size_t base = px * (size_t)source_channels;
+                    for (int c = 0; c < source_channels; c++) {
+                        dst[c] = (uint8_t)(png_row_sample(row, base + (size_t)c,
+                                                          bit_depth) * gray_scale);
+                    }
+                }
+            }
+            prev_row = row;
+            row_data += 1 + row_payload;
         }
-        prev_row = row;
     }
 
     free(raw);

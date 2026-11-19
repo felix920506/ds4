@@ -10,7 +10,7 @@ static int hex_fingerprint(const uint8_t *fp, char *out, size_t cap) {
     return 1;
 }
 
-static int check_jpeg(const char *path, uint32_t width, uint32_t height,
+static int check_decode(const char *path, uint32_t width, uint32_t height,
                       const char *expected_fp) {
     ds4_image image = {0};
     char error[160] = {0};
@@ -30,6 +30,28 @@ static int check_jpeg(const char *path, uint32_t width, uint32_t height,
     ds4_image_free(&image);
     return ok;
 }
+
+/* PNG variants that IRIS used to reject (issue #13). Each set decodes to the
+ * same pixels as its 8-bit source: RGB, 4-level gray, or black/white. The
+ * fixtures are 13x11 so Adam7 has partial passes and sub-byte rows pad. */
+static const struct {
+    const char *name;
+    uint32_t width, height;
+    const char *fp;
+} png_cases[] = {
+    {"rgb16.png", 13u, 11u, "622047850ba6198c5bedf6b4dd5a99ec0078d5a65e40f5e1a35e3d60ccc25efb"},
+    {"rgba16.png", 13u, 11u, "622047850ba6198c5bedf6b4dd5a99ec0078d5a65e40f5e1a35e3d60ccc25efb"},
+    {"gray16.png", 13u, 11u, "75194fa2300eeca09e7a06cb05e18c9d0bbc7b8d1e8877dd70abbf8b1689868f"},
+    {"graya16.png", 13u, 11u, "75194fa2300eeca09e7a06cb05e18c9d0bbc7b8d1e8877dd70abbf8b1689868f"},
+    {"gray4.png", 13u, 11u, "75194fa2300eeca09e7a06cb05e18c9d0bbc7b8d1e8877dd70abbf8b1689868f"},
+    {"gray2.png", 13u, 11u, "75194fa2300eeca09e7a06cb05e18c9d0bbc7b8d1e8877dd70abbf8b1689868f"},
+    {"gray1.png", 13u, 11u, "f10f1fc9c01dbaeac6df50be035855f098b4e7735d20791ea3248052303ac6e3"},
+    {"rgb8_adam7.png", 13u, 11u, "622047850ba6198c5bedf6b4dd5a99ec0078d5a65e40f5e1a35e3d60ccc25efb"},
+    {"rgba8_adam7.png", 13u, 11u, "622047850ba6198c5bedf6b4dd5a99ec0078d5a65e40f5e1a35e3d60ccc25efb"},
+    {"rgba16_adam7.png", 13u, 11u, "622047850ba6198c5bedf6b4dd5a99ec0078d5a65e40f5e1a35e3d60ccc25efb"},
+    {"gray1_adam7.png", 13u, 11u, "f10f1fc9c01dbaeac6df50be035855f098b4e7735d20791ea3248052303ac6e3"},
+    {"gray2_adam7.png", 13u, 11u, "75194fa2300eeca09e7a06cb05e18c9d0bbc7b8d1e8877dd70abbf8b1689868f"},
+};
 
 static int check_jpeg_rejected(const char *path) {
     ds4_image image = {0};
@@ -76,14 +98,14 @@ static int check_jpeg_sos_rejected(uint8_t ss, uint8_t se) {
 int main(void) {
     /* 24x16 grayscale progressive JPEG. Unpatched Iris yields different
      * pixels; patched decode matches libjpeg-turbo djpeg bit-exactly. */
-    if (!check_jpeg("tests/vision-fixtures/jpeg/prog_ac_refine_zrl_gray.jpg",
+    if (!check_decode("tests/vision-fixtures/jpeg/prog_ac_refine_zrl_gray.jpg",
                     24u, 16u,
                     "63aae8863e829170c5abc746c90a5ff3ad60e9c4312e2ffa5eefbfeaacd26bfc"))
         return 1;
     /* 64x48 4:2:0 progressive JPEG. Unpatched jpeg_load returns NULL.
      * After the ZRL fix plus main's chroma interpolation, decode matches
      * libjpeg-turbo djpeg bit-exactly. */
-    if (!check_jpeg("tests/vision-fixtures/jpeg/prog_ac_refine_zrl_420.jpg",
+    if (!check_decode("tests/vision-fixtures/jpeg/prog_ac_refine_zrl_420.jpg",
                     64u, 48u,
                     "d3be4d7078c41b6589942c82bd622ca8a3ed40adddee11cccf1de9ca1a096ba4"))
         return 1;
@@ -93,5 +115,13 @@ int main(void) {
         return 1;
     /* DC scans must have Se == 0. */
     if (!check_jpeg_sos_rejected(0, 5)) return 1;
+    for (size_t i = 0; i < sizeof(png_cases) / sizeof(png_cases[0]); i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "tests/vision-fixtures/png/%s",
+                 png_cases[i].name);
+        if (!check_decode(path, png_cases[i].width, png_cases[i].height,
+                        png_cases[i].fp))
+            return 1;
+    }
     return 0;
 }
