@@ -150,8 +150,8 @@ It is also where a slot's conversation goes when the slot is kicked for memory
 that should survive that.
 
 When the budget is full, the least recently used checkpoints go first: one
-that was stored or loaded minutes ago outlives one idle for days, whatever its
-size or old hit count. Three things adjust that order. Recent hits and a
+that was stored or loaded a minute ago outlives one idle for ten, and one from
+today outlives one from last month, whatever its size or old hit count. Three things adjust that order. Recent hits and a
 checkpoint's tokens per byte count in its favour; a cold checkpoint, which new
 conversations with the same system prompt start from, gets a bonus; and a
 checkpoint that a longer one of the same conversation already extends is

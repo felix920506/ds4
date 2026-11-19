@@ -677,6 +677,29 @@ static void scenario_weekend(void) {
     sim_close(&s, "weekend");
 }
 
+/* A busy single slot: eight conversations of up to 30k tokens, a request every
+ * few seconds, a tenth of them with an edited reply, a crash every 60 turns,
+ * and a budget that holds about six tips.  Everything in the cache is minutes
+ * old, so only an ordering that separates minutes keeps the right ones.  This
+ * is the shape of the real-model soak the policy was checked against. */
+static void scenario_busy(void) {
+    sim s;
+    sim_open(&s, 2500, 1, 4096, 2048, 512, 30000);
+    int active[8], len[SIM_MAX_CONVS] = {0};
+    for (int i = 0; i < 8; i++) active[i] = add_conv(&s, i % 2, 1900);
+    for (int turn = 0; turn < 600; turn++) {
+        double u = rng_unit();
+        int k = (int)(8.0 * u * u), ci = active[k];
+        if (len[ci] > 30000) ci = active[k] = add_conv(&s, k % 2, 1900);
+        if (len[ci] == 0) len[ci] = 1900;
+        len[ci] += rng_range(450, 2400);
+        if (turn % 60 == 59) crash(&s);
+        request(&s, ci, len[ci], rng_unit() < 0.1);
+        sim_now += (uint64_t)rng_range(1, 4);
+    }
+    sim_close(&s, "busy");
+}
+
 /* Chat where a quarter of the turns edit or regenerate an earlier message, so
  * the prompt forks off somewhere in the last third of the conversation.  Only
  * a checkpoint from before the fork helps. */
@@ -838,7 +861,7 @@ static void scenario_bench(void) {
 
 int main(int argc, char **argv) {
     static const char *all[] = {"issue21", "tiny", "chat", "chat-rewrite", "long", "weekend",
-                                "branch", "agent", "small", "slots", "reprefill"};
+                                "branch", "agent", "small", "slots", "reprefill", "busy"};
     int n = argc > 1 ? argc - 1 : (int)(sizeof(all) / sizeof(all[0]));
     for (int i = 0; i < n; i++) {
         const char *name = argc > 1 ? argv[i + 1] : all[i];
@@ -853,6 +876,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(name, "small")) scenario_small();
         else if (!strcmp(name, "slots")) scenario_slots();
         else if (!strcmp(name, "reprefill")) scenario_reprefill();
+        else if (!strcmp(name, "busy")) scenario_busy();
         else if (!strcmp(name, "bench")) scenario_bench();
         else { fprintf(stderr, "unknown scenario %s\n", name); return 2; }
     }

@@ -47,10 +47,14 @@
 /* Eviction policy.
  *
  * The cache is least-recently-used first: an entry's score falls with the time
- * since it was last stored or loaded, as scale / (scale + idle).  A hyperbola
- * and not an exponential, so that entries idle for a week and for three months
- * are still told apart.  Without this term a full cache keeps old dense
- * checkpoints for ever and evicts every new frontier within a minute.
+ * since it was last stored or loaded, as scale / (scale + idle).  The scale is
+ * two minutes, so past that the score is close to 1 / idle and the order holds
+ * at every range: ten minutes against one, a week against a day.  A longer
+ * scale makes everything written inside it look equally fresh, and a busy
+ * server replaces its whole cache in less time than that; an exponential
+ * would leave everything old tied at zero.  Without this term a full cache
+ * keeps old dense checkpoints for ever and evicts every new frontier within a
+ * minute of writing it.
  *
  * Three things adjust that order, each because it changes what evicting the
  * entry would cost in prefill:
@@ -60,19 +64,24 @@
  *     from, so they get a fixed bonus.
  *   - A checkpoint that a longer one extends is redundant while the longer one
  *     is there: a prompt that reaches the longer one never loads the shorter.
- *     It keeps only the share of its score that a fork between the two would
- *     need it for, the gap between them as a fraction of the longer text.
- *     A conversation's old tips, a few turns short of the current one, go
- *     first; a frontier at half its length keeps half its score.
+ *     Only a prompt that forks between the two needs it, so its score is
+ *     scaled by the square of the gap between them as a fraction of the
+ *     longer text.  A conversation's old tips, a few turns short of the
+ *     current one, keep next to nothing and go before anything else; a
+ *     frontier at half its length keeps a quarter.
+ *
+ * The discount has to be this strong because the recency scale is short: a
+ * redundant entry is by its nature recent, and must still lose to another
+ * conversation's only checkpoint from an hour ago.
  *
  * A tip written when a slot gave up its state ends in generated text that the
  * client may rewrite, so until something loads it, it is not known to be a
  * prefix of any later prompt.  What it extends is discounted less: that entry
  * is the fallback if the tip turns out to be dead. */
-#define KV_CACHE_IDLE_SCALE_SECONDS (2ull * 60ull * 60ull)
+#define KV_CACHE_IDLE_SCALE_SECONDS 120ull
 #define KV_CACHE_COLD_SCORE_FACTOR 2.0
-#define KV_CACHE_COVERED_MIN_FACTOR 0.02
-#define KV_CACHE_COVERED_BY_UNPROVEN_TIP_MIN_FACTOR 0.25
+#define KV_CACHE_COVERED_MIN_FACTOR 0.0005
+#define KV_CACHE_COVERED_BY_UNPROVEN_TIP_MIN_FACTOR 0.05
 
 /* Whether one checkpoint extends another is decided on a signature of its
  * text: a running hash sampled every KV_SIG_GRID bytes, computed once per file
@@ -594,6 +603,7 @@ static double kv_cover_factor(const ds4_kvstore_entry *e, const kv_cover *c) {
     if (by == 0) return 1.0;
     double gap = by > e->text_bytes ?
         (double)(by - e->text_bytes) / (double)by : 0.0;
+    gap *= gap;
     return gap > least ? gap : least;
 }
 
