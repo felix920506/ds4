@@ -17407,7 +17407,15 @@ typedef struct {
 
 enum { DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS = 64 };
 
+/* The indexer scratch of every session that shares it (see "On-demand context
+ * memory"): the two tensors, and the graphs whose pointers follow them. */
+struct ds4_gpu_graph;
 typedef struct {
+    ds4_gpu_tensor *tensor[2]; /* scores, top-k mask */
+    struct ds4_gpu_graph *users;
+} ds4_kv_scratch;
+
+typedef struct ds4_gpu_graph {
     /* Class P — per-tier replicated kernel scratch buffers.
      * Each used tier has its own copy; active_tier names the slot the
      * current dispatch step reads/writes. Single-tier paths leave
@@ -17487,6 +17495,11 @@ typedef struct {
      * committed size is the tensor size. */
     const ds4_memory_pressure *kv_on_demand;
     bool kv_managed; /* the KV caches live in managed (movable) memory */
+    /* Non-NULL when the indexer scratch is the engine's, shared by its
+     * sessions; kv_scratch_need is what this session last asked of it. */
+    ds4_kv_scratch *kv_scratch;
+    struct ds4_gpu_graph *kv_scratch_next;
+    uint64_t kv_scratch_need;
 
     /* Class P (per-layer work tensors). Each used tier has its
      * own replica. They are reused in place by every layer instead of
@@ -18198,6 +18211,24 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     g->owns_prefill_workspace = false;
 }
 
+/* Detach g from a shared indexer scratch.  Returns whether g now owns the two
+ * tensors and has to free them: it never shared them, or it was the last
+ * session that did. */
+static bool metal_graph_kv_scratch_leave(ds4_gpu_graph *g) {
+    ds4_kv_scratch *pool = g->kv_scratch;
+    if (!pool) return true;
+    g->kv_scratch = NULL;
+    for (ds4_gpu_graph **u = &pool->users; *u; u = &(*u)->kv_scratch_next) {
+        if (*u != g) continue;
+        *u = g->kv_scratch_next;
+        g->kv_scratch_next = NULL;
+        if (pool->users) return false;
+        pool->tensor[0] = pool->tensor[1] = NULL;
+        return true;
+    }
+    return false; /* never joined: the pointers are not g's */
+}
+
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
     /* Captured decode-island graphs bake this graph's buffer addresses
@@ -18271,9 +18302,13 @@ static void metal_graph_free(ds4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->index_comp_sc_cur_by_tier[t]);
         ds4_gpu_tensor_free(g->comp_kv_cur_by_tier[t]);
         ds4_gpu_tensor_free(g->attn_comp_stage_by_tier[t]);
-        ds4_gpu_tensor_free(g->comp_mask_by_tier[t]);
+        if (t != 0 || metal_graph_kv_scratch_leave(g)) {
+            ds4_gpu_tensor_free(g->comp_mask_by_tier[t]);
+            ds4_gpu_tensor_free(g->indexer_scores_by_tier[t]);
+        }
+        g->comp_mask_by_tier[t] = NULL;
+        g->indexer_scores_by_tier[t] = NULL;
         ds4_gpu_tensor_free(g->comp_selected_by_tier[t]);
-        ds4_gpu_tensor_free(g->indexer_scores_by_tier[t]);
         ds4_gpu_tensor_free(g->indexer_weights_by_tier[t]);
         ds4_gpu_tensor_free(g->indexer_q_by_tier[t]);
     }
@@ -18656,6 +18691,10 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
  *     tokens: geometric growth, valid rows copied to the new tensor;
  *   - the indexer score and top-k mask scratch, one float per (visible row,
  *     chunk token): grown to what the current step needs, nothing to copy.
+ *     A layer fills it and reads it back before the next layer starts, so
+ *     where sessions already take turns on the GPU (a batched server, a
+ *     pipeline worker: the engines that share the prefill workspace) they
+ *     share one scratch, as large as the longest of them needs.
  *
  * Kernels receive valid row counts, never capacities, so only the allocation
  * moves.  Growth happens at the top of a layer, before the layer creates a
@@ -18840,20 +18879,59 @@ static bool metal_graph_kv_reserve_rows(
                                  g->kv_managed);
 }
 
-static bool metal_graph_kv_reserve_scratch(ds4_gpu_graph *g, uint64_t need_bytes) {
-    ds4_gpu_tensor **scratch[2] = {
-        &g->indexer_scores_by_tier[0], &g->comp_mask_by_tier[0],
-    };
+/* Resize one of the two indexer scratch tensors (0 scores, 1 mask).  A shared
+ * one moves under every session that uses it, on failure too: the tensor is
+ * reallocated either way. */
+static bool metal_graph_kv_scratch_resize(ds4_gpu_graph *g, int i, uint64_t bytes) {
+    ds4_gpu_tensor **slot = i ? &g->comp_mask_by_tier[0]
+                              : &g->indexer_scores_by_tier[0];
+    const bool ok = metal_graph_kv_resize(g, slot, bytes, 0, false);
+    if (g->kv_scratch) {
+        g->kv_scratch->tensor[i] = *slot;
+        for (ds4_gpu_graph *u = g->kv_scratch->users; u; u = u->kv_scratch_next) {
+            *(i ? &u->comp_mask_by_tier[0] : &u->indexer_scores_by_tier[0]) = *slot;
+        }
+    }
+    return ok;
+}
+
+/* Scratch to commit for a step that needs need_bytes.  Nothing is copied, so
+ * a quarter of slack is enough to keep a long prefill from reallocating at
+ * every chunk; doubling would hold gigabytes the weight cache could use. */
+static uint64_t metal_graph_kv_scratch_bytes_for(const ds4_gpu_graph *g, uint64_t need_bytes) {
     const uint64_t reserved = metal_graph_kv_scratch_bytes(g, true);
+    const uint64_t bytes = need_bytes + need_bytes / 4u;
+    return bytes < reserved ? bytes : reserved;
+}
+
+static bool metal_graph_kv_reserve_scratch(ds4_gpu_graph *g, uint64_t need_bytes) {
+    if (need_bytes > metal_graph_kv_scratch_bytes(g, true)) return true;
+    if (need_bytes > g->kv_scratch_need) g->kv_scratch_need = need_bytes;
     for (int i = 0; i < 2; i++) {
-        const uint64_t have = ds4_gpu_tensor_bytes(*scratch[i]);
-        if (need_bytes <= have || need_bytes > reserved) continue;
-        /* Nothing is copied, so a quarter of slack is enough to keep a long
-         * prefill from reallocating at every chunk; doubling would hold
-         * gigabytes the weight cache could use. */
-        uint64_t bytes = need_bytes + need_bytes / 4u;
-        if (bytes > reserved) bytes = reserved;
-        if (!metal_graph_kv_resize(g, scratch[i], bytes, 0, false)) return false;
+        const ds4_gpu_tensor *t = i ? g->comp_mask_by_tier[0]
+                                    : g->indexer_scores_by_tier[0];
+        if (need_bytes <= ds4_gpu_tensor_bytes(t)) continue;
+        if (!metal_graph_kv_scratch_resize(
+                    g, i, metal_graph_kv_scratch_bytes_for(g, need_bytes))) return false;
+    }
+    return true;
+}
+
+/* Give the scratch back when a session is reset: down to the minimum, or to
+ * what the other sessions sharing it still use. */
+static bool metal_graph_kv_scratch_refit(ds4_gpu_graph *g) {
+    uint64_t bytes = metal_graph_kv_scratch_bytes(g, false);
+    g->kv_scratch_need = 0;
+    for (const ds4_gpu_graph *u = g->kv_scratch ? g->kv_scratch->users : NULL;
+         u; u = u->kv_scratch_next) {
+        const uint64_t used = metal_graph_kv_scratch_bytes_for(u, u->kv_scratch_need);
+        if (used > bytes) bytes = used;
+    }
+    for (int i = 0; i < 2; i++) {
+        const ds4_gpu_tensor *t = i ? g->comp_mask_by_tier[0]
+                                    : g->indexer_scores_by_tier[0];
+        if (bytes < ds4_gpu_tensor_bytes(t) &&
+            !metal_graph_kv_scratch_resize(g, i, bytes)) return false;
     }
     return true;
 }
@@ -18906,16 +18984,7 @@ static bool metal_graph_kv_refit(
                 !metal_graph_kv_resize(g, cache, bytes, 0, g->kv_managed)) return false;
         }
     }
-    if (n_comp) return true;
-    const uint64_t scratch_bytes = metal_graph_kv_scratch_bytes(g, false);
-    ds4_gpu_tensor **scratch[2] = {
-        &g->indexer_scores_by_tier[0], &g->comp_mask_by_tier[0],
-    };
-    for (int i = 0; i < 2; i++) {
-        if (scratch_bytes != ds4_gpu_tensor_bytes(*scratch[i]) &&
-            !metal_graph_kv_resize(g, scratch[i], scratch_bytes, 0, false)) return false;
-    }
-    return true;
+    return n_comp || metal_graph_kv_scratch_refit(g);
 }
 
 /* The same for a checkpoint shard that carries only layers
@@ -19643,6 +19712,7 @@ static bool metal_graph_alloc_raw_cap(
         const ds4_gpu_graph    *shared_prefill_workspace) {
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
     const ds4_memory_pressure *const kv_on_demand = g->kv_on_demand;
+    ds4_kv_scratch *const kv_scratch = kv_on_demand ? g->kv_scratch : NULL;
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
     g->kv_on_demand = kv_on_demand;
@@ -19998,10 +20068,23 @@ static bool metal_graph_alloc_raw_cap(
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
-        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+        if (kv_scratch && kv_scratch->users) {
+            /* Later steps grow it if this session reserves more. */
+            g->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
+            g->comp_mask_by_tier[t] = kv_scratch->tensor[1];
+        } else {
+            g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
+                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+            g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
+                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+        }
+        if (kv_scratch) { /* on demand: tier 0 is the only one */
+            kv_scratch->tensor[0] = g->indexer_scores_by_tier[t];
+            kv_scratch->tensor[1] = g->comp_mask_by_tier[t];
+            g->kv_scratch = kv_scratch;
+            g->kv_scratch_next = kv_scratch->users;
+            kv_scratch->users = g;
+        }
         g->comp_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                 (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) * pc * sizeof(uint32_t));
         g->heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_dim * sizeof(float));
@@ -45226,6 +45309,7 @@ struct ds4_engine {
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
+    ds4_kv_scratch kv_scratch; /* with the workspace, when on demand */
     /* Qwen keeps the same idea in its own graph shape; the first session
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
@@ -77288,7 +77372,9 @@ static int ds4_session_attach_distributed(ds4_session *s, ds4_engine *e,
  * full, and tensor-parallel ranks mirror allocations across processes, so
  * those keep the up-front allocation Metal and CUDA use.
  * DS4_ROCM_KV_UPFRONT=1 forces it for A/B validation; a pipeline needs it on
- * no particular stage, since stages do not see each other's allocations. */
+ * no particular stage, since stages do not see each other's allocations.
+ * DS4_ROCM_KV_PRIVATE_SCRATCH=1 likewise gives every session its own indexer
+ * scratch. */
 static bool ds4_engine_kv_on_demand(const ds4_engine *e) {
 #ifdef DS4_ROCM_BUILD
     return e->backend == DS4_BACKEND_CUDA && !e->ssd_streaming && !e->multi_tier &&
@@ -77635,6 +77721,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             : NULL;
     s->graph.dspark_exec_tier = e->multi_tier ? e->dspark_exec_tier : 0;
     s->graph.kv_on_demand = ds4_engine_kv_on_demand(e) ? &e->memory_pressure : NULL;
+    /* Sessions that alias the prefill workspace never overlap on the GPU, so
+     * they can alias the indexer scratch as well. */
+    s->graph.kv_scratch = e->share_session_prefill_workspace &&
+                          getenv("DS4_ROCM_KV_PRIVATE_SCRATCH") == NULL
+        ? &e->kv_scratch : NULL;
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap,
                                    need_spec_verifier,
@@ -91328,7 +91419,10 @@ uint64_t ds4_session_context_memory_bytes(const ds4_session *s) {
                  ds4_gpu_tensor_bytes(g->layer_attn_comp_cache[il]) +
                  ds4_gpu_tensor_bytes(g->layer_index_comp_cache[il]);
     }
-    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+    /* A shared scratch stays behind for the other sessions. */
+    const bool scratch_stays = g->kv_scratch && g->kv_scratch->users &&
+        (g->kv_scratch->users != g || g->kv_scratch_next);
+    for (int t = 0; !scratch_stays && t < DS4_MAX_GPUS; t++) {
         bytes += ds4_gpu_tensor_bytes(g->indexer_scores_by_tier[t]) +
                  ds4_gpu_tensor_bytes(g->comp_mask_by_tier[t]);
     }

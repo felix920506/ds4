@@ -71,6 +71,12 @@ nothing. With a 1M reservation, 2K-token prefill is 466 tok/s instead of 153,
 because the Q8->F16 weight cache keeps the memory the context is not using.
 `DS4_ROCM_KV_UPFRONT=1` restores up-front allocation for comparison.
 
+Sessions that take turns on the GPU (the slots of `--batched-session`, the
+sessions of a pipeline worker) share one indexer scratch, sized for the
+longest of them, instead of holding one each: at 1M tokens that is 4 to 8 GiB
+per extra session. `DS4_ROCM_KV_PRIVATE_SCRATCH=1` gives each session its own
+again.
+
 When an allocation does not fit, memory is taken back in this order:
 
 1. Idle server slots: saved to the disk KV cache and freed (see
