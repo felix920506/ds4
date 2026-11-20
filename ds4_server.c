@@ -11938,15 +11938,22 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+/* The token count at which the slot's session is due a continued checkpoint
+ * right now, or 0.  The progress reports of a pipelined prefill arrive while
+ * the session's timeline is ahead of its logits, so nothing is due then; the
+ * last report comes after the logits. */
+static int kv_cache_slot_continued_due(server *s, server_slot *slot) {
+    if (ds4_session_prefill_in_flight(slot->session)) return 0;
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    return tokens ? kv_cache_slot_continued_target(s, slot, tokens->len) : 0;
+}
+
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
-    kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
-    const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
+    const int target = kv_cache_slot_continued_due(s, slot);
     if (target == 0) return;
-    if (kv_cache_store_live_prefix(s, slot, tokens, target, "continued")) {
-        (void)kc;
+    if (kv_cache_store_live_prefix(s, slot, ds4_session_tokens(slot->session),
+                                   target, "continued")) {
         kv_cache_slot_note_store(slot, target);
     }
 }
@@ -23786,6 +23793,38 @@ static void test_prefill_slices_stop_at_continued_frontiers(void) {
     TEST_ASSERT(kv_cache_slot_continued_next_target(&s, &slot, 4096) == 0);
 }
 
+/* Issue #31: a pipelined prefill reports progress while the coordinator's
+ * timeline is ahead of its logits.  A session standing on a due count is not
+ * a checkpoint then, neither for the server nor for the engine. */
+static void test_kv_cache_continued_skips_prefill_in_flight(void) {
+    server s = {0};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.continued_interval_tokens = 1024;
+    s.kv.opt.boundary_align_tokens = 0;
+    int tok[1024];
+    for (int i = 0; i < 1024; i++) tok[i] = i + 1;
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(tok, 1024);
+    TEST_ASSERT(kv_cache_slot_continued_due(&s, &slot) == 1024);
+
+    ds4_session_set_prefill_in_flight(slot.session, true);
+    TEST_ASSERT(kv_cache_slot_continued_due(&s, &slot) == 0);
+    char err[160] = {0};
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(ds4_session_save_payload(slot.session, fp, err, sizeof(err)) != 0);
+        TEST_ASSERT(strstr(err, "pipelined prefill") != NULL);
+        TEST_ASSERT(ftell(fp) == 0);
+        fclose(fp);
+    }
+
+    ds4_session_set_prefill_in_flight(slot.session, false);
+    TEST_ASSERT(kv_cache_slot_continued_due(&s, &slot) == 1024);
+    ds4_session_free_test_checkpoint(slot.session);
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -26161,6 +26200,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_continued_next_target();
     test_prefill_slices_stop_at_continued_frontiers();
+    test_kv_cache_continued_skips_prefill_in_flight();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();

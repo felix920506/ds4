@@ -3516,6 +3516,9 @@ static void dist_prefill_reader_emit_progress(
 
     while (*reported < completed) {
         (*reported)++;
+        /* The last chunk is reported by the caller once its logits are in the
+         * session: a report is where a checkpoint may be saved. */
+        if (*reported == reader->count) break;
         uint32_t rel = reader->chunk_offsets[*reported];
         uint32_t current = reader->progress_base + rel;
         if (current > reader->progress_total) current = reader->progress_total;
@@ -4094,11 +4097,19 @@ static int dist_coordinator_prefill_prompt_pipelined(
                                  &chunk_offsets, &chunk_count, err, errlen) != 0) {
         return 1;
     }
+    /* The local layers run ahead of the worker's acknowledgements and only
+     * the last chunk returns logits, so until then the session's timeline is
+     * ahead of its logits.  Keep it marked as unsaveable for that time: the
+     * progress reports in between would otherwise let ds4-server write a KV
+     * checkpoint that holds the logits of an older frontier. */
+    ds4_session_set_prefill_in_flight(session, true);
     const int rc = dist_coordinator_prefill_prompt_pipelined_chunks(
             state, session, plan, prompt, span_start, n_tokens, reset_first_chunk,
             first_chunk_flags, chunk_cap, chunk_offsets, chunk_count, session_id, request_id,
             logits, err, errlen);
+    ds4_session_set_prefill_in_flight(session, false);
     free(chunk_offsets);
+    if (rc == 0) dist_report_prefill_progress(session, span_start + n_tokens, (uint32_t)prompt->len);
     return rc;
 }
 
