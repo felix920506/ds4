@@ -63742,12 +63742,6 @@ typedef struct ds4_dspark_spec_stats {
 
 #endif
 
-typedef struct {
-    uint32_t token_start;
-    uint32_t token_count;
-    uint8_t fingerprint[32];
-} ds4_vision_identity;
-
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -79690,6 +79684,87 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 
 bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
+}
+
+bool ds4_session_vision_identities(const ds4_session *s,
+                                   ds4_vision_identity **out, size_t *count) {
+    if (out) *out = NULL;
+    if (count) *count = 0;
+    if (!s || !out || !count || !s->checkpoint_valid) return false;
+    const uint64_t frontier = (uint64_t)s->checkpoint.len;
+    /* During a sync the checkpoint advances chunk by chunk while the stored
+     * list still describes the state before it; the request's images are
+     * the ones the new rows were conditioned on. */
+    const bool syncing = s->sync_image_count != 0;
+    const size_t total = syncing ? s->sync_image_count : s->checkpoint_image_count;
+    size_t n = 0;
+    for (; n < total; n++) {
+        const uint64_t start = syncing ? s->sync_images[n].token_start :
+                                         s->checkpoint_images[n].token_start;
+        const uint64_t rows = syncing ? s->sync_images[n].embedding.token_count :
+                                        s->checkpoint_images[n].token_count;
+        if (start >= frontier) break;
+        if (start + rows > frontier) return false;
+    }
+    if (n == 0) return true;
+    ds4_vision_identity *copy = calloc(n, sizeof(copy[0]));
+    if (!copy) return false;
+    for (size_t i = 0; i < n; i++) {
+        if (!syncing) {
+            copy[i] = s->checkpoint_images[i];
+            continue;
+        }
+        copy[i].token_start = s->sync_images[i].token_start;
+        copy[i].token_count = s->sync_images[i].embedding.token_count;
+        memcpy(copy[i].fingerprint, s->sync_images[i].embedding.fingerprint,
+               sizeof(copy[i].fingerprint));
+    }
+    *out = copy;
+    *count = n;
+    return true;
+}
+
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_identity *images,
+                                           size_t count) {
+    if (!s || !s->checkpoint_valid || (count != 0 && !images)) return false;
+    const uint64_t frontier = (uint64_t)s->checkpoint.len;
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < count; i++) {
+        const uint64_t end = (uint64_t)images[i].token_start + images[i].token_count;
+        if (images[i].token_count == 0 || images[i].token_start < previous_end ||
+            end > frontier) return false;
+        previous_end = end;
+    }
+    ds4_vision_identity *copy = NULL;
+    if (count != 0) {
+        if (count > SIZE_MAX / sizeof(copy[0])) return false;
+        copy = malloc(count * sizeof(copy[0]));
+        if (!copy) return false;
+        memcpy(copy, images, count * sizeof(copy[0]));
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = count;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* The payload loader rebuilt the Engram n-gram tail from the tokens alone.
+     * Image rows are masked out of it during prefill, so mask them again. */
+    if (ds4_session_is_ds41(s)) {
+        for (uint64_t i = 0; i < DS4_ENGRAM_NGRAM - 1 && i < frontier; i++) {
+            const uint64_t pos = frontier - 1u - i;
+            for (size_t j = 0; j < count; j++) {
+                if (pos >= images[j].token_start &&
+                    pos - images[j].token_start < images[j].token_count)
+                    s->ds41_graph.history.tail[i] = DS4_ENGRAM_DEAD;
+            }
+        }
+    }
+#endif
+    return true;
+}
+
+bool ds4_session_payload_restores_vision(const ds4_session *s) {
+    return s && !(s->engine && s->engine->tp.active);
 }
 
 static bool ds4_session_vision_range_overlaps(

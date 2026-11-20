@@ -546,6 +546,6 @@ make test-web-recovery
 
 The agent can save an already-full text transcript without a KV payload.
 Restart with a larger `--ctx`, then `/switch` to the saved session and
-`/compact` to recover room. Sessions containing images still use the existing
-save restriction. Automatic compaction reserves summary space and continues
+`/compact` to recover room. Sessions containing images need their KV payload
+and cannot be saved this way. Automatic compaction reserves summary space and continues
 interrupted generation through the existing agent compaction path.
