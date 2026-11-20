@@ -63900,6 +63900,9 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    /* A pipelined distributed prefill is under way: the timeline is ahead of
+     * the logits and of the remote stages, so there is nothing to save. */
+    bool prefill_in_flight;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
@@ -66642,6 +66645,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 static int ds4_session_save_payload_unmetered(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
+        return 1;
+    }
+    if (s->prefill_in_flight) {
+        payload_set_err(err, errlen, "session is in the middle of a pipelined prefill");
         return 1;
     }
     if (s->distributed) {
@@ -78167,6 +78174,14 @@ void ds4_session_remote_yield(ds4_session *s, bool acquire) {
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total) {
     if (!s || !s->progress || !event) return;
     s->progress(s->progress_ud, event, current, total);
+}
+
+void ds4_session_set_prefill_in_flight(ds4_session *s, bool in_flight) {
+    if (s) s->prefill_in_flight = in_flight;
+}
+
+bool ds4_session_prefill_in_flight(const ds4_session *s) {
+    return s && s->prefill_in_flight;
 }
 
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {

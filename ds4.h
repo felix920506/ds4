@@ -467,6 +467,14 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
+/* A pipelined distributed prefill runs the coordinator's layers ahead of the
+ * stages behind it, and only its last chunk returns logits.  While it is under
+ * way the session's timeline is therefore ahead of its logits and of the
+ * remote KV, although progress is still reported as chunks are acknowledged.
+ * The coordinator marks the session for that time; a marked session is not a
+ * checkpoint and ds4_session_save_payload() refuses it. */
+void ds4_session_set_prefill_in_flight(ds4_session *s, bool in_flight);
+bool ds4_session_prefill_in_flight(const ds4_session *s);
 /* Lend the executor out while a distributed coordinator session waits on a
  * remote stage.  During ds4_session_sync() the coordinator calls
  * fn(ud, false) once its local layer slice has finished and been read back,
