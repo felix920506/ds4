@@ -86,6 +86,10 @@ typedef struct {
     struct ds4_kvstore_sig *sig;
     int sig_len;
     int sig_cap;
+    /* Dead tips seen lately; see ds4_kvstore.c. */
+    struct ds4_kvstore_mark *mark;
+    int mark_len;
+    int mark_next;
 } ds4_kvstore;
 
 /* One image of a saved checkpoint.  text_offset is where its marker starts in

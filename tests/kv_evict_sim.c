@@ -84,6 +84,10 @@ typedef struct {
     int parent;     /* conversation this one was forked from, or -1 */
     int fork;       /* tokens shared with the parent */
     int len;        /* tokens the conversation has reached */
+    /* How often the client alters the model's last reply before sending the
+     * next turn, as one that reformats or trims replies does every time.  A
+     * tip saved before that never matches the conversation again. */
+    double rewrite;
     char *text;     /* rendered text, grown on demand */
     int text_tokens;
 } sim_conv;
@@ -376,6 +380,7 @@ static void request(sim *s, int ci, int len, bool mismatch) {
         if (s->slot[i].conv == ci) sl = &s->slot[i];
     int cached = 0;
     bool from_live = false;
+    if (sl && c->rewrite > 0.0 && rng_unit() < c->rewrite) mismatch = true;
     if (sl && !mismatch && sl->live <= len) {
         cached = sl->live;
         from_live = true;
@@ -387,7 +392,8 @@ static void request(sim *s, int ci, int len, bool mismatch) {
                 if (s->slot[i].conv < 0 || s->slot[i].used < sl->used)
                     sl = &s->slot[i];
             }
-            store_slot(s, sl, false);
+            const double rewrite = sl->conv < 0 ? 0.0 : s->conv[sl->conv].rewrite;
+            store_slot(s, sl, rewrite > 0.0 && rng_unit() < rewrite);
         } else {
             store_slot(s, sl, true);
         }
@@ -682,22 +688,28 @@ static void scenario_weekend(void) {
  * and a budget that holds about six tips.  Everything in the cache is minutes
  * old, so only an ordering that separates minutes keeps the right ones.  This
  * is the shape of the real-model soak the policy was checked against. */
-static void scenario_busy(void) {
+static void scenario_busy(const char *name, int rewriting_of_4, double rewrite) {
     sim s;
     sim_open(&s, 2500, 1, 4096, 2048, 512, 30000);
     int active[8], len[SIM_MAX_CONVS] = {0};
-    for (int i = 0; i < 8; i++) active[i] = add_conv(&s, i % 2, 1900);
+    for (int i = 0; i < 8; i++) {
+        active[i] = add_conv(&s, i % 2, 1900);
+        if (i % 4 < rewriting_of_4) s.conv[active[i]].rewrite = rewrite;
+    }
     for (int turn = 0; turn < 600; turn++) {
         double u = rng_unit();
         int k = (int)(8.0 * u * u), ci = active[k];
-        if (len[ci] > 30000) ci = active[k] = add_conv(&s, k % 2, 1900);
+        if (len[ci] > 30000) {
+            ci = active[k] = add_conv(&s, k % 2, 1900);
+            if (k % 4 < rewriting_of_4) s.conv[ci].rewrite = rewrite;
+        }
         if (len[ci] == 0) len[ci] = 1900;
         len[ci] += rng_range(450, 2400);
         if (turn % 60 == 59) crash(&s);
         request(&s, ci, len[ci], rng_unit() < 0.1);
         sim_now += (uint64_t)rng_range(1, 4);
     }
-    sim_close(&s, "busy");
+    sim_close(&s, name);
 }
 
 /* Chat where a quarter of the turns edit or regenerate an earlier message, so
@@ -861,7 +873,8 @@ static void scenario_bench(void) {
 
 int main(int argc, char **argv) {
     static const char *all[] = {"issue21", "tiny", "chat", "chat-rewrite", "long", "weekend",
-                                "branch", "agent", "small", "slots", "reprefill", "busy"};
+                                "branch", "agent", "small", "slots", "reprefill", "busy",
+                                "reformat-some", "reformat-all", "edit-often"};
     int n = argc > 1 ? argc - 1 : (int)(sizeof(all) / sizeof(all[0]));
     for (int i = 0; i < n; i++) {
         const char *name = argc > 1 ? argv[i + 1] : all[i];
@@ -876,7 +889,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(name, "small")) scenario_small();
         else if (!strcmp(name, "slots")) scenario_slots();
         else if (!strcmp(name, "reprefill")) scenario_reprefill();
-        else if (!strcmp(name, "busy")) scenario_busy();
+        else if (!strcmp(name, "busy")) scenario_busy("busy", 0, 0.0);
+        /* The busy server again, with clients that never send a reply back
+         * the way the model wrote it: one conversation in four, then all. */
+        else if (!strcmp(name, "reformat-some")) scenario_busy("reformat-some", 1, 1.0);
+        else if (!strcmp(name, "reformat-all")) scenario_busy("reformat-all", 4, 1.0);
+        else if (!strcmp(name, "edit-often")) scenario_busy("edit-often", 4, 0.3);
         else if (!strcmp(name, "bench")) scenario_bench();
         else { fprintf(stderr, "unknown scenario %s\n", name); return 2; }
     }

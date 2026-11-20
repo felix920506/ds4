@@ -24425,6 +24425,49 @@ static void test_kv_cache_eviction_tells_images_apart(void) {
     }
 }
 
+static void test_kv_cache_eviction_learns_dead_tips(void) {
+    /* A client that rewrites every reply: its tip is never loaded, and the
+     * frontier underneath is what each turn resumes from.  After one dead tip
+     * the conversation's next tip gives way to its frontier.  A conversation
+     * with no such history keeps its tip and gives up the frontier. */
+    char tmpl[] = "/tmp/ds4-kv-chain-learn-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    /* The frontier was loaded after the tip was written: the tip is dead. */
+    char *front1 = test_kv_chain_file(dir, 1, 8192, 0, KV_REASON_CONTINUED, 1, now - 100);
+    char *dead1 = test_kv_chain_file(dir, 1, 8704, 5, KV_REASON_EVICT, 0, now - 200);
+    kc.budget_bytes = test_kv_chain_bytes(8192) + test_kv_chain_bytes(8704);
+    kv_cache_evict(&kc, NULL, 1, NULL);
+    TEST_ASSERT(access(dead1, F_OK) != 0);
+    TEST_ASSERT(access(front1, F_OK) == 0);
+
+    char *front2 = test_kv_chain_file(dir, 1, 12288, 0, KV_REASON_CONTINUED, 0, now - 50);
+    char *tip2 = test_kv_chain_file(dir, 1, 12800, 6, KV_REASON_EVICT, 0, now - 40);
+    char *other_front = test_kv_chain_file(dir, 2, 12288, 0, KV_REASON_CONTINUED, 0, now - 50);
+    char *other_tip = test_kv_chain_file(dir, 2, 12800, 0, KV_REASON_EVICT, 0, now - 40);
+    kc.budget_bytes = test_kv_chain_bytes(12288) + test_kv_chain_bytes(12800);
+    kv_cache_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(access(front1, F_OK) != 0);
+    TEST_ASSERT(access(front2, F_OK) == 0);
+    TEST_ASSERT(access(tip2, F_OK) != 0);
+    TEST_ASSERT(access(other_front, F_OK) != 0);
+    TEST_ASSERT(access(other_tip, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(front1); unlink(dead1); unlink(front2); unlink(tip2);
+    unlink(other_front); unlink(other_tip);
+    free(front1); free(dead1); free(front2); free(tip2);
+    free(other_front); free(other_tip);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_is_lru_among_unrelated(void) {
     /* Nothing extends anything here and nothing was hit: plain recency
      * decides, down to minutes. */
@@ -25738,6 +25781,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_thins_waypoints_by_gap();
     test_kv_cache_eviction_is_lru_among_unrelated();
     test_kv_cache_eviction_tells_images_apart();
+    test_kv_cache_eviction_learns_dead_tips();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 

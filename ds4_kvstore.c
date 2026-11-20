@@ -82,6 +82,12 @@
 #define KV_CACHE_COLD_SCORE_FACTOR 2.0
 #define KV_CACHE_COVERED_MIN_FACTOR 0.0005
 #define KV_CACHE_COVERED_BY_UNPROVEN_TIP_MIN_FACTOR 0.05
+/* Some clients never send a reply back the way the model wrote it, so none of
+ * their tips can be loaded and the entry underneath is all they have.  Once a
+ * conversation has left a dead tip, its later tips are expected to be dead
+ * too: they stop discounting what they extend and are themselves worth only
+ * the text they add to it, until one of them is loaded. */
+#define KV_CACHE_SUSPECT_TIP_MIN_FACTOR 0.02
 
 /* Whether one checkpoint extends another is decided on a signature of its
  * text: a running hash sampled every KV_SIG_GRID bytes, computed once per file
@@ -663,6 +669,10 @@ static bool kv_cache_tip_unproven(uint8_t reason, uint32_t hits) {
 typedef struct {
     uint64_t proven_bytes;
     uint64_t unproven_bytes;
+    /* For a tip that is probably dead: the longest other checkpoint it
+     * extends.  dead: something it extends was used after it was written. */
+    uint64_t under_bytes;
+    bool dead;
 } kv_cover;
 
 static void kv_cover_add(kv_cover *c, uint64_t text_bytes, bool unproven) {
@@ -672,13 +682,22 @@ static void kv_cover_add(kv_cover *c, uint64_t text_bytes, bool unproven) {
 
 static double kv_cover_factor(const ds4_kvstore_entry *e, const kv_cover *c) {
     if (e->reason == DS4_KVSTORE_REASON_COLD) return 1.0;
+    if (c->dead) return KV_CACHE_COVERED_MIN_FACTOR;
     uint64_t by = c->proven_bytes;
     double least = KV_CACHE_COVERED_MIN_FACTOR;
     if (by == 0) {
         by = c->unproven_bytes;
         least = KV_CACHE_COVERED_BY_UNPROVEN_TIP_MIN_FACTOR;
     }
-    if (by == 0) return 1.0;
+    if (by == 0) {
+        if (c->under_bytes && c->under_bytes < e->text_bytes) {
+            const double g = (double)(e->text_bytes - c->under_bytes) /
+                             (double)e->text_bytes;
+            return g > KV_CACHE_SUSPECT_TIP_MIN_FACTOR ?
+                   g : KV_CACHE_SUSPECT_TIP_MIN_FACTOR;
+        }
+        return 1.0;
+    }
     double gap = by > e->text_bytes ?
         (double)(by - e->text_bytes) / (double)by : 0.0;
     gap *= gap;
@@ -837,6 +856,71 @@ static bool kv_sig_extends(const kv_sig *e, const kv_sig *w) {
     return e->n >= need && e->v[need - 1] == w->v[need - 1];
 }
 
+/* Whether entry x is a longer checkpoint of the text and images of entry w. */
+static bool kv_cache_pair_extends(const ds4_kvstore *kc, const int *sig,
+                                  int w, int x) {
+    const ds4_kvstore_entry *W = &kc->entry[w], *E = &kc->entry[x];
+    const kv_sig *ws = &kc->sig[sig[w]], *es = &kc->sig[sig[x]];
+    if (E->text_bytes <= W->text_bytes || E->model_id != W->model_id) return false;
+    if (kc->reject_different_quant && E->quant_bits != W->quant_bits) return false;
+    if (ws->unknown || es->unknown || ws->n < KV_SIG_MIN_BLOCKS) return false;
+    /* Only a tip nothing has loaded can end in text that was rewritten; any
+     * other entry is extended by what has all of its text.  Otherwise a short
+     * checkpoint would count as part of every conversation that shares its
+     * system prompt. */
+    const bool whole = !kv_cache_tip_unproven(W->reason, W->hits);
+    return (whole ? es->n >= ws->n && es->v[ws->n - 1] == ws->v[ws->n - 1]
+                  : kv_sig_extends(es, ws)) &&
+           kv_images_agree(ws->image, ws->image_n, es->image, es->image_n,
+                           W->text_bytes);
+}
+
+/* Dead tips seen lately, kept after their files are gone: a conversation
+ * whose client rewrote one reply usually rewrites the next. */
+struct ds4_kvstore_mark {
+    uint32_t need;   /* signature blocks a text must share with the dead tip */
+    uint64_t hash;
+    uint64_t bytes;  /* the dead tip's text length */
+};
+typedef struct ds4_kvstore_mark kv_mark;
+#define KV_MARK_MAX 256
+
+static bool kv_mark_fits(const kv_mark *m, const kv_sig *sig) {
+    return sig->n >= m->need && sig->v[m->need - 1] == m->hash;
+}
+
+static bool kv_mark_matches(const ds4_kvstore *kc, const kv_sig *sig) {
+    for (int i = 0; i < kc->mark_len; i++)
+        if (kv_mark_fits(&kc->mark[i], sig)) return true;
+    return false;
+}
+
+static void kv_mark_add(ds4_kvstore *kc, const kv_sig *sig, uint64_t bytes) {
+    if (sig->n < KV_SIG_MIN_BLOCKS) return;
+    kv_mark m = {.need = sig->n - sig->n / 8, .bytes = bytes};
+    m.hash = sig->v[m.need - 1];
+    for (int i = 0; i < kc->mark_len; i++)
+        if (kc->mark[i].need == m.need && kc->mark[i].hash == m.hash) return;
+    if (!kc->mark) kc->mark = kv_xmalloc(KV_MARK_MAX * sizeof(kc->mark[0]));
+    if (kc->mark_len < KV_MARK_MAX) {
+        kc->mark[kc->mark_len++] = m;
+    } else {
+        kc->mark[kc->mark_next] = m;
+        kc->mark_next = (kc->mark_next + 1) % KV_MARK_MAX;
+    }
+}
+
+/* Forgets the dead tips that a longer text extends. */
+static void kv_mark_clear(ds4_kvstore *kc, const kv_sig *sig, uint64_t bytes) {
+    int keep = 0;
+    for (int i = 0; i < kc->mark_len; i++) {
+        if (bytes > kc->mark[i].bytes && kv_mark_fits(&kc->mark[i], sig)) continue;
+        kc->mark[keep++] = kc->mark[i];
+    }
+    kc->mark_len = keep;
+    if (kc->mark_next >= keep) kc->mark_next = 0;
+}
+
 /* For every listed entry, the longer checkpoints that extend it: the incoming
  * store, and entries on disk used no earlier than the entry itself.  One that
  * was loaded after a longer one was written was needed in spite of it. */
@@ -845,6 +929,8 @@ static kv_cover *kv_cache_covers(ds4_kvstore *kc,
     const int n = kc->len;
     kv_cover *cover = kv_xmalloc((size_t)(n ? n : 1) * sizeof(cover[0]));
     int *sig = kv_xmalloc((size_t)(n ? n : 1) * sizeof(sig[0]));
+    uint64_t *under = kv_xmalloc((size_t)(n ? n : 1) * sizeof(under[0]));
+    memset(under, 0, (size_t)(n ? n : 1) * sizeof(under[0]));
     for (int i = 0; i < kc->sig_len; i++) kc->sig[i].seen = false;
     for (int i = 0; i < n; i++) sig[i] = kv_sig_for_entry(kc, &kc->entry[i]);
 
@@ -854,10 +940,46 @@ static kv_cover *kv_cache_covers(ds4_kvstore *kc,
     if (incoming && incoming->text && incoming->text_len >= KV_SIG_GRID)
         kv_sig_compute(incoming->text, incoming->text_len, &in);
 
+    /* A tip is dead when something it extends was used after the tip was
+     * written: the conversation came back and could not load it. */
+    bool *suspect = kv_xmalloc((size_t)(n ? n : 1) * sizeof(suspect[0]));
+    bool *dead = kv_xmalloc((size_t)(n ? n : 1) * sizeof(dead[0]));
+    for (int x = 0; x < n; x++) {
+        const ds4_kvstore_entry *E = &kc->entry[x];
+        dead[x] = false;
+        if (!kv_cache_tip_unproven(E->reason, E->hits)) continue;
+        for (int w = 0; w < n && !dead[x]; w++) {
+            const ds4_kvstore_entry *W = &kc->entry[w];
+            if (W->reason == DS4_KVSTORE_REASON_COLD ||
+                kv_cache_tip_unproven(W->reason, W->hits) ||
+                kv_entry_used_at(W) <= kv_entry_used_at(E))
+                continue;
+            dead[x] = kv_cache_pair_extends(kc, sig, w, x);
+        }
+        if (dead[x]) kv_mark_add(kc, &kc->sig[sig[x]], E->text_bytes);
+    }
+    /* A later tip of the conversation that did load says the client stopped
+     * rewriting. */
+    for (int x = 0; x < n; x++) {
+        const ds4_kvstore_entry *E = &kc->entry[x];
+        if (E->hits == 0 || (E->reason != DS4_KVSTORE_REASON_EVICT &&
+                             E->reason != DS4_KVSTORE_REASON_SHUTDOWN))
+            continue;
+        kv_mark_clear(kc, &kc->sig[sig[x]], E->text_bytes);
+    }
+    for (int x = 0; x < n; x++) {
+        const ds4_kvstore_entry *E = &kc->entry[x];
+        suspect[x] = kv_cache_tip_unproven(E->reason, E->hits) &&
+                     (dead[x] || kv_mark_matches(kc, &kc->sig[sig[x]]));
+    }
+    const bool in_suspect = in_unproven && kv_mark_matches(kc, &in);
+
     for (int w = 0; w < n; w++) {
         const ds4_kvstore_entry *W = &kc->entry[w];
         const kv_sig *ws = &kc->sig[sig[w]];
+        const bool w_tip = kv_cache_tip_unproven(W->reason, W->hits);
         memset(&cover[w], 0, sizeof(cover[w]));
+        cover[w].dead = dead[w];
         if (ws->unknown) continue;
         const bool in_images_agree = incoming &&
             kv_images_agree(ws->image, ws->image_n, incoming->images,
@@ -868,23 +990,31 @@ static kv_cover *kv_cache_covers(ds4_kvstore *kc,
             continue;
         }
         if (in_images_agree && kv_cache_incoming_compatible(W, incoming) &&
-            kv_sig_extends(&in, ws))
+            (w_tip ? kv_sig_extends(&in, ws)
+                   : in.n >= ws->n && in.v[ws->n - 1] == ws->v[ws->n - 1]) &&
+            (w_tip || !in_suspect))
             kv_cover_add(&cover[w], incoming->text_len, in_unproven);
         for (int x = 0; x < n; x++) {
             const ds4_kvstore_entry *E = &kc->entry[x];
-            if (E->text_bytes <= W->text_bytes) continue;
-            if (E->model_id != W->model_id || E->ctx_size > W->ctx_size) continue;
-            if (kc->reject_different_quant && E->quant_bits != W->quant_bits)
+            if (E->ctx_size > W->ctx_size) continue;
+            if (!kv_cache_pair_extends(kc, sig, w, x)) continue;
+            if (suspect[x] && !w_tip) {
+                /* The tip is probably dead: this entry is what the
+                 * conversation will load, and the tip is worth only what it
+                 * adds, if anything. */
+                if (W->ctx_size == E->ctx_size && W->text_bytes > under[x])
+                    under[x] = W->text_bytes;
                 continue;
+            }
             if (kv_entry_used_at(E) < kv_entry_used_at(W)) continue;
-            const kv_sig *es = &kc->sig[sig[x]];
-            if (!es->unknown && kv_sig_extends(es, ws) &&
-                kv_images_agree(ws->image, ws->image_n, es->image, es->image_n,
-                                W->text_bytes))
-                kv_cover_add(&cover[w], E->text_bytes,
-                             kv_cache_tip_unproven(E->reason, E->hits));
+            kv_cover_add(&cover[w], E->text_bytes,
+                         kv_cache_tip_unproven(E->reason, E->hits));
         }
     }
+    free(suspect);
+    free(dead);
+    for (int i = 0; i < n; i++) cover[i].under_bytes = under[i];
+    free(under);
     free(in.v);
     free(sig);
 
@@ -992,6 +1122,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
 void ds4_kvstore_close(ds4_kvstore *kc) {
     ds4_kvstore_clear(kc);
     kv_sig_free_all(kc);
+    free(kc->mark);
     free(kc->dir);
     memset(kc, 0, sizeof(*kc));
 }
