@@ -16,6 +16,11 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+/* The payload starts with an image block: the identities of the images the
+ * saved rows were conditioned on. */
+#define DS4_KVSTORE_EXT_IMAGES            (1u << 4)
+/* ds4-agent: the embeddings of those images follow the title trailer. */
+#define DS4_KVSTORE_EXT_IMAGE_DATA        (1u << 5)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -83,6 +88,13 @@ typedef struct {
     int sig_cap;
 } ds4_kvstore;
 
+/* One image of a saved checkpoint.  text_offset is where its marker starts in
+ * the cache text, so a lookup can tell an image from text that looks like one. */
+typedef struct {
+    ds4_vision_identity identity;
+    uint32_t text_offset;
+} ds4_kvstore_image;
+
 typedef struct {
     const char *text;
     size_t text_len;
@@ -92,6 +104,9 @@ typedef struct {
     bool reject_different_quant;
     /* DS4_KVSTORE_REASON_* of the checkpoint being stored. */
     uint8_t reason;
+    /* Its images, if it has any. */
+    const ds4_kvstore_image *images;
+    size_t image_count;
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -101,6 +116,16 @@ typedef struct {
     bool (*write)(void *ud, FILE *fp, const char *text, uint64_t *written_bytes);
     int (*load)(void *ud, FILE *fp, const void *wanted);
     const void *load_wanted;
+    /* Store: the marker offset of every image in the session's checkpoint.  A
+     * session that holds images is only stored when the count agrees. */
+    const uint32_t *image_text_offsets;
+    size_t image_count;
+    /* Load: whether a candidate's images (possibly none) are exactly the
+     * request's images inside its text_bytes.  Called before the payload is
+     * read; without it, entries that hold images are never loaded. */
+    bool (*images_match)(void *ud, const ds4_kvstore_image *images,
+                         size_t count, uint32_t text_bytes);
+    void *images_ud;
 } ds4_kvstore_trailer_hooks;
 
 typedef struct {
@@ -201,6 +226,19 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               const ds4_kvstore_trailer_hooks *hooks,
                               bool responses_protocol);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
+
+/* The image block sits at the start of the payload bytes of an entry flagged
+ * DS4_KVSTORE_EXT_IMAGES and is counted in its payload byte count, so the
+ * trailers stay where older readers expect them. */
+#define DS4_KVSTORE_MAX_IMAGES 4096u
+uint64_t ds4_kvstore_image_block_bytes(size_t count);
+bool ds4_kvstore_write_image_block(FILE *fp, const ds4_kvstore_image *images,
+                                   size_t count);
+/* Reads the block at the current position; the engine payload follows it.
+ * free() *images. */
+bool ds4_kvstore_read_image_block(FILE *fp, uint64_t payload_bytes,
+                                  ds4_kvstore_image **images, size_t *count,
+                                  uint64_t *block_bytes);
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes);

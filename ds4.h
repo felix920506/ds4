@@ -202,6 +202,14 @@ typedef struct {
     ds4_vision_embedding embedding;
 } ds4_vision_span;
 
+/* What identifies one image inside a checkpoint: where its rows sit in the
+ * token history, how many rows it has, and the fingerprint of its pixels. */
+typedef struct {
+    uint32_t token_start;
+    uint32_t token_count;
+    uint8_t fingerprint[32];
+} ds4_vision_identity;
+
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
 typedef void (*ds4_generation_done_fn)(void *ud);
 
@@ -518,8 +526,26 @@ bool ds4_session_vision_fingerprint_prefix_matches(const ds4_session *s,
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
- * state. Such state must not be written to the text-keyed disk KV cache. */
+ * state. A saved payload of such a session is only valid together with the
+ * image identities below. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* Copy the identities of the images inside the current checkpoint, in token
+ * order (free() the result; *out is NULL when there are none).  Also valid
+ * from a prefill progress callback, where it lists the images already below
+ * the frontier.  Fails when the frontier splits an image, because such a
+ * checkpoint cannot be described, and on allocation failure. */
+bool ds4_session_vision_identities(const ds4_session *s,
+                                   ds4_vision_identity **out, size_t *count);
+/* Attach image identities to a checkpoint that ds4_session_load_payload() just
+ * restored, replacing any the session held before.  The payload carries the
+ * image-conditioned rows but not which images they came from.  Rejects spans
+ * that are unordered, overlap or leave the checkpoint. */
+bool ds4_session_restore_vision_identities(ds4_session *s,
+                                           const ds4_vision_identity *images,
+                                           size_t count);
+/* False when loading a payload rebuilds the state from its tokens alone (as
+ * tensor parallelism does), which cannot reproduce image rows. */
+bool ds4_session_payload_restores_vision(const ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

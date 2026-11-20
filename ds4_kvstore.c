@@ -452,6 +452,63 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 40, payload_bytes);
 }
 
+#define KV_IMAGE_BLOCK_HEADER 8u
+#define KV_IMAGE_BLOCK_ENTRY 44u
+static const uint8_t kv_image_block_magic[4] = {'K', 'V', 'I', 'M'};
+
+uint64_t ds4_kvstore_image_block_bytes(size_t count) {
+    return count ? KV_IMAGE_BLOCK_HEADER + (uint64_t)count * KV_IMAGE_BLOCK_ENTRY : 0;
+}
+
+bool ds4_kvstore_write_image_block(FILE *fp, const ds4_kvstore_image *images,
+                                   size_t count) {
+    if (count == 0) return true;
+    if (!fp || !images || count > DS4_KVSTORE_MAX_IMAGES) return false;
+    uint8_t h[KV_IMAGE_BLOCK_HEADER];
+    memcpy(h, kv_image_block_magic, 4);
+    ds4_kvstore_le_put32(h + 4, (uint32_t)count);
+    if (fwrite(h, 1, sizeof(h), fp) != sizeof(h)) return false;
+    for (size_t i = 0; i < count; i++) {
+        uint8_t e[KV_IMAGE_BLOCK_ENTRY];
+        ds4_kvstore_le_put32(e, images[i].identity.token_start);
+        ds4_kvstore_le_put32(e + 4, images[i].identity.token_count);
+        ds4_kvstore_le_put32(e + 8, images[i].text_offset);
+        memcpy(e + 12, images[i].identity.fingerprint, 32);
+        if (fwrite(e, 1, sizeof(e), fp) != sizeof(e)) return false;
+    }
+    return true;
+}
+
+bool ds4_kvstore_read_image_block(FILE *fp, uint64_t payload_bytes,
+                                  ds4_kvstore_image **images, size_t *count,
+                                  uint64_t *block_bytes) {
+    *images = NULL;
+    *count = 0;
+    *block_bytes = 0;
+    uint8_t h[KV_IMAGE_BLOCK_HEADER];
+    if (payload_bytes < sizeof(h) || fread(h, 1, sizeof(h), fp) != sizeof(h) ||
+        memcmp(h, kv_image_block_magic, 4) != 0) return false;
+    const uint32_t n = ds4_kvstore_le_get32(h + 4);
+    if (n == 0 || n > DS4_KVSTORE_MAX_IMAGES ||
+        ds4_kvstore_image_block_bytes(n) > payload_bytes) return false;
+    ds4_kvstore_image *out = kv_xmalloc((size_t)n * sizeof(out[0]));
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t e[KV_IMAGE_BLOCK_ENTRY];
+        if (fread(e, 1, sizeof(e), fp) != sizeof(e)) {
+            free(out);
+            return false;
+        }
+        out[i].identity.token_start = ds4_kvstore_le_get32(e);
+        out[i].identity.token_count = ds4_kvstore_le_get32(e + 4);
+        out[i].text_offset = ds4_kvstore_le_get32(e + 8);
+        memcpy(out[i].identity.fingerprint, e + 12, 32);
+    }
+    *images = out;
+    *count = n;
+    *block_bytes = ds4_kvstore_image_block_bytes(n);
+    return true;
+}
+
 /* routed-expert quantizations whose checkpoints the store keys on */
 bool ds4_kvstore_quant_bits_supported(int quant_bits) {
     return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 ||
@@ -571,6 +628,27 @@ static bool kv_cache_incoming_extends_exactly(
     return !strcmp(prefix_sha, e->sha);
 }
 
+/* Whether the longer checkpoint's images inside the first text_bytes are
+ * exactly the shorter one's.  The same text with another image is another
+ * conversation: neither checkpoint can stand in for the other. */
+static bool kv_images_agree(const ds4_kvstore_image *shorter, size_t shorter_n,
+                            const ds4_kvstore_image *longer, size_t longer_n,
+                            uint64_t text_bytes) {
+    size_t k = 0;
+    for (size_t i = 0; i < longer_n; i++) {
+        if (longer[i].text_offset >= text_bytes) continue;
+        if (k == shorter_n) return false;
+        const ds4_kvstore_image *a = &shorter[k++], *b = &longer[i];
+        if (a->text_offset != b->text_offset ||
+            a->identity.token_start != b->identity.token_start ||
+            a->identity.token_count != b->identity.token_count ||
+            memcmp(a->identity.fingerprint, b->identity.fingerprint,
+                   sizeof(a->identity.fingerprint)) != 0)
+            return false;
+    }
+    return k == shorter_n;
+}
+
 static uint64_t kv_entry_used_at(const ds4_kvstore_entry *e) {
     return e->last_used ? e->last_used : e->created_at;
 }
@@ -630,7 +708,8 @@ static double kv_cache_score(const ds4_kvstore_entry *e, uint64_t now,
 }
 
 /* Scores one entry against the incoming store alone, by exact prefix.  The
- * eviction pass also counts the checkpoints already on disk. */
+ * eviction pass also counts the checkpoints already on disk.  This one does
+ * not read the entry's images, so an entry that has any is not discounted. */
 double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_entry *e,
         const ds4_tokens *live,
@@ -638,7 +717,10 @@ double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_eviction_context *incoming) {
     (void)live;
     kv_cover cover = {0};
-    if (kv_cache_incoming_extends_exactly(e, incoming))
+    if (e && !(e->ext_flags & DS4_KVSTORE_EXT_IMAGES) &&
+        kv_cache_incoming_extends_exactly(e, incoming) &&
+        kv_images_agree(NULL, 0, incoming->images, incoming->image_count,
+                        e->text_bytes))
         kv_cover_add(&cover, incoming->text_len,
                      kv_cache_tip_unproven(incoming->reason, 0));
     return kv_cache_score(e, now, &cover);
@@ -647,8 +729,16 @@ double ds4_kvstore_entry_eviction_score(
 struct ds4_kvstore_sig {
     char sha[41];
     bool seen;
+    /* The file the signature was read from; a key can be stored again. */
+    uint64_t created_at;
+    uint64_t file_size;
     uint32_t n;
     uint64_t *v;
+    /* Its images.  unknown: they could not be read, so it neither covers
+     * anything nor is covered. */
+    ds4_kvstore_image *image;
+    size_t image_n;
+    bool unknown;
 };
 typedef struct ds4_kvstore_sig kv_sig;
 
@@ -671,35 +761,70 @@ static void kv_sig_compute(const char *text, size_t len, kv_sig *sig) {
 /* Index of the entry's signature in kc->sig, reading the file's text the
  * first time the entry is seen. */
 static int kv_sig_for_entry(ds4_kvstore *kc, const ds4_kvstore_entry *e) {
+    int at = -1;
     for (int i = 0; i < kc->sig_len; i++) {
-        if (!memcmp(kc->sig[i].sha, e->sha, 41)) {
+        if (memcmp(kc->sig[i].sha, e->sha, 41) != 0) continue;
+        if (kc->sig[i].created_at == e->created_at &&
+            kc->sig[i].file_size == e->file_size) {
             kc->sig[i].seen = true;
             return i;
         }
+        at = i;
+        free(kc->sig[i].v);
+        free(kc->sig[i].image);
+        break;
     }
-    if (kc->sig_len == kc->sig_cap) {
-        kc->sig_cap = kc->sig_cap ? kc->sig_cap * 2 : 64;
-        kc->sig = kv_xrealloc(kc->sig, (size_t)kc->sig_cap * sizeof(kc->sig[0]));
+    if (at < 0) {
+        if (kc->sig_len == kc->sig_cap) {
+            kc->sig_cap = kc->sig_cap ? kc->sig_cap * 2 : 64;
+            kc->sig = kv_xrealloc(kc->sig,
+                                  (size_t)kc->sig_cap * sizeof(kc->sig[0]));
+        }
+        at = kc->sig_len++;
     }
-    kv_sig *sig = &kc->sig[kc->sig_len];
+    kv_sig *sig = &kc->sig[at];
     memset(sig, 0, sizeof(*sig));
     memcpy(sig->sha, e->sha, 41);
     sig->seen = true;
-    FILE *fp = e->text_bytes >= KV_SIG_GRID && e->text_bytes <= UINT32_MAX ?
-               fopen(e->path, "rb") : NULL;
-    if (fp) {
-        char *text = kv_xmalloc((size_t)e->text_bytes);
-        if (fseek(fp, DS4_KVSTORE_FIXED_HEADER + 4, SEEK_SET) == 0 &&
-            fread(text, 1, (size_t)e->text_bytes, fp) == (size_t)e->text_bytes)
-            kv_sig_compute(text, (size_t)e->text_bytes, sig);
-        free(text);
-        fclose(fp);
+    sig->created_at = e->created_at;
+    sig->file_size = e->file_size;
+    const bool has_images = (e->ext_flags & DS4_KVSTORE_EXT_IMAGES) != 0;
+    const bool want_text = e->text_bytes >= KV_SIG_GRID;
+    if (e->text_bytes > UINT32_MAX) {
+        sig->unknown = has_images;
+        return at;
     }
-    return kc->sig_len++;
+    FILE *fp = want_text || has_images ? fopen(e->path, "rb") : NULL;
+    if (fp) {
+        bool ok = true;
+        if (want_text) {
+            char *text = kv_xmalloc((size_t)e->text_bytes);
+            ok = fseek(fp, DS4_KVSTORE_FIXED_HEADER + 4, SEEK_SET) == 0 &&
+                 fread(text, 1, (size_t)e->text_bytes, fp) == (size_t)e->text_bytes;
+            if (ok) kv_sig_compute(text, (size_t)e->text_bytes, sig);
+            free(text);
+        }
+        if (has_images) {
+            uint64_t block_bytes = 0;
+            ok = ok &&
+                 fseek(fp, (long)(DS4_KVSTORE_FIXED_HEADER + 4 + e->text_bytes),
+                       SEEK_SET) == 0 &&
+                 ds4_kvstore_read_image_block(fp, e->payload_bytes, &sig->image,
+                                              &sig->image_n, &block_bytes);
+            sig->unknown = !ok;
+        }
+        fclose(fp);
+    } else if (has_images) {
+        sig->unknown = true;
+    }
+    return at;
 }
 
 static void kv_sig_free_all(ds4_kvstore *kc) {
-    for (int i = 0; i < kc->sig_len; i++) free(kc->sig[i].v);
+    for (int i = 0; i < kc->sig_len; i++) {
+        free(kc->sig[i].v);
+        free(kc->sig[i].image);
+    }
     free(kc->sig);
     kc->sig = NULL;
     kc->sig_len = kc->sig_cap = 0;
@@ -733,12 +858,16 @@ static kv_cover *kv_cache_covers(ds4_kvstore *kc,
         const ds4_kvstore_entry *W = &kc->entry[w];
         const kv_sig *ws = &kc->sig[sig[w]];
         memset(&cover[w], 0, sizeof(cover[w]));
+        if (ws->unknown) continue;
+        const bool in_images_agree = incoming &&
+            kv_images_agree(ws->image, ws->image_n, incoming->images,
+                            incoming->image_count, W->text_bytes);
         if (ws->n < KV_SIG_MIN_BLOCKS) {
-            if (kv_cache_incoming_extends_exactly(W, incoming))
+            if (in_images_agree && kv_cache_incoming_extends_exactly(W, incoming))
                 kv_cover_add(&cover[w], incoming->text_len, in_unproven);
             continue;
         }
-        if (kv_cache_incoming_compatible(W, incoming) &&
+        if (in_images_agree && kv_cache_incoming_compatible(W, incoming) &&
             kv_sig_extends(&in, ws))
             kv_cover_add(&cover[w], incoming->text_len, in_unproven);
         for (int x = 0; x < n; x++) {
@@ -748,7 +877,10 @@ static kv_cover *kv_cache_covers(ds4_kvstore *kc,
             if (kc->reject_different_quant && E->quant_bits != W->quant_bits)
                 continue;
             if (kv_entry_used_at(E) < kv_entry_used_at(W)) continue;
-            if (kv_sig_extends(&kc->sig[sig[x]], ws))
+            const kv_sig *es = &kc->sig[sig[x]];
+            if (!es->unknown && kv_sig_extends(es, ws) &&
+                kv_images_agree(ws->image, ws->image_n, es->image, es->image_n,
+                                W->text_bytes))
                 kv_cover_add(&cover[w], E->text_bytes,
                              kv_cache_tip_unproven(E->reason, E->hits));
         }
@@ -759,8 +891,12 @@ static kv_cover *kv_cache_covers(ds4_kvstore *kc,
     /* Forget the signatures of files that are gone. */
     int keep = 0;
     for (int i = 0; i < kc->sig_len; i++) {
-        if (kc->sig[i].seen) kc->sig[keep++] = kc->sig[i];
-        else free(kc->sig[i].v);
+        if (kc->sig[i].seen) {
+            kc->sig[keep++] = kc->sig[i];
+        } else {
+            free(kc->sig[i].v);
+            free(kc->sig[i].image);
+        }
     }
     kc->sig_len = keep;
     return cover;
@@ -1172,6 +1308,37 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return false;
     }
 
+    /* The rows of a session that holds images are only meaningful together
+     * with which images they are.  Take the list from the session itself, so
+     * it always describes the payload staged below. */
+    ds4_kvstore_image *images = NULL;
+    size_t image_count = 0;
+    {
+        ds4_vision_identity *ids = NULL;
+        const bool listed = ds4_session_vision_identities(session, &ids, &image_count);
+        if (!listed || image_count > DS4_KVSTORE_MAX_IMAGES ||
+            (image_count != 0 &&
+             (!hooks || !hooks->image_text_offsets ||
+              hooks->image_count != image_count ||
+              !ds4_session_payload_restores_vision(session))))
+        {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache skipped tokens=%d reason=%s because its images cannot be described",
+                    kv_log_name(kc), store_tokens.len, reason);
+            free(ids);
+            ds4_tokens_free(&store_tokens);
+            return false;
+        }
+        if (image_count != 0) {
+            images = kv_xmalloc(image_count * sizeof(images[0]));
+            for (size_t i = 0; i < image_count; i++) {
+                images[i].identity = ids[i];
+                images[i].text_offset = hooks->image_text_offsets[i];
+            }
+        }
+        free(ids);
+    }
+
     size_t text_len = 0;
     char *text = NULL;
     const bool text_override = cache_text_override && cache_text_override[0];
@@ -1186,6 +1353,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 "%s: kv cache skipped tokens=%d because rendered text is too large",
                 kv_log_name(kc), store_tokens.len);
         free(text);
+        free(images);
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -1196,6 +1364,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 "%s: kv cache skipped tokens=%d reason=%s because tool map size overflowed",
                 kv_log_name(kc), store_tokens.len, reason);
         free(text);
+        free(images);
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -1210,6 +1379,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);
+        free(images);
         ds4_tokens_free(&store_tokens);
         return true;
     }
@@ -1227,10 +1397,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                      save_err[0] ? save_err : "unknown error");
         free(text);
         free(path);
+        free(images);
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    uint64_t payload_bytes = staged.bytes;
+    const uint64_t image_block_bytes = ds4_kvstore_image_block_bytes(image_count);
+    uint64_t payload_bytes = staged.bytes + image_block_bytes;
 
     uint64_t est_file_bytes = 0, est_required_bytes = 0;
     if (!ds4_kvstore_file_size_fits(kc, (uint64_t)text_len, payload_bytes,
@@ -1247,6 +1419,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         ds4_session_payload_file_free(&staged);
         free(text);
         free(path);
+        free(images);
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -1259,6 +1432,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
         .reason = reason_code,
+        .images = images,
+        .image_count = image_count,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
@@ -1276,6 +1451,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         free(tmp);
         free(text);
         free(path);
+        free(images);
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -1284,6 +1460,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint8_t ext_flags = trailer_est_bytes > 0 && hooks ? hooks->ext_flag : 0;
     if (text_override) ext_flags |= cache_text_ext;
+    if (image_count != 0) ext_flags |= DS4_KVSTORE_EXT_IMAGES;
     ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
@@ -1296,6 +1473,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
+              ds4_kvstore_write_image_block(fp, images, image_count) &&
               ds4_session_write_staged_payload(&staged, fp,
                                                save_err, sizeof(save_err)) == 0 &&
               kv_trailer_write(hooks, fp, text, &trailer_bytes) &&
@@ -1348,12 +1526,14 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         unlink(tmp);
     } else {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
+                "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s images=%zu size=%.2f MiB save=%.1f ms",
                 kv_log_name(kc),
                 store_tokens.len,
                 original_len - store_tokens.len,
                 reason,
-                text_override ? (cache_text_key ? cache_text_key : "visible-transcript") : "token-text",
+                text_override && cache_text_key ? cache_text_key :
+                text_override && cache_text_ext ? "visible-transcript" : "token-text",
+                image_count,
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
     }
@@ -1361,6 +1541,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     free(tmp);
     free(text);
     free(path);
+    free(images);
     ds4_tokens_free(&store_tokens);
     return ok;
 }
@@ -1482,12 +1663,47 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             }
         }
     }
+    /* Image identity is settled before the payload replaces the live state:
+     * the text can only say that an image was here, not which one. */
+    ds4_kvstore_image *images = NULL;
+    size_t image_count = 0;
+    uint64_t image_block_bytes = 0;
+    bool images_differ = false;
+    if (header_ok && (hdr.ext_flags & DS4_KVSTORE_EXT_IMAGES)) {
+        if (!ds4_kvstore_read_image_block(fp, hdr.payload_bytes, &images,
+                                          &image_count, &image_block_bytes)) {
+            header_ok = false;
+            fail_reason = "invalid image block";
+        } else if (!ds4_session_payload_restores_vision(session)) {
+            header_ok = false;
+            images_differ = true;
+            fail_reason = "image checkpoints cannot be restored by this backend";
+        }
+    }
+    if (header_ok && (image_count != 0 || (hooks && hooks->images_match)) &&
+        (!hooks || !hooks->images_match ||
+         !hooks->images_match(hooks->images_ud, images, image_count, text_bytes)))
+    {
+        header_ok = false;
+        images_differ = true;
+        fail_reason = "images differ from the cached ones";
+    }
     char err[160] = {0};
     int loaded = 0;
     if (header_ok &&
-        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
+        ds4_session_load_payload(session, fp,
+                                 hdr.payload_bytes - image_block_bytes,
+                                 err, sizeof(err)) == 0)
     {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
+        if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
+            ds4_vision_identity *ids = image_count ?
+                kv_xmalloc(image_count * sizeof(ids[0])) : NULL;
+            for (size_t i = 0; i < image_count; i++) ids[i] = images[i].identity;
+            if (!ds4_session_restore_vision_identities(session, ids, image_count))
+                loaded_tokens = NULL;
+            free(ids);
+        }
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
             if (effective_prompt) {
@@ -1515,8 +1731,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     } else {
         if (header_ok) ds4_session_invalidate(session);
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
+                "%s: kv cache %s%s%s %s: %s load=%.1f ms",
                 kv_log_name(kc),
+                images_differ ? "entry not used" : "load failed",
                 responses_protocol ? " " : "",
                 responses_protocol ? "RESPPROTO" : "",
                 path,
@@ -1545,6 +1762,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             result->path = kv_xstrdup(path);
         }
     }
+    free(images);
     free(cached_text);
     free(path);
     return loaded;

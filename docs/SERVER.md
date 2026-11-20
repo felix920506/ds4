@@ -75,7 +75,7 @@ finish and takes that slot's memory then (`ds4_server_memory_waits_total`).
 It fails with HTTP 503 only when no other slot could give memory back.
 
 Kicking needs `--kv-disk-dir`. Without it, and for state the disk cache cannot
-hold (conversations with images, or shorter than `--kv-cache-min-tokens`), a
+hold (conversations shorter than `--kv-cache-min-tokens`), a
 kicked conversation is prefilled again; such slots are kicked last, and the log
 says so. A client that continues a tool call by id alone, without replaying the
 history, gets the usual 409 after a kick, as it does after any slot reuse.
@@ -161,6 +161,12 @@ before it costs another conversation its only one. Each line
 `make kv-evict-sim` (`make kv-evict-sim-rocm` on a ROCm build) replays
 simulated workloads against the eviction code and reports how many tokens
 would have to be prefilled again; use it when changing the policy.
+
+Conversations with images are cached like any other. A checkpoint records the
+fingerprint of every image it was built from, and a request restores it only
+when its own images are the same ones at the same places: the same prompt with
+a different image is a miss, not a wrong answer. Tensor-parallel servers do not
+cache image conversations, because their cache loading rebuilds from tokens.
 
 TP cache loading rebuilds the saved token prefix on both ranks. It is not an
 instantaneous restoration of both GPUs. Pipeline loading redistributes the

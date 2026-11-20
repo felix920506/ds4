@@ -987,7 +987,7 @@ static int test_full_context_save(const char *model) {
         cfg.gen.ctx_size = 512;
         ds4_tokens restored = {0};
         agent_kv_session_meta meta = {0};
-        AGENT_TEST_ASSERT(agent_kv_load_path(&w, path, sha, NULL, 0, &restored, &meta, err, sizeof(err)));
+        AGENT_TEST_ASSERT(agent_kv_load_path(&w, path, sha, NULL, 0, &restored, &meta, NULL, NULL, err, sizeof(err)));
         AGENT_TEST_ASSERT(agent_tokens_equal(&w.transcript, &restored));
         AGENT_TEST_ASSERT(meta.created_at == w.session_created_at && meta.title && !strcmp(meta.title, w.session_title));
         ds4_token_score score;
