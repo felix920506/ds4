@@ -153,6 +153,22 @@ It is also where a slot's conversation goes when the slot is kicked for memory
 (see Multiple sessions), so size `--kv-disk-space-mb` for the conversations
 that should survive that.
 
+When the budget is full, the least recently used checkpoints go first: one
+that was stored or loaded a minute ago outlives one idle for ten, and one from
+today outlives one from last month, whatever its size or old hit count. Three things adjust that order. Recent hits and a
+checkpoint's tokens per byte count in its favour; a cold checkpoint, which new
+conversations with the same system prompt start from, gets a bonus; and a
+checkpoint that a longer one of the same conversation already extends is
+treated as mostly redundant, so a conversation gives up its own old waypoints
+before it costs another conversation its only one. A client that rewrites
+the model's replies leaves checkpoints that end in text it will never send
+again; once the cache has seen one go unused, it keeps what that conversation
+can still resume from instead. Each line
+`kv cache evicted reason=disk-cache-full` in the log names what was removed.
+`make kv-evict-sim` (`make kv-evict-sim-rocm` on a ROCm build) replays
+simulated workloads against the eviction code and reports how many tokens
+would have to be prefilled again; use it when changing the policy.
+
 Conversations with images are cached like any other. A checkpoint records the
 fingerprint of every image it was built from, and a request restores it only
 when its own images are the same ones at the same places: the same prompt with

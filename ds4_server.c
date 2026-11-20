@@ -24078,6 +24078,426 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_score_ages_idle_entries(void) {
+    /* Issue #21: a months-old anchor whose hits have long decayed is denser
+     * than a small frontier and carries the anchor prior, so on density alone
+     * it outranked a frontier written minutes ago. */
+    const uint64_t day = 24u * 60u * 60u;
+    const uint64_t now = 200u * day;
+    kv_entry august = {.tokens = 102400, .hits = 40, .file_size = 1400u << 20,
+                       .reason = KV_REASON_COLD, .created_at = now - 90u * day,
+                       .last_used = now - 60u * day};
+    kv_entry week = august;
+    week.last_used = now - 7u * day;
+    kv_entry frontier = {.tokens = 10240, .hits = 0, .file_size = 157u << 20,
+                         .reason = KV_REASON_CONTINUED,
+                         .created_at = now - 20u * 60u,
+                         .last_used = now - 20u * 60u};
+
+    double s_august = kv_entry_eviction_score(&august, NULL, now, NULL);
+    double s_week = kv_entry_eviction_score(&week, NULL, now, NULL);
+    double s_frontier = kv_entry_eviction_score(&frontier, NULL, now, NULL);
+    TEST_ASSERT(s_august < s_week);
+    TEST_ASSERT(s_week < s_frontier);
+
+    /* Never used since it was written: age counts from created_at. */
+    kv_entry unused = august;
+    unused.hits = 0;
+    unused.last_used = 0;
+    TEST_ASSERT(kv_entry_eviction_score(&unused, NULL, now, NULL) < s_august);
+
+    /* A timestamp ahead of the clock is not penalized. */
+    kv_entry ahead = frontier;
+    ahead.last_used = now + day;
+    TEST_ASSERT(kv_entry_eviction_score(&ahead, NULL, now, NULL) ==
+                (double)ahead.tokens / (double)ahead.file_size);
+}
+
+static void test_kv_cache_eviction_drops_stale_before_fresh_frontier(void) {
+    /* Issue #21 on disk: a full cache holds a stale anchor, another session's
+     * newest frontier and this session's previous waypoint.  The store that
+     * supersedes the waypoint has to take the stale anchor, not either of the
+     * two entries written minutes ago. */
+    char tmpl[] = "/tmp/ds4-kv-idle-age-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *stale_sha = "1111111111111111111111111111111111111111";
+    const char *other_sha = "2222222222222222222222222222222222222222";
+    const char *waypoint_text = "system: hello world";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    const uint64_t day = 24u * 60u * 60u;
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, stale_sha, KV_REASON_COLD, 4096, 40,
+                      now - 60u * day, 2048);
+    test_kv_stub_file(dir, other_sha, KV_REASON_CONTINUED, 1024, 0,
+                      now - 20u * 60u, 2048);
+    test_kv_text_stub_file(dir, waypoint_text, KV_REASON_CONTINUED, 1024, 2048);
+
+    char waypoint_sha[41];
+    sha1_bytes_hex(waypoint_text, strlen(waypoint_text), waypoint_sha);
+    char stale_name[44], other_name[44], waypoint_name[44];
+    snprintf(stale_name, sizeof(stale_name), "%.40s.kv", stale_sha);
+    snprintf(other_name, sizeof(other_name), "%.40s.kv", other_sha);
+    snprintf(waypoint_name, sizeof(waypoint_name), "%.40s.kv", waypoint_sha);
+    char *stale_path = path_join(dir, stale_name);
+    char *other_path = path_join(dir, other_name);
+    char *waypoint_path = path_join(dir, waypoint_name);
+    TEST_ASSERT(ds4_kvstore_touch_file(waypoint_path, 0));
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    const uint64_t stub = KV_CACHE_FIXED_HEADER + 4u + 2048u;
+    uint64_t incoming_bytes = stub + strlen(incoming_text);
+    kc.budget_bytes = incoming_bytes + 2u * stub + strlen(waypoint_text);
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+    };
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(stale_path, F_OK) != 0);
+    TEST_ASSERT(access(other_path, F_OK) == 0);
+    TEST_ASSERT(access(waypoint_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(stale_path);
+    unlink(other_path);
+    unlink(waypoint_path);
+    free(stale_path);
+    free(other_path);
+    free(waypoint_path);
+    rmdir(dir);
+}
+
+/* A checkpoint with real text, for the tests of what extends what.  The text
+ * of conversation `conv` is deterministic, and `tail` (nonzero) rewrites the
+ * last 200 bytes the way a client that edits the final turn would. */
+static char *test_kv_chain_text(int conv, size_t len, int tail) {
+    char *text = xmalloc(len + 1);
+    for (size_t i = 0; i < len; i++)
+        text[i] = (char)('a' + (i * 7u + (size_t)conv * 5u + i / 97u) % 26u);
+    if (tail) {
+        for (size_t i = len - 200; i < len; i++)
+            text[i] = (char)('A' + (i + (size_t)tail) % 26u);
+    }
+    text[len] = '\0';
+    return text;
+}
+
+/* Writes the checkpoint and returns its path. */
+static char *test_kv_chain_file(const char *dir, int conv, size_t len, int tail,
+                                uint8_t reason, uint32_t hits,
+                                uint64_t last_used) {
+    char *text = test_kv_chain_text(conv, len, tail);
+    char sha[41], name[44];
+    sha1_bytes_hex(text, len, sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        /* Tokens and size both follow the text, so every entry has the same
+         * tokens per byte and only age, hits and coverage separate them. */
+        uint8_t h[KV_CACHE_FIXED_HEADER], tb[4];
+        ds4_kvstore_fill_header(h, 0, 2, reason, 0, (uint32_t)len, hits, 32768,
+                                last_used, last_used, len);
+        le_put32(tb, (uint32_t)len);
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb));
+        TEST_ASSERT(fwrite(text, 1, len, fp) == len);
+        TEST_ASSERT(fwrite(text, 1, len, fp) == len);
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    free(text);
+    return path;
+}
+
+static uint64_t test_kv_chain_bytes(size_t len) {
+    return KV_CACHE_FIXED_HEADER + 4u + 2u * (uint64_t)len;
+}
+
+/* Evicts until `bytes` are free, as a store of an unrelated checkpoint would. */
+static void test_kv_chain_evict(const char *dir, uint64_t total, uint64_t bytes) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = total;
+    kv_cache_evict(&kc, NULL, bytes, NULL);
+    kv_cache_close(&kc);
+}
+
+static void test_kv_cache_eviction_drops_old_tip_of_same_conversation(void) {
+    /* One conversation left two tips, the second a turn longer and loaded
+     * since.  Another conversation's only tip is older than both.  Making
+     * room must take the redundant tip, not the other conversation. */
+    char tmpl[] = "/tmp/ds4-kv-chain-old-tip-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    char *old_tip = test_kv_chain_file(dir, 1, 8192, 0, KV_REASON_EVICT, 1, now - 600);
+    char *new_tip = test_kv_chain_file(dir, 1, 9216, 0, KV_REASON_EVICT, 1, now - 300);
+    char *other = test_kv_chain_file(dir, 2, 8192, 0, KV_REASON_EVICT, 0, now - 1800);
+
+    uint64_t total = test_kv_chain_bytes(8192) * 2 + test_kv_chain_bytes(9216);
+    test_kv_chain_evict(dir, total, 1);
+
+    TEST_ASSERT(access(old_tip, F_OK) != 0);
+    TEST_ASSERT(access(new_tip, F_OK) == 0);
+    TEST_ASSERT(access(other, F_OK) == 0);
+
+    unlink(old_tip); unlink(new_tip); unlink(other);
+    free(old_tip); free(new_tip); free(other);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_keeps_fallback_under_unproven_tip(void) {
+    /* Two conversations, each a frontier and a slightly longer tip.  One tip
+     * has been loaded, so its frontier is redundant; the other never was, and
+     * may end in text the client rewrote, so its frontier is the fallback. */
+    char tmpl[] = "/tmp/ds4-kv-chain-unproven-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    char *front_a = test_kv_chain_file(dir, 1, 8192, 0, KV_REASON_CONTINUED, 0, now - 300);
+    char *tip_a = test_kv_chain_file(dir, 1, 8704, 0, KV_REASON_EVICT, 1, now - 200);
+    char *front_b = test_kv_chain_file(dir, 2, 8192, 0, KV_REASON_CONTINUED, 0, now - 300);
+    char *tip_b = test_kv_chain_file(dir, 2, 8704, 0, KV_REASON_EVICT, 0, now - 200);
+
+    uint64_t total = 2 * (test_kv_chain_bytes(8192) + test_kv_chain_bytes(8704));
+    test_kv_chain_evict(dir, total, 1);
+
+    TEST_ASSERT(access(front_a, F_OK) != 0);
+    TEST_ASSERT(access(front_b, F_OK) == 0);
+    TEST_ASSERT(access(tip_a, F_OK) == 0);
+    TEST_ASSERT(access(tip_b, F_OK) == 0);
+
+    unlink(front_a); unlink(tip_a); unlink(front_b); unlink(tip_b);
+    free(front_a); free(tip_a); free(front_b); free(tip_b);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_drops_dead_tip(void) {
+    /* A tip whose last 200 bytes the client rewrote is not a prefix of the
+     * conversation's later frontier, but nearly all of it is.  It goes before
+     * an older checkpoint of another conversation. */
+    char tmpl[] = "/tmp/ds4-kv-chain-dead-tip-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    char *dead = test_kv_chain_file(dir, 1, 8192, 5, KV_REASON_EVICT, 0, now - 300);
+    char *front = test_kv_chain_file(dir, 1, 12288, 0, KV_REASON_CONTINUED, 0, now - 200);
+    char *other = test_kv_chain_file(dir, 2, 8192, 0, KV_REASON_EVICT, 0, now - 1800);
+
+    uint64_t total = test_kv_chain_bytes(8192) * 2 + test_kv_chain_bytes(12288);
+    test_kv_chain_evict(dir, total, 1);
+
+    TEST_ASSERT(access(dead, F_OK) != 0);
+    TEST_ASSERT(access(front, F_OK) == 0);
+    TEST_ASSERT(access(other, F_OK) == 0);
+
+    unlink(dead); unlink(front); unlink(other);
+    free(dead); free(front); free(other);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_keeps_entry_loaded_after_longer_one(void) {
+    /* A frontier that was loaded after the longer checkpoint was written was
+     * needed in spite of it, so it is not redundant: the older checkpoint of
+     * another conversation goes first. */
+    char tmpl[] = "/tmp/ds4-kv-chain-loaded-later-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    char *front = test_kv_chain_file(dir, 1, 8192, 0, KV_REASON_CONTINUED, 1, now - 100);
+    char *longer = test_kv_chain_file(dir, 1, 8704, 0, KV_REASON_CONTINUED, 0, now - 200);
+    char *other = test_kv_chain_file(dir, 2, 8192, 0, KV_REASON_CONTINUED, 0, now - 3600);
+
+    uint64_t total = test_kv_chain_bytes(8192) * 2 + test_kv_chain_bytes(8704);
+    test_kv_chain_evict(dir, total, 1);
+
+    TEST_ASSERT(access(front, F_OK) == 0);
+    TEST_ASSERT(access(longer, F_OK) == 0);
+    TEST_ASSERT(access(other, F_OK) != 0);
+
+    unlink(front); unlink(longer); unlink(other);
+    free(front); free(longer); free(other);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_thins_waypoints_by_gap(void) {
+    /* Three frontiers under one tip.  The one just below the tip saves almost
+     * nothing over it; the one at half its length is what a fork in between
+     * would load.  The near one goes first although it is the newest. */
+    char tmpl[] = "/tmp/ds4-kv-chain-gap-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    char *half = test_kv_chain_file(dir, 1, 16384, 0, KV_REASON_CONTINUED, 0, now - 400);
+    char *near = test_kv_chain_file(dir, 1, 30720, 0, KV_REASON_CONTINUED, 0, now - 300);
+    char *tip = test_kv_chain_file(dir, 1, 32768, 0, KV_REASON_CONTINUED, 0, now - 200);
+
+    uint64_t total = test_kv_chain_bytes(16384) + test_kv_chain_bytes(30720) +
+                     test_kv_chain_bytes(32768);
+    test_kv_chain_evict(dir, total, 1);
+
+    TEST_ASSERT(access(near, F_OK) != 0);
+    TEST_ASSERT(access(half, F_OK) == 0);
+    TEST_ASSERT(access(tip, F_OK) == 0);
+
+    unlink(half); unlink(near); unlink(tip);
+    free(half); free(near); free(tip);
+    rmdir(dir);
+}
+
+/* A chain checkpoint whose text holds one image at byte 1024; `pixels` stands
+ * for the image's fingerprint. */
+static char *test_kv_chain_image_file(const char *dir, int conv, size_t len,
+                                      uint8_t pixels, uint32_t hits,
+                                      uint64_t last_used) {
+    char *text = test_kv_chain_text(conv, len, 0);
+    char sha[41], name[44];
+    sha1_bytes_hex(text, len, sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    ds4_kvstore_image image = {0};
+    image.identity.token_start = 256;
+    image.identity.token_count = 64;
+    memset(image.identity.fingerprint, pixels, sizeof(image.identity.fingerprint));
+    image.text_offset = 1024;
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[KV_CACHE_FIXED_HEADER], tb[4];
+        ds4_kvstore_fill_header(h, 0, 2, KV_REASON_EVICT, DS4_KVSTORE_EXT_IMAGES,
+                                (uint32_t)len, hits, 32768, last_used, last_used,
+                                ds4_kvstore_image_block_bytes(1) + len);
+        le_put32(tb, (uint32_t)len);
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb));
+        TEST_ASSERT(fwrite(text, 1, len, fp) == len);
+        TEST_ASSERT(ds4_kvstore_write_image_block(fp, &image, 1));
+        TEST_ASSERT(fwrite(text, 1, len, fp) == len);
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+    free(text);
+    return path;
+}
+
+static void test_kv_cache_eviction_tells_images_apart(void) {
+    /* Two checkpoints share their text, one a turn longer and loaded since,
+     * and a third conversation is older than both.  With the same image the
+     * shorter one is redundant and goes first.  With another image it is a
+     * different conversation that the longer one cannot serve, so the least
+     * recently used entry goes instead. */
+    for (int same = 0; same < 2; same++) {
+        char tmpl[] = "/tmp/ds4-kv-chain-image-test.XXXXXX";
+        char *dir = mkdtemp(tmpl);
+        TEST_ASSERT(dir != NULL);
+        if (!dir) return;
+        uint64_t now = (uint64_t)time(NULL);
+        char *shorter = test_kv_chain_image_file(dir, 1, 8192, 1, 1, now - 600);
+        char *longer = test_kv_chain_image_file(dir, 1, 9216, same ? 1 : 2, 1,
+                                                now - 300);
+        char *other = test_kv_chain_file(dir, 2, 8192, 0, KV_REASON_EVICT, 0,
+                                         now - 1800);
+
+        uint64_t total = test_kv_chain_bytes(8192) * 2 + test_kv_chain_bytes(9216) +
+                         2 * ds4_kvstore_image_block_bytes(1);
+        test_kv_chain_evict(dir, total, 1);
+
+        TEST_ASSERT((access(shorter, F_OK) == 0) == !same);
+        TEST_ASSERT(access(longer, F_OK) == 0);
+        TEST_ASSERT((access(other, F_OK) == 0) == !!same);
+
+        unlink(shorter); unlink(longer); unlink(other);
+        free(shorter); free(longer); free(other);
+        rmdir(dir);
+    }
+}
+
+static void test_kv_cache_eviction_learns_dead_tips(void) {
+    /* A client that rewrites every reply: its tip is never loaded, and the
+     * frontier underneath is what each turn resumes from.  After one dead tip
+     * the conversation's next tip gives way to its frontier.  A conversation
+     * with no such history keeps its tip and gives up the frontier. */
+    char tmpl[] = "/tmp/ds4-kv-chain-learn-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    /* The frontier was loaded after the tip was written: the tip is dead. */
+    char *front1 = test_kv_chain_file(dir, 1, 8192, 0, KV_REASON_CONTINUED, 1, now - 100);
+    char *dead1 = test_kv_chain_file(dir, 1, 8704, 5, KV_REASON_EVICT, 0, now - 200);
+    kc.budget_bytes = test_kv_chain_bytes(8192) + test_kv_chain_bytes(8704);
+    kv_cache_evict(&kc, NULL, 1, NULL);
+    TEST_ASSERT(access(dead1, F_OK) != 0);
+    TEST_ASSERT(access(front1, F_OK) == 0);
+
+    char *front2 = test_kv_chain_file(dir, 1, 12288, 0, KV_REASON_CONTINUED, 0, now - 50);
+    char *tip2 = test_kv_chain_file(dir, 1, 12800, 6, KV_REASON_EVICT, 0, now - 40);
+    char *other_front = test_kv_chain_file(dir, 2, 12288, 0, KV_REASON_CONTINUED, 0, now - 50);
+    char *other_tip = test_kv_chain_file(dir, 2, 12800, 0, KV_REASON_EVICT, 0, now - 40);
+    kc.budget_bytes = test_kv_chain_bytes(12288) + test_kv_chain_bytes(12800);
+    kv_cache_evict(&kc, NULL, 0, NULL);
+    TEST_ASSERT(access(front1, F_OK) != 0);
+    TEST_ASSERT(access(front2, F_OK) == 0);
+    TEST_ASSERT(access(tip2, F_OK) != 0);
+    TEST_ASSERT(access(other_front, F_OK) != 0);
+    TEST_ASSERT(access(other_tip, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(front1); unlink(dead1); unlink(front2); unlink(tip2);
+    unlink(other_front); unlink(other_tip);
+    free(front1); free(dead1); free(front2); free(tip2);
+    free(other_front); free(other_tip);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_is_lru_among_unrelated(void) {
+    /* Nothing extends anything here and nothing was hit: plain recency
+     * decides, down to minutes. */
+    char tmpl[] = "/tmp/ds4-kv-chain-lru-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+    uint64_t now = (uint64_t)time(NULL);
+    char *a = test_kv_chain_file(dir, 1, 8192, 0, KV_REASON_EVICT, 0, now - 900);
+    char *b = test_kv_chain_file(dir, 2, 8192, 0, KV_REASON_CONTINUED, 0, now - 600);
+    char *c = test_kv_chain_file(dir, 3, 8192, 0, KV_REASON_SHUTDOWN, 0, now - 300);
+
+    uint64_t total = test_kv_chain_bytes(8192) * 3;
+    test_kv_chain_evict(dir, total, 1);
+    TEST_ASSERT(access(a, F_OK) != 0);
+    TEST_ASSERT(access(b, F_OK) == 0);
+    TEST_ASSERT(access(c, F_OK) == 0);
+    test_kv_chain_evict(dir, total, test_kv_chain_bytes(8192) + 1);
+    TEST_ASSERT(access(b, F_OK) != 0);
+    TEST_ASSERT(access(c, F_OK) == 0);
+
+    unlink(a); unlink(b); unlink(c);
+    free(a); free(b); free(c);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -25412,6 +25832,16 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
+    test_kv_cache_eviction_score_ages_idle_entries();
+    test_kv_cache_eviction_drops_stale_before_fresh_frontier();
+    test_kv_cache_eviction_drops_old_tip_of_same_conversation();
+    test_kv_cache_eviction_keeps_fallback_under_unproven_tip();
+    test_kv_cache_eviction_drops_dead_tip();
+    test_kv_cache_eviction_keeps_entry_loaded_after_longer_one();
+    test_kv_cache_eviction_thins_waypoints_by_gap();
+    test_kv_cache_eviction_is_lru_among_unrelated();
+    test_kv_cache_eviction_tells_images_apart();
+    test_kv_cache_eviction_learns_dead_tips();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
 

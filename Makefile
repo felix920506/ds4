@@ -74,6 +74,7 @@ endif
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench session-concurrency-bench check-mxfp4-half-lut
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp test-v41-indexer-score
+.PHONY: kv-evict-sim kv-evict-sim-rocm
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -1500,6 +1501,28 @@ test-cuda-mixed-batch: tests/test_cuda_mixed_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_cuda_mixed_batch
 endif
 
+# Disk KV cache eviction simulator: no model, no GPU work.  It links the
+# engine only because ds4_kvstore.o refers to it.
+tests/kv_evict_sim.o: tests/kv_evict_sim.c ds4_kvstore.h ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/kv_evict_sim: tests/kv_evict_sim.o ds4_kvstore.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
+kv-evict-sim: tests/kv_evict_sim
+	./tests/kv_evict_sim
+
+kv-evict-sim-rocm:
+	$(MAKE) kv-evict-sim \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
+		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
+		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
+		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
+
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -1598,6 +1621,7 @@ ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o tests/test_session_state.o \
 tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
+	rm -f tests/kv_evict_sim tests/kv_evict_sim.o
 	rm -f tests/test_mmvq_cuda tests/test_mmvq_rocm
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_memory tests/test_qwen4_mtp_policy tests/test_qwen4_ssd_experts

@@ -82,7 +82,22 @@ typedef struct {
     const char *log_name;
     void *log_ud;
     void (*log)(void *ud, ds4_kvstore_log_type type, const char *msg);
+    /* Text signatures of the listed files, kept between eviction passes. */
+    struct ds4_kvstore_sig *sig;
+    int sig_len;
+    int sig_cap;
+    /* Dead tips seen lately; see ds4_kvstore.c. */
+    struct ds4_kvstore_mark *mark;
+    int mark_len;
+    int mark_next;
 } ds4_kvstore;
+
+/* One image of a saved checkpoint.  text_offset is where its marker starts in
+ * the cache text, so a lookup can tell an image from text that looks like one. */
+typedef struct {
+    ds4_vision_identity identity;
+    uint32_t text_offset;
+} ds4_kvstore_image;
 
 typedef struct {
     const char *text;
@@ -91,14 +106,12 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    /* DS4_KVSTORE_REASON_* of the checkpoint being stored. */
+    uint8_t reason;
+    /* Its images, if it has any. */
+    const ds4_kvstore_image *images;
+    size_t image_count;
 } ds4_kvstore_eviction_context;
-
-/* One image of a saved checkpoint.  text_offset is where its marker starts in
- * the cache text, so a lookup can tell an image from text that looks like one. */
-typedef struct {
-    ds4_vision_identity identity;
-    uint32_t text_offset;
-} ds4_kvstore_image;
 
 typedef struct {
     void *ud;
