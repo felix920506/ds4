@@ -63763,6 +63763,18 @@ typedef struct ds4_dspark_spec_stats {
 
 #endif
 
+/* A rewind anchor: the part of one frontier that later tokens overwrite.  See
+ * "Rewind Anchors" beside ds4_session_anchor_save(). */
+#define DS4_SESSION_ANCHOR_MAX 16
+
+typedef struct {
+    int pos;                /* tokens evaluated before this frontier */
+    uint64_t prefix_hash;   /* of those tokens; binds the anchor to its timeline */
+    uint32_t n_comp[DS4_MAX_LAYER];
+    uint32_t n_index_comp[DS4_MAX_LAYER];
+    uint8_t *state;         /* raw window rows and compressor state, layer by layer */
+} ds4_session_anchor;
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -63829,6 +63841,9 @@ struct ds4_session {
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
+    /* Rewind anchors of this checkpoint's timeline, oldest first. */
+    ds4_session_anchor anchors[DS4_SESSION_ANCHOR_MAX];
+    int anchor_count;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
@@ -63890,6 +63905,14 @@ struct ds4_session {
 };
 
 static bool ds4_session_tp_leader(const ds4_session *s);
+
+/* Forget every rewind anchor.  Called wherever the backend state is rebuilt
+ * from position zero or replaced by a payload: the token hash that guards an
+ * anchor cannot see image rows, so anchors must not outlive such a rebuild. */
+static void session_anchors_clear(ds4_session *s) {
+    for (int i = 0; i < s->anchor_count; i++) free(s->anchors[i].state);
+    s->anchor_count = 0;
+}
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -65307,6 +65330,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         payload_set_err(err, errlen, "invalid session layer payload load");
         return 1;
     }
+    session_anchors_clear(s);
     if (ds4_session_is_cpu(s)) {
         payload_set_err(err, errlen, "distributed layer payloads require the graph backend");
         return 1;
@@ -66970,6 +66994,7 @@ static int ds4_session_load_payload_unmetered(ds4_session *s, FILE *fp, uint64_t
                                               char *err, size_t errlen);
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (s) session_anchors_clear(s);
     const uint64_t t0 = metrics_begin();
     const int rc = ds4_session_load_payload_unmetered(s, fp, payload_bytes, err, errlen);
     metrics_end(t0, DS4_METRIC_KV_LOAD_NS);
@@ -77971,6 +77996,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #endif
     token_vec_free(&s->checkpoint);
+    session_anchors_clear(s);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
     free(s->logits);
@@ -79641,14 +79667,22 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  */
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 
-bool ds4_session_vision_prefix_matches(
+bool ds4_session_vision_prefix_matches_at(
         const ds4_session     *s,
         const ds4_vision_span *images,
-        size_t                 image_count) {
+        size_t                 image_count,
+        int                    pos) {
     if (!s || (image_count != 0 && !images)) return false;
-    if (!s->checkpoint_valid) return false;
-    if (s->checkpoint_image_count > image_count) return false;
-    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+    if (!s->checkpoint_valid || pos < 0 || pos > s->checkpoint.len) return false;
+    /* Images wholly before pos are history; later ones are not there yet. */
+    size_t history = 0;
+    while (history < s->checkpoint_image_count &&
+           (uint64_t)s->checkpoint_images[history].token_start +
+           s->checkpoint_images[history].token_count <= (uint64_t)pos) history++;
+    if (history > image_count) return false;
+    if (history < s->checkpoint_image_count &&
+        s->checkpoint_images[history].token_start < (uint32_t)pos) return false;
+    for (size_t i = 0; i < history; i++) {
         const ds4_vision_identity *old = &s->checkpoint_images[i];
         const ds4_vision_span *current = &images[i];
         if (old->token_start != current->token_start ||
@@ -79656,11 +79690,19 @@ bool ds4_session_vision_prefix_matches(
             memcmp(old->fingerprint, current->embedding.fingerprint,
                    sizeof(old->fingerprint)) != 0) return false;
     }
-    if (s->checkpoint_image_count < image_count) {
-        const ds4_vision_span *next = &images[s->checkpoint_image_count];
-        if (next->token_start < (uint32_t)s->checkpoint.len) return false;
+    if (history < image_count) {
+        const ds4_vision_span *next = &images[history];
+        if (next->token_start < (uint32_t)pos) return false;
     }
     return true;
+}
+
+bool ds4_session_vision_prefix_matches(
+        const ds4_session     *s,
+        const ds4_vision_span *images,
+        size_t                 image_count) {
+    return s && ds4_session_vision_prefix_matches_at(s, images, image_count,
+                                                     s->checkpoint.len);
 }
 
 bool ds4_session_vision_state_matches(
@@ -81244,6 +81286,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    session_anchors_clear(s);
     ds4_session_dspark_capture_invalidate(s);
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
@@ -91278,6 +91321,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    session_anchors_clear(s);
     free(s->checkpoint_images);
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;
@@ -91491,6 +91535,256 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #endif
 }
 
+/* =========================================================================
+ * Rewind Anchors.
+ * =========================================================================
+ *
+ * A DeepSeek V4 frontier cannot be rolled back by truncating row counts.  The
+ * compressed rows are append-only, so the ones before an earlier position are
+ * still there, but two things are not: the raw sliding-window ring has been
+ * overwritten by later tokens, and each compressor holds the partial window of
+ * the latest tokens instead of the one it held back then.  An anchor is a host
+ * copy of exactly that perishable part of one frontier - the window of raw
+ * rows before it, the compressor state, and the compressed row counts.  With
+ * it the session can return to that position and evaluate a different
+ * continuation, at a cost that does not grow with the context (about 22 MiB
+ * for all of Flash, against a disk checkpoint that also carries every
+ * compressed row).
+ *
+ * Callers take anchors where they may want to come back to, such as the start
+ * of a reply and at intervals inside it (ds4_session_anchor_save).  A fixed
+ * number is kept.  When they run out, the one whose loss lengthens a replay
+ * least, relative to how far back it lies, is dropped: spacing grows with age,
+ * so a rewind of d tokens replays a bounded fraction of d on top.
+ *
+ * An anchor is only valid for the timeline it was taken from.  Each one
+ * records a hash of the tokens before it and is restored only into a
+ * checkpoint whose tokens still hash the same.  Image rows are invisible to
+ * that hash, so every path that rebuilds the state from position zero or
+ * replaces it with a payload drops all anchors (session_anchors_clear).
+ *
+ * On a pipeline, every stage keeps anchors for its own layers; the
+ * coordinator's save and rewind travel as flags on its next WORK frame.
+ */
+
+/* Start from ANCHOR_HASH_INIT; a nonzero start makes the length count. */
+#define ANCHOR_HASH_INIT UINT64_C(0xcbf29ce484222325)
+
+static uint64_t anchor_hash_extend(uint64_t h, const int *tokens, int n) {
+    for (int i = 0; i < n; i++) {
+        h = (h ^ (uint32_t)tokens[i]) * UINT64_C(0x9e3779b97f4a7c15);
+        h ^= h >> 32;
+    }
+    return h;
+}
+
+static void session_anchor_drop(ds4_session *s, int i) {
+    free(s->anchors[i].state);
+    memmove(&s->anchors[i], &s->anchors[i + 1],
+            (size_t)(s->anchor_count - i - 1) * sizeof(s->anchors[0]));
+    s->anchor_count--;
+}
+
+/* Index of the newest anchor at or below pos that belongs to the current
+ * timeline, or -1.  Anchors are sorted, so one pass extends a single hash. */
+static int session_anchor_find(const ds4_session *s, int pos) {
+    if (!s || !s->checkpoint_valid) return -1;
+    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    int found = -1, hashed = 0;
+    uint64_t h = ANCHOR_HASH_INIT;
+    for (int i = 0; i < s->anchor_count && s->anchors[i].pos <= pos; i++) {
+        const ds4_session_anchor *a = &s->anchors[i];
+        h = anchor_hash_extend(h, s->checkpoint.v + hashed, a->pos - hashed);
+        hashed = a->pos;
+        /* Left behind by a continuation that was rewound some other way. */
+        if (h != a->prefix_hash) continue;
+        /* A frontier cannot be resumed from inside an image. */
+        bool splits_image = false;
+        for (size_t k = 0; k < s->checkpoint_image_count; k++) {
+            const ds4_vision_identity *im = &s->checkpoint_images[k];
+            if ((uint64_t)a->pos > im->token_start &&
+                (uint64_t)a->pos < (uint64_t)im->token_start + im->token_count)
+                splits_image = true;
+        }
+        if (!splits_image) found = i;
+    }
+    return found;
+}
+
+int ds4_session_anchor_floor(const ds4_session *s, int pos) {
+    if (s && s->distributed && !ds4_dist_session_anchors_supported(s->distributed))
+        return -1;
+    const int i = session_anchor_find(s, pos);
+    return i < 0 ? -1 : s->anchors[i].pos;
+}
+
+#ifndef DS4_NO_GPU
+/* Anchors exist for the DeepSeek V4 graph, alone or as a pipeline stage.
+ * Tensor parallelism keeps part of this state a second time, on the peer or
+ * on the partner card, which an anchor does not cover. */
+static bool session_anchor_capable(const ds4_session *s) {
+    return s && s->engine && !ds4_session_is_cpu(s) &&
+           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+           !s->engine->tp.active && !s->graph.cuda_tp_decode &&
+           s->graph.raw_cap != 0 &&
+           (!s->distributed || ds4_dist_session_anchors_supported(s->distributed));
+}
+
+enum { ANCHOR_SIZE, ANCHOR_SAVE, ANCHOR_RESTORE };
+
+static uint64_t anchor_span(ds4_gpu_tensor *tensor, uint64_t offset, uint64_t bytes,
+                            uint8_t *host, uint64_t at, int mode, bool *ok) {
+    if (bytes == 0) return at;
+    if (*ok && mode == ANCHOR_SAVE)
+        *ok = ds4_gpu_tensor_read(tensor, offset, host + at, bytes) != 0;
+    if (*ok && mode == ANCHOR_RESTORE)
+        *ok = ds4_gpu_tensor_write(tensor, offset, host + at, bytes) != 0;
+    return at + bytes;
+}
+
+/* Walk the perishable state of the frontier at pos in one fixed order: size
+ * it, copy it to the host, or copy it back.  Returns the bytes covered. */
+static uint64_t session_anchor_copy(ds4_gpu_graph *g, uint32_t pos, uint8_t *host,
+                                    int mode, bool *ok) {
+    const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t rows = session_raw_live_rows(g, pos);
+    const uint32_t first = (pos - rows) % g->raw_cap;
+    /* The window is contiguous in positions but may wrap in the ring. */
+    const uint32_t head = rows < g->raw_cap - first ? rows : g->raw_cap - first;
+    uint64_t at = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        /* A pipeline stage holds state only for its own layers. */
+        if (!g->layer_raw_cache[il]) continue;
+        at = anchor_span(g->layer_raw_cache[il], first * row, head * row,
+                         host, at, mode, ok);
+        at = anchor_span(g->layer_raw_cache[il], 0, (rows - head) * row,
+                         host, at, mode, ok);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        at = anchor_span(g->layer_attn_state_kv[il], 0, ab, host, at, mode, ok);
+        at = anchor_span(g->layer_attn_state_score[il], 0, ab, host, at, mode, ok);
+        if (ratio != 4) continue;
+        const uint64_t ib = layer_index_state_bytes(ratio);
+        at = anchor_span(g->layer_index_state_kv[il], 0, ib, host, at, mode, ok);
+        at = anchor_span(g->layer_index_state_score[il], 0, ib, host, at, mode, ok);
+    }
+    return at;
+}
+
+/* Make room for one more anchor.  Dropping anchor i merges the gaps on either
+ * side of it; the cost is that merged gap relative to how far behind the
+ * frontier it reaches.  Position zero stands in as the anchor before the
+ * oldest, because a full prefill is always available. */
+static void session_anchor_thin(ds4_session *s, int frontier) {
+    int victim = 0;
+    double least = 2.0;
+    for (int i = 0; i + 1 < s->anchor_count; i++) {
+        const int below = i ? s->anchors[i - 1].pos : 0;
+        const double cost = (double)(s->anchors[i + 1].pos - below) /
+                            (double)(frontier - below);
+        if (cost < least) {
+            least = cost;
+            victim = i;
+        }
+    }
+    session_anchor_drop(s, victim);
+}
+#endif
+
+bool ds4_session_anchor_save(ds4_session *s) {
+#ifdef DS4_NO_GPU
+    (void)s;
+    return false;
+#else
+    if (s && s->distributed) ds4_dist_session_anchor_probe(s->distributed);
+    if (!session_anchor_capable(s) || !s->checkpoint_valid || s->checkpoint.len <= 0)
+        return false;
+    const int pos = s->checkpoint.len;
+    /* Drop what a rewound continuation left behind: anchors past the
+     * frontier, and earlier ones whose tokens have since been replaced. */
+    uint64_t hash = ANCHOR_HASH_INIT;
+    int hashed = 0;
+    for (int i = 0; i < s->anchor_count;) {
+        const ds4_session_anchor *a = &s->anchors[i];
+        if (a->pos <= pos) {
+            hash = anchor_hash_extend(hash, s->checkpoint.v + hashed, a->pos - hashed);
+            hashed = a->pos;
+        }
+        if (a->pos > pos || a->prefix_hash != hash) session_anchor_drop(s, i);
+        else i++;
+    }
+    hash = anchor_hash_extend(hash, s->checkpoint.v + hashed, pos - hashed);
+    if (s->anchor_count && s->anchors[s->anchor_count - 1].pos == pos) return true;
+
+    ds4_gpu_graph *g = &s->graph;
+    bool ok = ds4_gpu_synchronize() != 0;
+    ds4_session_anchor a = {.pos = pos, .prefix_hash = hash};
+    a.state = ok ? malloc((size_t)session_anchor_copy(g, (uint32_t)pos, NULL,
+                                                      ANCHOR_SIZE, &ok)) : NULL;
+    if (!a.state) return false;
+    session_anchor_copy(g, (uint32_t)pos, a.state, ANCHOR_SAVE, &ok);
+    if (!ok) {
+        free(a.state);
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        a.n_comp[il] = g->layer_n_comp[il];
+        a.n_index_comp[il] = g->layer_n_index_comp[il];
+    }
+    if (s->anchor_count == DS4_SESSION_ANCHOR_MAX) session_anchor_thin(s, pos);
+    s->anchors[s->anchor_count++] = a;
+    if (s->distributed) ds4_dist_session_anchor_note(s->distributed, (uint32_t)pos, false);
+    return true;
+#endif
+}
+
+bool ds4_session_anchor_rewind(ds4_session *s, int pos) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)pos;
+    return false;
+#else
+    if (!session_anchor_capable(s)) return false;
+    const int i = session_anchor_find(s, pos);
+    if (i < 0 || s->anchors[i].pos != pos) return false;
+    if (pos == s->checkpoint.len) return true;
+
+    ds4_gpu_graph *g = &s->graph;
+    const ds4_session_anchor *a = &s->anchors[i];
+    bool ok = ds4_gpu_synchronize() != 0;
+    if (ok) session_anchor_copy(g, (uint32_t)pos, a->state, ANCHOR_RESTORE, &ok);
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (!ok) {
+        /* Some layers may already hold the anchor's rows. */
+        ds4_session_invalidate(s);
+        return false;
+    }
+    /* Rows past these counts stay behind as garbage that the continuation
+     * overwrites before anything can read it, as after a speculative commit. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_n_comp[il] = a->n_comp[il];
+        g->layer_n_index_comp[il] = a->n_index_comp[il];
+    }
+    s->checkpoint.len = pos;
+    while (s->anchor_count > i + 1) session_anchor_drop(s, s->anchor_count - 1);
+    while (s->checkpoint_image_count &&
+           (uint64_t)s->checkpoint_images[s->checkpoint_image_count - 1].token_start +
+           s->checkpoint_images[s->checkpoint_image_count - 1].token_count > (uint64_t)pos)
+        s->checkpoint_image_count--;
+    /* Drafting state describes the abandoned continuation, and the logits
+     * are those of its last token: the caller evaluates at least one token
+     * from here before sampling. */
+    s->mtp_draft_valid = false;
+    s->dist_spec_pending = false;
+    g->mtp_n_raw = 0;
+    metal_graph_dspark_cache_reset(g);
+    ds4_session_dspark_capture_invalidate(s);
+    session_greedy_splitkv_reset(s);
+    if (s->distributed) ds4_dist_session_anchor_note(s->distributed, (uint32_t)pos, true);
+    return true;
+#endif
+}
+
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }
@@ -91506,9 +91800,16 @@ ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
     return s;
 }
 
+void ds4_session_add_test_anchor(ds4_session *s, int pos) {
+    s->anchors[s->anchor_count++] = (ds4_session_anchor){
+        .pos = pos,
+        .prefix_hash = anchor_hash_extend(ANCHOR_HASH_INIT, s->checkpoint.v, pos)};
+}
+
 void ds4_session_free_test_checkpoint(ds4_session *s) {
     if (!s) return;
     token_vec_free(&s->checkpoint);
+    session_anchors_clear(s);
     free(s->checkpoint_images);
     free(s);
 }

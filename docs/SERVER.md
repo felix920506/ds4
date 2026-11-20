@@ -136,6 +136,40 @@ that replay their full screenshot history each turn fit. The body buffer grows
 as bytes arrive, so a client that advertises a large Content-Length without
 sending the body does not reserve that memory.
 
+## Live KV reuse and rewind
+
+Clients resend the whole conversation on every turn. A slot keeps the KV
+state of the conversation it last served, so a request that extends it only
+evaluates what is new. The match is on tokens first and on rendered text
+second, because resent history does not always tokenize the way it was
+sampled.
+
+A request can also leave the live state part way: the client sent the last
+reply back with different bytes than the model produced (trimmed, reformatted,
+or with a tool call rebuilt from its arguments), or the user regenerated an
+answer or edited an earlier message. DeepSeek V4 Flash and PRO sessions then
+rewind instead of starting over. While it generates, the server keeps a rewind
+anchor at the start of each reply and every 256 tokens inside it; an anchor is
+a copy of the small part of the state that later tokens overwrite (about
+22 MiB for Flash, whatever the context length). The session returns to the
+nearest anchor below the point where the request diverges and evaluates the
+rest:
+
+```
+ds4-server: live kv rewind live=195170 prompt=200550 common=192692 anchor=192512: keeping 192512 tokens, re-evaluating 180 that still match
+```
+
+A session holds at most 16 anchors, close together near the end of the
+conversation and further apart behind it, so a divergence in the last reply
+costs a few hundred extra tokens and one in an older turn costs a fraction of
+the distance. A request that keeps less than half of a slot's state is treated
+as a different conversation and does not take that slot away from its owner.
+When no anchor is usable (other model families, tensor parallelism, or a
+divergence before the first anchor), the request is a
+`live kv cache miss ... reason=token-mismatch`, served from the disk KV cache
+if that has a usable prefix and prefilled from the first token otherwise.
+With several slots, a request goes to the slot that keeps the most.
+
 ## Disk KV cache
 
 Disk caching saves useful prefixes across slot reuse and server restarts:

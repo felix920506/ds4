@@ -71,11 +71,22 @@
 /* Set on the first draft of a request so the final stage restarts its DSpark
  * scheduler, as a local session does when a request begins. */
 #define DS4_DIST_WORK_F_DSPARK_NEW_REQUEST 0x00000040u
+/* Rewind anchors (ds4_session_anchor_save): before evaluating the span, the
+ * stage returns to its anchor at pos0, and/or keeps one there.  They ride on
+ * the frame that would be sent anyway, so anchors cost no round trip. */
+#define DS4_DIST_WORK_F_ANCHOR_SAVE 0x00000080u
+#define DS4_DIST_WORK_F_ANCHOR_REWIND 0x00000100u
+#define DS4_DIST_WORK_F_ANCHOR_MASK \
+    (DS4_DIST_WORK_F_ANCHOR_SAVE | DS4_DIST_WORK_F_ANCHOR_REWIND)
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
      DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
      DS4_DIST_WORK_F_DSPARK_DRAFT | DS4_DIST_WORK_F_DSPARK_VERIFY | \
-     DS4_DIST_WORK_F_DSPARK_NEW_REQUEST)
+     DS4_DIST_WORK_F_DSPARK_NEW_REQUEST | DS4_DIST_WORK_F_ANCHOR_MASK)
+/* What a worker answers to a flag it does not know, and to a frame without
+ * tokens.  It checks the flags first, which the anchor probe relies on. */
+#define DS4_DIST_ERR_WORK_FLAGS "invalid distributed WORK flags"
+#define DS4_DIST_ERR_WORK_NO_TOKENS "WORK frame has no tokens"
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
@@ -261,6 +272,9 @@ typedef struct {
     pthread_mutex_t mu;
     ds4_dist_worker_entry *workers;
     bool shutting_down;
+    /* A worker from an older build refused the anchor flags: no session
+     * uses anchors from then on. */
+    bool anchors_rejected;
 } ds4_dist_coordinator_state;
 
 typedef struct {
@@ -438,6 +452,15 @@ struct ds4_dist_session {
     uint64_t prefix_hash;
     uint64_t prefix_request;
     uint32_t prefix_len;
+    /* Anchor flags the remote stages are owed on the next frame that starts
+     * at anchor_pos; a frame from anywhere else means they no longer apply. */
+    uint32_t anchor_pos;
+    uint32_t anchor_flags;
+    /* The first-hop connection that was asked whether it knows those flags,
+     * and its answer. */
+    uint64_t anchor_probe_generation;
+    int anchor_probe_fd;
+    bool anchor_probe_ok;
     /* Set once the route shows it cannot draft, so later cycles skip the
      * round trip. */
     bool dspark_unavailable;
@@ -490,6 +513,7 @@ typedef struct {
     uint64_t result_hash;
     bool reset_session;
     bool ack_only;
+    uint32_t extra_flags;
     float *hidden;
 } ds4_dist_prefill_send_slot;
 
@@ -541,6 +565,8 @@ static int dist_send_work_frame(
         const float *input_hc,
         const void *route_blob);
 static int dist_write_full(int fd, const void *buf, size_t len);
+static uint32_t dist_session_take_anchor_flags(ds4_dist_session *d, ds4_session *owner,
+                                               uint32_t pos0);
 static int dist_send_snapshot_file_chunks(
         int fd,
         uint64_t request_id,
@@ -2505,7 +2531,7 @@ static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
 
 static int dist_recv_result_alloc(
         int fd,
-        const ds4_dist_coordinator_state *state,
+        ds4_dist_coordinator_state *state,
         uint64_t request_id,
         uint32_t *kind,
         uint64_t *result_hash,
@@ -2618,6 +2644,14 @@ static int dist_recv_result_alloc(
             } else {
                 snprintf(err, errlen, "distributed worker returned an error");
             }
+        }
+        if (buf && !state->anchors_rejected &&
+            memmem(buf, result.payload_bytes, DS4_DIST_ERR_WORK_FLAGS,
+                   sizeof(DS4_DIST_ERR_WORK_FLAGS) - 1)) {
+            state->anchors_rejected = true;
+            fprintf(stderr,
+                    "ds4: distributed coordinator: a worker refused the rewind-anchor flags "
+                    "(older build?); live KV rewind is off until all nodes run this build\n");
         }
         free(buf);
         return DS4_DIST_RECV_REMOTE_ERROR;
@@ -2811,6 +2845,7 @@ static int dist_coordinator_eval_remote_on_fd(
         uint64_t prefix_hash,
         uint64_t expected_result_hash,
         bool reset_session,
+        uint32_t extra_flags,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
         float *logits,
@@ -2833,7 +2868,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      expected_result_hash,
                                                      reset_session,
                                                      false,
-                                                     0,
+                                                     extra_flags,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
                                                      err,
@@ -2865,6 +2900,7 @@ static int dist_coordinator_eval_span(
         uint64_t session_id,
         uint64_t request_id,
         bool reset_session,
+        uint32_t extra_flags,
         const uint64_t *known_prefix_hash,
         float *logits,
         char *err,
@@ -2949,6 +2985,7 @@ static int dist_coordinator_eval_span(
                                                 prefix_hash,
                                                 result_hash,
                                                 reset_session,
+                                                extra_flags,
                                                 hidden,
                                                 hidden_bytes,
                                                 logits,
@@ -3246,7 +3283,7 @@ static int dist_write_logprobs_dump(
         if (dist_coordinator_eval_span(state, session, plan,
                                        &token, 1, token_pos,
                                        session_id, (*request_id)++,
-                                       false, NULL, logits, err, sizeof(err)) != 0) {
+                                       false, 0, NULL, logits, err, sizeof(err)) != 0) {
             fprintf(stderr,
                     "ds4: distributed decode failed while dumping logprobs: %s\n",
                     err);
@@ -3422,7 +3459,7 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->result_hash,
                                                          slot->reset_session,
                                                          slot->ack_only,
-                                                         0,
+                                                         slot->extra_flags,
                                                          slot->hidden,
                                                          slot->hidden_bytes,
                                                          send_err,
@@ -3707,6 +3744,7 @@ static int dist_coordinator_prefill_prompt_pipelined_chunks(
         uint32_t span_start,
         uint32_t n_tokens,
         bool reset_first_chunk,
+        uint32_t first_chunk_flags,
         uint32_t chunk_cap,
         const uint32_t *chunk_offsets,
         uint32_t chunk_count,
@@ -3878,6 +3916,7 @@ static int dist_coordinator_prefill_prompt_pipelined_chunks(
         slot->prefix_hash = next_prefix_hash;
         slot->result_hash = reader.expected_hashes[submitted_chunks];
         slot->reset_session = reset_first_chunk && pos == span_start;
+        slot->extra_flags = pos == span_start ? first_chunk_flags : 0;
         slot->ack_only = !getenv("DS4_DIST_DISABLE_PREFILL_ACK_ONLY") &&
                          pos + chunk < span_end;
         rc = dist_prefill_sender_enqueue_slot(&sender, err, errlen);
@@ -4035,6 +4074,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
         uint32_t span_start,
         uint32_t n_tokens,
         bool reset_first_chunk,
+        uint32_t first_chunk_flags,
         uint32_t chunk_cap,
         uint64_t session_id,
         uint64_t *request_id,
@@ -4056,7 +4096,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     }
     const int rc = dist_coordinator_prefill_prompt_pipelined_chunks(
             state, session, plan, prompt, span_start, n_tokens, reset_first_chunk,
-            chunk_cap, chunk_offsets, chunk_count, session_id, request_id,
+            first_chunk_flags, chunk_cap, chunk_offsets, chunk_count, session_id, request_id,
             logits, err, errlen);
     free(chunk_offsets);
     return rc;
@@ -4085,6 +4125,7 @@ static int dist_coordinator_prefill_prompt(
                                                         0,
                                                         prompt_len,
                                                         true,
+                                                        0,
                                                         chunk_cap,
                                                         session_id,
                                                         request_id,
@@ -4101,7 +4142,7 @@ static int dist_coordinator_prefill_prompt(
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
-                                                 pos == 0, NULL, logits, err, errlen);
+                                                 pos == 0, 0, NULL, logits, err, errlen);
         if (eval_rc != 0) {
             return eval_rc;
         }
@@ -4340,7 +4381,7 @@ static int dist_run_coordinator_generation(
         int decode_rc = dist_coordinator_eval_span(state, session, &plan,
                                                    &token, 1, token_pos,
                                                    session_id, request_id++,
-                                                   false, NULL, logits, err, sizeof(err));
+                                                   false, 0, NULL, logits, err, sizeof(err));
         if (decode_rc != 0) {
             fprintf(stderr, "\nds4: distributed decode failed: %s\n", err);
             if (dist_coordinator_rebuild_from_transcript(state,
@@ -5888,6 +5929,7 @@ int ds4_dist_session_sync(
         }
         const uint32_t pos0 = (uint32_t)checkpoint->len;
         const uint32_t suffix = (uint32_t)prompt->len - pos0;
+        const uint32_t anchor_flags = dist_session_take_anchor_flags(d, owner, pos0);
         if (dist_coordinator_can_pipeline_prefill(&d->coord->state, &d->plan, owner, suffix, chunk_cap)) {
             int prefill_rc = dist_coordinator_prefill_prompt_pipelined(&d->coord->state,
                                                                        owner,
@@ -5896,6 +5938,7 @@ int ds4_dist_session_sync(
                                                                        pos0,
                                                                        suffix,
                                                                        false,
+                                                                       anchor_flags,
                                                                        chunk_cap,
                                                                        d->session_id,
                                                                        &d->request_id,
@@ -5938,6 +5981,7 @@ int ds4_dist_session_sync(
                                                      d->session_id,
                                                      d->request_id++,
                                                      false,
+                                                     pos == pos0 ? anchor_flags : 0,
                                                      NULL,
                                                      logits,
                                                      err,
@@ -5967,6 +6011,8 @@ int ds4_dist_session_sync(
         return 0;
     }
 
+    /* Every stage starts over, so no anchor is owed to anyone. */
+    d->anchor_flags = 0;
     int prefill_rc = dist_coordinator_prefill_prompt(&d->coord->state,
                                                      owner,
                                                      &d->plan,
@@ -5994,6 +6040,105 @@ int ds4_dist_session_sync(
         }
         d->plan_ready = true;
     }
+    return 0;
+}
+
+/* Rewind anchors on a pipeline.  The coordinator session saves and restores
+ * the anchor of its own layers directly; the remote stages are told with a
+ * flag on the next frame that starts at the same position, which is the next
+ * frame of any continuation from there.  A stage that cannot follow a rewind
+ * answers with an error, and the usual rebuild from the transcript recovers.
+ *
+ * A worker from a build without anchors refuses the flags outright, which
+ * would cost a rebuild the first time one is sent.  So each first-hop
+ * connection is asked once, before any session state depends on the answer:
+ * a WORK frame that carries an anchor flag and no tokens is refused by every
+ * build, for the flag by an old one and for the missing tokens by this one. */
+static int dist_session_anchor_fd(const ds4_dist_session *d) {
+    return d->plan.count ? d->plan.entry[0].fd : -1;
+}
+
+bool ds4_dist_session_anchors_supported(const ds4_dist_session *d) {
+    return d && d->plan_ready && d->anchor_probe_ok &&
+           d->anchor_probe_generation == d->plan_generation &&
+           d->anchor_probe_fd == dist_session_anchor_fd(d) &&
+           !d->coord->state.anchors_rejected;
+}
+
+void ds4_dist_session_anchor_probe(ds4_dist_session *d) {
+    if (!d || !d->plan_ready) return;
+    const int fd = dist_session_anchor_fd(d);
+    if (d->anchor_probe_generation == d->plan_generation && d->anchor_probe_fd == fd) return;
+    d->anchor_probe_generation = d->plan_generation;
+    d->anchor_probe_fd = fd;
+    /* With no remote stage there is nobody to ask. */
+    d->anchor_probe_ok = d->plan.count == 0;
+    if (d->plan.count == 0 || fd < 0) return;
+
+    ds4_dist_coordinator_state *state = &d->coord->state;
+    const ds4_dist_route_entry *first = &d->plan.entry[0];
+    const uint64_t request_id = d->request_id++;
+    ds4_dist_work_fixed work = {
+        .model_id = state->model_id,
+        .layer_start = first->layer_start,
+        .layer_end = first->layer_end,
+        .flags = DS4_DIST_WORK_F_ANCHOR_SAVE,
+        .route_count = d->plan.count,
+        .route_bytes = d->plan.blob_bytes,
+    };
+    dist_u64_to_halves(d->session_id, &work.session_hi, &work.session_lo);
+    dist_u64_to_halves(request_id, &work.request_hi, &work.request_lo);
+    dist_work_to_wire(&work);
+    char err[256] = {0};
+    uint32_t kind = 0, payload_bytes = 0;
+    void *payload = NULL;
+    if (dist_write_frame_header(fd, DS4_DIST_MSG_WORK,
+                                (uint32_t)sizeof(work) + d->plan.blob_bytes) != 0 ||
+        dist_write_full(fd, &work, sizeof(work)) != 0 ||
+        (d->plan.blob_bytes && dist_write_full(fd, d->plan.blob, d->plan.blob_bytes) != 0)) {
+        return;
+    }
+    const int rc = dist_recv_result_alloc(fd, state, request_id, &kind, NULL,
+                                          &payload, &payload_bytes, err, sizeof(err));
+    free(payload);
+    d->anchor_probe_ok = rc == DS4_DIST_RECV_REMOTE_ERROR &&
+                         strstr(err, DS4_DIST_ERR_WORK_NO_TOKENS) != NULL;
+}
+
+void ds4_dist_session_anchor_note(ds4_dist_session *d, uint32_t pos, bool rewind) {
+    if (!d) return;
+    if (d->anchor_pos != pos) d->anchor_flags = 0;
+    d->anchor_pos = pos;
+    d->anchor_flags |= rewind ? DS4_DIST_WORK_F_ANCHOR_REWIND : DS4_DIST_WORK_F_ANCHOR_SAVE;
+}
+
+/* The flags for a frame that starts at pos0.  They are owed only while the
+ * coordinator stage still holds that anchor itself: a reset or a loaded
+ * payload in between dropped it, and the remote stages must not keep or
+ * look for one the coordinator no longer has. */
+static uint32_t dist_session_take_anchor_flags(ds4_dist_session *d, ds4_session *owner,
+                                               uint32_t pos0) {
+    uint32_t flags = d->anchor_pos == pos0 ? d->anchor_flags : 0;
+    d->anchor_flags = 0;
+    if (flags && ds4_session_anchor_floor(owner, (int)pos0) != (int)pos0) flags = 0;
+    return flags;
+}
+
+/* Worker side: bring this stage's session to the anchor a frame asks for.
+ * The caller then checks the frame's prefix hash against the rewound
+ * timeline, so a stage can never continue from an anchor of other tokens. */
+static int dist_worker_anchor_rewind(
+        ds4_dist_worker_session *session,
+        const ds4_dist_work_fixed *work,
+        char *err,
+        size_t errlen) {
+    if ((work->flags & DS4_DIST_WORK_F_ANCHOR_REWIND) == 0) return 0;
+    if (!ds4_session_anchor_rewind(session->session, (int)work->pos0)) {
+        session->token_hash_valid = false;
+        if (errlen) snprintf(err, errlen, "worker has no rewind anchor at %u", work->pos0);
+        return 1;
+    }
+    session->token_hash_valid = false;
     return 0;
 }
 
@@ -6111,7 +6256,8 @@ static int dist_batch_submit_member(
     if (dist_coordinator_send_remote_work_on_fd(
             state, &d->plan, d->plan.entry[0].fd, &item->token, 1, pos0,
             d->session_id, member->request_id, prefix_hash, member->result_hash,
-            false, false, 0, hidden, hidden_bytes, err, errlen) != 0) {
+            false, false, dist_session_take_anchor_flags(d, item->owner, pos0),
+            hidden, hidden_bytes, err, errlen) != 0) {
         return 1;
     }
     member->submitted = true;
@@ -6291,6 +6437,7 @@ int ds4_dist_session_eval(
                                         d->session_id,
                                         d->request_id++,
                                         false,
+                                        dist_session_take_anchor_flags(d, owner, pos0),
                                         &prefix_hash,
                                         logits,
                                         err,
@@ -6494,7 +6641,8 @@ int ds4_dist_session_dspark_cycle(
      * as an ordinary decode, so the draft costs no extra wall time. */
     const uint64_t draft_request = d->request_id++;
     const uint32_t draft_flags = DS4_DIST_WORK_F_DSPARK_DRAFT |
-                                 (new_request ? DS4_DIST_WORK_F_DSPARK_NEW_REQUEST : 0u);
+                                 (new_request ? DS4_DIST_WORK_F_DSPARK_NEW_REQUEST : 0u) |
+                                 dist_session_take_anchor_flags(d, owner, pos0);
     if (dist_coordinator_send_remote_work_on_fd(state, &d->plan, fd,
                                                 &seed, 1, pos0,
                                                 d->session_id, draft_request,
@@ -6556,7 +6704,7 @@ int ds4_dist_session_dspark_cycle(
         rc = dist_coordinator_eval_remote_on_fd(state, owner, &d->plan, fd,
                                                 &seed, 1, pos0,
                                                 d->session_id, d->request_id++,
-                                                prefix_hash, result_hash, false,
+                                                prefix_hash, result_hash, false, 0,
                                                 hidden, (uint32_t)row_bytes,
                                                 logits, err, errlen);
         free(hidden);
@@ -6592,7 +6740,7 @@ int ds4_dist_session_dspark_cycle(
         rc = dist_coordinator_eval_remote_on_fd(state, owner, &d->plan, fd,
                                                 &seed, 1, pos0,
                                                 d->session_id, d->request_id++,
-                                                prefix_hash, result_hash, false,
+                                                prefix_hash, result_hash, false, 0,
                                                 hidden, (uint32_t)row_bytes,
                                                 logits, err, errlen);
         free(hidden);
@@ -8267,6 +8415,7 @@ static int dist_worker_process_dspark(
     ds4_dist_worker_session *session =
         dist_worker_get_session_locked(state, session_id, err, sizeof(err));
     if (!session) rc = 1;
+    if (rc == 0) rc = dist_worker_anchor_rewind(session, work, err, sizeof(err));
     if (rc == 0 && !session->token_hash_valid) {
         const ds4_tokens *timeline = ds4_session_tokens(session->session);
         if (!timeline || timeline->len < 0) {
@@ -8281,6 +8430,8 @@ static int dist_worker_process_dspark(
         snprintf(err, sizeof(err), "worker KV prefix hash mismatch");
         rc = 1;
     }
+    if (rc == 0 && (work->flags & DS4_DIST_WORK_F_ANCHOR_SAVE) != 0)
+        (void)ds4_session_anchor_save(session->session);
     if (rc == 0 && draft) {
         int drafts[DS4_DIST_DSPARK_MAX_DRAFTS];
         const bool new_request =
@@ -8448,10 +8599,10 @@ static int dist_worker_process_work_payload(
         return dist_worker_upstream_send_work_error(upstream, request_id, err);
     }
     if ((work.flags & ~DS4_DIST_WORK_F_VALID_MASK) != 0) {
-        return dist_worker_upstream_send_work_error(upstream, request_id, "invalid distributed WORK flags");
+        return dist_worker_upstream_send_work_error(upstream, request_id, DS4_DIST_ERR_WORK_FLAGS);
     }
     if (work.n_tokens == 0) {
-        return dist_worker_upstream_send_work_error(upstream, request_id, "WORK frame has no tokens");
+        return dist_worker_upstream_send_work_error(upstream, request_id, DS4_DIST_ERR_WORK_NO_TOKENS);
     }
     if (work.pos0 > (uint32_t)state->ctx_size ||
         work.n_tokens > (uint32_t)state->ctx_size - work.pos0) {
@@ -8712,8 +8863,9 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, err);
     }
-    if ((work.flags & DS4_DIST_WORK_F_RESET_SESSION) != 0 &&
-        ds4_session_layer_slice_reset(session->session, err, sizeof(err)) != 0) {
+    if (((work.flags & DS4_DIST_WORK_F_RESET_SESSION) != 0 &&
+         ds4_session_layer_slice_reset(session->session, err, sizeof(err)) != 0) ||
+        dist_worker_anchor_rewind(session, &work, err, sizeof(err)) != 0) {
         pthread_mutex_unlock(&state->mu);
         if (!input_hc_uses_wire) free(input_hc);
         free(result);
@@ -8745,6 +8897,8 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
     }
+    if ((work.flags & DS4_DIST_WORK_F_ANCHOR_SAVE) != 0)
+        (void)ds4_session_anchor_save(session->session);
     const double eval_t0 = dist_now_sec();
     int eval_rc = ds4_session_eval_layer_slice(session->session,
                                                tokens,
