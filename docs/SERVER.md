@@ -177,7 +177,9 @@ cache image conversations, because their cache loading rebuilds from tokens.
 
 TP cache loading rebuilds the saved token prefix on both ranks. It is not an
 instantaneous restoration of both GPUs. Pipeline loading redistributes the
-saved layer state over its route.
+saved layer state over its route. A pipeline server saves checkpoints only
+when every stage runs with the same `--ctx` and `--prefill-chunk`; see
+[Pipeline parallelism](DISTRIBUTED.md#pipeline-parallelism).
 
 Defaults are intended to avoid saving fragile token boundaries. For unusual
 workloads, the controls are `--kv-cache-min-tokens`,

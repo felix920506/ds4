@@ -190,6 +190,13 @@ less often, stayed about even. Routes with more than one remote stage decode
 without DSpark. As on one machine, session-batched serving uses ordinary
 decoding.
 
+A disk KV checkpoint (`--kv-disk-dir` on a coordinator `ds4-server`) is
+assembled from one shard per stage, and the shards must share one layout. Start every stage with the same `--ctx` and the same
+`--prefill-chunk`; a worker left at its defaults does not match a coordinator
+that sets either. With differing layouts requests still run, but nothing is
+saved, and the server logs
+`kv cache skipped ... distributed KV shards use different layouts`.
+
 Long prefill chunks can occupy different stages simultaneously. A single
 generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and
