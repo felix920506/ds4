@@ -141,3 +141,4 @@ __pycache__/
 
 /tests/test_rocm_moe_down
 /tests/test_rocm_indexer
+/tests/test_rocm_visual_attention

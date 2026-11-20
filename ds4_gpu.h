@@ -2602,6 +2602,35 @@ int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim);
+#ifdef DS4_ROCM_BUILD
+/* The same attention on a ratio-4 layer past the indexer's top-k, reading the
+ * selected compressed rows of each token from topk (n_tokens x top_k row
+ * numbers) instead of a dense n_tokens x n_comp mask: its cost and memory do
+ * not grow with the context. */
+int ds4_gpu_attention_visual_indexed_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        uint32_t                top_k,
+        const int32_t          *tokens,
+        uint32_t                vocab_size,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+#endif
 
 int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,

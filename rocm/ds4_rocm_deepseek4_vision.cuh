@@ -1,96 +1,152 @@
-__global__ static void attention_visual_pack_mixed_kv_kernel(
-        float       *dst,
-        const float *raw_kv,
-        const float *comp_kv,
-        uint32_t     n_raw,
-        uint32_t     raw_cap,
-        uint32_t     raw_start,
-        uint32_t     n_comp,
-        uint32_t     head_dim) {
-    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t count = (uint64_t)(n_raw + n_comp) * head_dim;
-    if (gid >= count) return;
-    const uint32_t d = gid % head_dim;
-    const uint32_t row = gid / head_dim;
-    if (row < n_raw) {
-        const uint32_t physical = (raw_start + row) % raw_cap;
-        dst[gid] = raw_kv[(uint64_t)physical * head_dim + d];
-    } else {
-        dst[gid] = comp_kv[(uint64_t)(row - n_raw) * head_dim + d];
-    }
-}
-
-__global__ static void attention_visual_mixed_softmax_kernel(
-        float          *scores,
+/* Vision-Exp attention of one query token for up to 32 heads, one head per
+ * wave.  The keys of a query are a run of the raw ring (raw_bounds: the causal
+ * window of a text token, the bidirectional span of an image token) followed
+ * by its compressed rows: the visible part of the indexer's selection when
+ * topk is set, otherwise every visible row, optionally with an additive mask.
+ * A compressed row is visible once its last source token has arrived.
+ *
+ * Keys are staged eight at a time and folded into an online softmax, as the
+ * text kernels do.  There is no score matrix: the memory of a launch depends
+ * neither on the chunk nor on the context length, where heads x queries x
+ * keys floats were gigabytes of scratch deep in a long context. */
+__global__ static void attention_visual_mixed_online_kernel(
+        float          *heads,
         const float    *sinks,
+        const float    *q,
+        const float    *raw_kv,
+        const float    *comp_kv,
+        const int32_t  *topk,
         const float    *comp_mask,
         const uint32_t *raw_bounds,
-        uint32_t        use_comp_mask,
         uint32_t        n_tokens,
         uint32_t        pos0,
         uint32_t        first_raw_pos,
-        uint32_t        n_raw,
+        uint32_t        raw_cap,
+        uint32_t        raw_start,
         uint32_t        n_comp,
+        uint32_t        top_k,
         uint32_t        ratio,
-        uint32_t        n_keys) {
+        uint32_t        n_head) {
+    enum { STAGE = 8, HEAD_DIM = 512 };
     const uint32_t t = blockIdx.x;
-    const uint32_t h = blockIdx.y;
     if (t >= n_tokens) return;
-    float *row = scores + ((uint64_t)h * n_tokens + t) * n_keys;
-    __shared__ float partial[256];
-    __shared__ float max_s;
-    __shared__ float denom;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t head = blockIdx.y * 32u + (threadIdx.x >> 5u);
+    const bool valid_head = head < n_head;
+
+    __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
+    __shared__ uint32_t comp_count_s;
+    __shared__ float4 kv_shared[STAGE * (HEAD_DIM / 4)];
+    __shared__ float add_shared[STAGE];
+
     const uint32_t raw_lo = raw_bounds[2u * t];
     const uint32_t raw_hi = raw_bounds[2u * t + 1u];
-    const uint32_t qpos = pos0 + t;
-    uint32_t visible_comp = ratio ? (qpos + 1u) / ratio : 0u;
+    const uint32_t raw_count = raw_hi >= raw_lo ? raw_hi - raw_lo + 1u : 0u;
+    const uint32_t raw_first = raw_lo - first_raw_pos;
+    uint32_t visible_comp = ratio ? (pos0 + t + 1u) / ratio : 0u;
     if (visible_comp > n_comp) visible_comp = n_comp;
-    float local_max = sinks[h];
-    for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
-        float score = -INFINITY;
-        if (k < n_raw) {
-            const uint32_t kpos = first_raw_pos + k;
-            if (kpos >= raw_lo && kpos <= raw_hi) score = row[k];
-        } else {
-            const uint32_t c = k - n_raw;
-            if (c < visible_comp) {
-                const float add = use_comp_mask
-                    ? comp_mask[(uint64_t)t * n_comp + c] : 0.0f;
-                if (add > -1.0e20f) score = row[k] + add;
+    if (threadIdx.x == 0) {
+        uint32_t count = visible_comp;
+        if (topk) {
+            count = 0;
+            for (uint32_t i = 0; i < top_k; i++) {
+                const int32_t c = topk[(uint64_t)t * top_k + i];
+                if (c >= 0 && (uint32_t)c < visible_comp) comp_rows[count++] = (uint32_t)c;
             }
         }
-        row[k] = score;
-        local_max = fmaxf(local_max, score);
+        comp_count_s = count;
     }
-    partial[threadIdx.x] = local_max;
     __syncthreads();
-    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
-        if (threadIdx.x < stride)
-            partial[threadIdx.x] = fmaxf(partial[threadIdx.x],
-                                          partial[threadIdx.x + stride]);
+    const uint32_t n_keys = raw_count + comp_count_s;
+
+    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q1 = q0, q2 = q0, q3 = q0;
+    if (valid_head) {
+        const float4 *q4 = (const float4 *)(q + ((uint64_t)t * n_head + head) * HEAD_DIM);
+        q0 = q4[lane +  0u];
+        q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u];
+        q3 = q4[lane + 96u];
+    }
+    const float scale = rsqrtf((float)HEAD_DIM);
+    /* The sink is a key with a zero value: it starts the running maximum and
+     * holds the weight 1 at that maximum. */
+    float max_s = valid_head ? sinks[head] : 0.0f;
+    float sum_s = 1.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+
+    for (uint32_t key0 = 0; key0 < n_keys; key0 += STAGE) {
+        const uint32_t nk = n_keys - key0 < STAGE ? n_keys - key0 : STAGE;
+        for (uint32_t off = threadIdx.x; off < nk * (HEAD_DIM / 4); off += blockDim.x) {
+            const uint32_t key = key0 + off / (HEAD_DIM / 4);
+            const uint32_t d4 = off % (HEAD_DIM / 4);
+            const float *row;
+            float add = 0.0f;
+            if (key < raw_count) {
+                row = raw_kv + (uint64_t)attention_raw_ring_row(
+                        raw_start, raw_cap, raw_first + key) * HEAD_DIM;
+            } else {
+                const uint32_t c = topk ? comp_rows[key - raw_count] : key - raw_count;
+                row = comp_kv + (uint64_t)c * HEAD_DIM;
+                if (comp_mask && d4 == 0) add = comp_mask[(uint64_t)t * n_comp + c];
+            }
+            kv_shared[off] = ((const float4 *)row)[d4];
+            if (d4 == 0) add_shared[off / (HEAD_DIM / 4)] = add;
+        }
+        __syncthreads();
+        if (valid_head) {
+            for (uint32_t k = 0; k < nk; k++) {
+                const float4 *kv4 = kv_shared + k * (HEAD_DIM / 4);
+                const float4 k0 = kv4[lane +  0u];
+                const float4 k1 = kv4[lane + 32u];
+                const float4 k2 = kv4[lane + 64u];
+                const float4 k3 = kv4[lane + 96u];
+                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
+                score = warp_sum_f32(score) * scale;
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                const float add = add_shared[k];
+                score = add > -1.0e20f ? score + add : -INFINITY;
+
+                const float new_max = fmaxf(max_s, score);
+                const float old_scale = expf(max_s - new_max);
+                const float key_scale = expf(score - new_max);
+                sum_s = sum_s * old_scale + key_scale;
+                o0.x = o0.x * old_scale + k0.x * key_scale;
+                o0.y = o0.y * old_scale + k0.y * key_scale;
+                o0.z = o0.z * old_scale + k0.z * key_scale;
+                o0.w = o0.w * old_scale + k0.w * key_scale;
+                o1.x = o1.x * old_scale + k1.x * key_scale;
+                o1.y = o1.y * old_scale + k1.y * key_scale;
+                o1.z = o1.z * old_scale + k1.z * key_scale;
+                o1.w = o1.w * old_scale + k1.w * key_scale;
+                o2.x = o2.x * old_scale + k2.x * key_scale;
+                o2.y = o2.y * old_scale + k2.y * key_scale;
+                o2.z = o2.z * old_scale + k2.z * key_scale;
+                o2.w = o2.w * old_scale + k2.w * key_scale;
+                o3.x = o3.x * old_scale + k3.x * key_scale;
+                o3.y = o3.y * old_scale + k3.y * key_scale;
+                o3.z = o3.z * old_scale + k3.z * key_scale;
+                o3.w = o3.w * old_scale + k3.w * key_scale;
+                max_s = new_max;
+            }
+        }
         __syncthreads();
     }
-    if (threadIdx.x == 0u) max_s = partial[0];
-    __syncthreads();
-    float sum = 0.0f;
-    for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x) {
-        const float probability = isfinite(row[k])
-            ? expf(row[k] - max_s) : 0.0f;
-        row[k] = probability;
-        sum += probability;
+
+    if (valid_head) {
+        const float inv_s = 1.0f / sum_s;
+        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
+        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
+        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
+        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
+        float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * HEAD_DIM);
+        out4[lane +  0u] = o0;
+        out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2;
+        out4[lane + 96u] = o3;
     }
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
-        if (threadIdx.x < stride)
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0u)
-        denom = partial[0] + expf(sinks[h] - max_s);
-    __syncthreads();
-    for (uint32_t k = threadIdx.x; k < n_keys; k += blockDim.x)
-        row[k] /= denom;
 }
 
 __global__ static void router_select_visual_parallel_kernel(
@@ -159,19 +215,23 @@ __global__ static void router_select_visual_parallel_kernel(
     for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
 }
 
-extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
+static int attention_visual_mixed_launch(
         ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
         uint64_t sinks_offset, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
-        uint32_t comp_kv_f16, const ds4_gpu_tensor *comp_mask,
-        uint32_t use_comp_mask, const int32_t *tokens, uint32_t vocab_size,
-        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
-        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim) {
+        uint32_t comp_kv_f16, const ds4_gpu_tensor *topk, uint32_t top_k,
+        const ds4_gpu_tensor *comp_mask, const int32_t *tokens,
+        uint32_t vocab_size, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !model_map || !q || !raw_kv || !tokens || vocab_size == 0 ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
-        (n_comp != 0 && (!comp_kv || ratio == 0)) ||
-        (use_comp_mask && !comp_mask) || comp_kv_f16 || !g_cublas_ready ||
+        (n_comp != 0 && (!comp_kv || ratio == 0)) || comp_kv_f16 ||
+        head_dim != 512u ||
+        (topk && (n_comp == 0 || top_k == 0 ||
+                  top_k > DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP ||
+                  !cuda_tensor_has_elems2(topk, n_tokens, top_k,
+                                          sizeof(int32_t)))) ||
         !cuda_model_range_fits(model_size, sinks_offset,
                                (uint64_t)n_head * sizeof(float)) ||
         !cuda_tensor_has_elems3(heads, n_tokens, n_head, head_dim,
@@ -181,8 +241,8 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
         !cuda_tensor_has_elems2(raw_kv, raw_cap, head_dim, sizeof(float)) ||
         (n_comp && !cuda_tensor_has_elems2(comp_kv, n_comp, head_dim,
                                            sizeof(float))) ||
-        (use_comp_mask && !cuda_tensor_has_elems2(comp_mask, n_tokens, n_comp,
-                                                   sizeof(float))) ||
+        (comp_mask && !cuda_tensor_has_elems2(comp_mask, n_tokens, n_comp,
+                                              sizeof(float))) ||
         pos0 > UINT32_MAX - n_tokens || n_raw > pos0 + n_tokens) return 0;
 
     const float *sinks = (const float *)cuda_model_range_ptr(
@@ -190,103 +250,62 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
             "visual_attn_sinks");
     if (!sinks) return 0;
 
-    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
     std::vector<uint32_t> bounds((size_t)n_tokens * 2u);
     if (!ds4_deepseek4_attention_bounds(
             (const int *)tokens, n_tokens, vocab_size,
             pos0, n_raw, window, bounds.data())) return 0;
-
-    if (n_raw > UINT32_MAX - n_comp) return 0;
-    const uint32_t n_keys = n_raw + n_comp;
-    const uint64_t kv_count = (uint64_t)n_keys * head_dim;
-    if (kv_count > UINT64_MAX / sizeof(float)) return 0;
-    const uint64_t kv_bytes = kv_count * sizeof(float);
-    const uint64_t score_offset = (kv_bytes + 255u) & ~UINT64_C(255);
-    const uint64_t bounds_bytes =
-        (uint64_t)n_tokens * 2u * sizeof(uint32_t);
-    /* The score matrix is heads x queries x keys, so one prefill chunk deep in
-     * a long context does not fit in memory at once.  Queries are independent
-     * of each other here: bound the scratch like the text path does and walk
-     * the chunk in query tiles. */
-    const uint64_t tile_cap = UINT64_C(4) * 1024u * 1024u * 1024u;
-    const uint64_t query_bytes =
-        (uint64_t)n_head * ((uint64_t)n_keys + head_dim) * sizeof(float);
-    if (query_bytes > (UINT64_MAX - score_offset - bounds_bytes - 1024u) / n_tokens)
-        return 0;
-    uint32_t tile_tokens = n_tokens;
-    while (tile_tokens > 1u &&
-           score_offset + (uint64_t)tile_tokens * query_bytes > tile_cap)
-        tile_tokens = (tile_tokens + 1u) >> 1u;
-    const uint64_t score_bytes =
-        (uint64_t)n_head * tile_tokens * n_keys * sizeof(float);
-    const uint64_t out_offset =
-        (score_offset + score_bytes + 255u) & ~UINT64_C(255);
-    const uint64_t out_bytes =
-        (uint64_t)n_head * tile_tokens * head_dim * sizeof(float);
-    const uint64_t bounds_offset =
-        (out_offset + out_bytes + 255u) & ~UINT64_C(255);
-    float *tmp = (float *)cuda_tmp_alloc(
-            bounds_offset + bounds_bytes, "visual mixed attention");
-    if (!tmp) return 0;
-    float *kv = tmp;
-    float *scores = (float *)((char *)tmp + score_offset);
-    float *out_tmp = (float *)((char *)tmp + out_offset);
-    uint32_t *device_bounds = (uint32_t *)((char *)tmp + bounds_offset);
-    if (!cuda_ok(cudaMemcpy(device_bounds, bounds.data(),
+    const uint64_t bounds_bytes = (uint64_t)n_tokens * 2u * sizeof(uint32_t);
+    uint32_t *device_bounds =
+        (uint32_t *)cuda_tmp_alloc(bounds_bytes, "visual attention bounds");
+    if (!device_bounds ||
+        !cuda_ok(cudaMemcpy(device_bounds, bounds.data(),
                             (size_t)bounds_bytes, cudaMemcpyHostToDevice),
                  "visual attention bounds upload")) return 0;
 
-    attention_visual_pack_mixed_kv_kernel<<<
-        (kv_count + 255u) / 256u, 256u>>>(
-            kv, (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-            n_raw, raw_cap, raw_start, n_comp, head_dim);
-    if (!cuda_ok(cudaGetLastError(), "visual attention KV pack launch"))
-        return 0;
+    const dim3 grid(n_tokens, (n_head + 31u) / 32u, 1u);
+    attention_visual_mixed_online_kernel<<<grid, 1024u>>>(
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const float *)raw_kv->ptr,
+            n_comp ? (const float *)comp_kv->ptr : NULL,
+            topk ? (const int32_t *)topk->ptr : NULL,
+            comp_mask ? (const float *)comp_mask->ptr : NULL,
+            device_bounds, n_tokens, pos0, pos0 + n_tokens - n_raw, raw_cap,
+            raw_start, n_comp, top_k, ratio, n_head);
+    return cuda_ok(cudaGetLastError(), "visual attention launch");
+}
 
-    /* Host context: HIP's rsqrtf is device-only, unlike CUDA's. */
-    const float alpha = 1.0f / sqrtf((float)head_dim);
-    const float beta = 0.0f;
-    const float one = 1.0f;
-    const uint64_t query_stride = (uint64_t)n_head * head_dim;
-    for (uint32_t t0 = 0; t0 < n_tokens; t0 += tile_tokens) {
-        const uint32_t nt =
-            n_tokens - t0 < tile_tokens ? n_tokens - t0 : tile_tokens;
-        cublasStatus_t status = cublasSgemmStridedBatched(
-                g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                (int)n_keys, (int)nt, (int)head_dim,
-                &alpha, kv, (int)head_dim, 0,
-                (const float *)q->ptr + (uint64_t)t0 * query_stride,
-                (int)query_stride, (long long)head_dim, &beta, scores,
-                (int)n_keys, (long long)n_keys * nt, (int)n_head);
-        if (!cublas_ok(status, "visual attention score gemm")) return 0;
-        const dim3 score_grid(nt, n_head, 1u);
-        attention_visual_mixed_softmax_kernel<<<score_grid, 256u>>>(
-                scores, sinks,
-                use_comp_mask
-                    ? (const float *)comp_mask->ptr + (uint64_t)t0 * n_comp
-                    : NULL,
-                device_bounds + 2u * (uint64_t)t0, use_comp_mask, nt,
-                pos0 + t0, first_raw_pos, n_raw, n_comp, ratio, n_keys);
-        if (!cuda_ok(cudaGetLastError(), "visual attention softmax launch"))
-            return 0;
+extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
+        uint32_t comp_kv_f16, const ds4_gpu_tensor *comp_mask,
+        uint32_t use_comp_mask, const int32_t *tokens, uint32_t vocab_size,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
+        uint32_t n_head, uint32_t head_dim) {
+    if (use_comp_mask && !comp_mask) return 0;
+    return attention_visual_mixed_launch(
+            heads, model_map, model_size, sinks_offset, q, raw_kv, comp_kv,
+            comp_kv_f16, NULL, 0, use_comp_mask ? comp_mask : NULL, tokens,
+            vocab_size, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+            window, ratio, n_head, head_dim);
+}
 
-        status = cublasSgemmStridedBatched(
-                g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                (int)head_dim, (int)nt, (int)n_keys,
-                &one, kv, (int)head_dim, 0, scores, (int)n_keys,
-                (long long)n_keys * nt, &beta, out_tmp, (int)head_dim,
-                (long long)head_dim * nt, (int)n_head);
-        if (!cublas_ok(status, "visual attention value gemm")) return 0;
-        const uint64_t values = (uint64_t)nt * query_stride;
-        attention_prefill_unpack_heads_kernel<<<
-            (values + 255u) / 256u, 256u>>>(
-                (float *)heads->ptr + (uint64_t)t0 * query_stride, out_tmp,
-                nt, n_head, head_dim);
-        if (!cuda_ok(cudaGetLastError(), "visual attention unpack launch"))
-            return 0;
-    }
-    return 1;
+extern "C" int ds4_gpu_attention_visual_indexed_batch_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
+        uint32_t comp_kv_f16, const ds4_gpu_tensor *topk, uint32_t top_k,
+        const int32_t *tokens, uint32_t vocab_size, uint32_t n_tokens,
+        uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head,
+        uint32_t head_dim) {
+    if (!topk) return 0;
+    return attention_visual_mixed_launch(
+            heads, model_map, model_size, sinks_offset, q, raw_kv, comp_kv,
+            comp_kv_f16, topk, top_k, NULL, tokens, vocab_size, n_tokens,
+            pos0, n_raw, raw_cap, raw_start, n_comp, window, ratio, n_head,
+            head_dim);
 }
 
 extern "C" int ds4_gpu_router_select_batch_visual_tensor(
