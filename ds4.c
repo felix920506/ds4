@@ -33092,14 +33092,35 @@ static bool metal_graph_encode_layer_attention_batch(
                             metal_graph_indexer_scores(g),
                             n_comp, n_tokens, DS4_N_INDEXER_TOP_K) != 0;
                 }
+#ifndef DS4_ROCM_BUILD
                 if (ok) {
                     ok = ds4_gpu_dsv4_topk_mask_tensor(
                             metal_graph_comp_mask(g),
                             metal_graph_comp_selected(g),
                             n_comp, n_tokens, DS4_N_INDEXER_TOP_K) != 0;
                 }
+#endif
                 use_indexed_comp = ok;
             }
+#ifdef DS4_ROCM_BUILD
+            /* ROCm gathers the selected rows like the text path.  A dense
+             * mask makes every query score every compressed row, which deep
+             * in a long context is most of the prefill time and a score
+             * matrix of gigabytes. */
+            if (ok && use_indexed_comp) {
+                ok = ds4_gpu_attention_visual_indexed_batch_heads_tensor(
+                        metal_graph_batch_heads(g),
+                        model->map, model->size, sinks_offset,
+                        metal_graph_batch_q(g), g->layer_raw_cache[il],
+                        g->layer_attn_comp_cache[il],
+                        metal_graph_attn_comp_cache_is_f16(),
+                        metal_graph_comp_selected(g), DS4_N_INDEXER_TOP_K,
+                        visual_tokens, DS4_N_VOCAB,
+                        n_tokens, pos0, n_raw, g->raw_cap, raw_start,
+                        n_comp, g->raw_window, ratio,
+                        attn_heads, DS4_N_HEAD_DIM) != 0;
+            } else
+#endif
             if (ok) {
                 ok = ds4_gpu_attention_visual_mixed_batch_heads_tensor(
                         metal_graph_batch_heads(g),
