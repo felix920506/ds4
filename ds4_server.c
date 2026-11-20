@@ -11867,12 +11867,30 @@ static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
 }
 #endif
 
+/* The continued-checkpoint schedule of one slot: the cache's options with the
+ * slot's own last stored frontier.  Only fields that are fixed after startup
+ * are read from the shared cache, so no lock is needed. */
+static kv_disk_cache kv_cache_slot_continued_view(const server *s,
+                                                  const server_slot *slot) {
+    return (kv_disk_cache){
+        .enabled = s->kv.enabled,
+        .opt = s->kv.opt,
+        .continued_last_store_tokens = slot->continued_last_store_tokens,
+    };
+}
+
 static int kv_cache_slot_continued_target(server *s, server_slot *slot,
                                           int live_tokens) {
     if (!s || !slot) return 0;
-    kv_disk_cache view = s->kv;
-    view.continued_last_store_tokens = slot->continued_last_store_tokens;
+    const kv_disk_cache view = kv_cache_slot_continued_view(s, slot);
     return kv_cache_continued_store_target(&view, live_tokens);
+}
+
+static int kv_cache_slot_continued_next_target(server *s, server_slot *slot,
+                                               int live_tokens) {
+    if (!s || !slot) return 0;
+    const kv_disk_cache view = kv_cache_slot_continued_view(s, slot);
+    return ds4_kvstore_continued_next_target(&view, live_tokens);
 }
 
 static void kv_cache_slot_note_store(server_slot *slot, int tokens) {
@@ -13166,6 +13184,30 @@ static int server_prefill_quantum(server *s) {
     return server_prefill_quantum_for(s, generation_active);
 }
 
+/* Where the scheduling slice that starts at done tokens ends: one quantum
+ * further on, or sooner at the next token count where a continued KV
+ * checkpoint is due.  Such a checkpoint can only be written while the session
+ * stands exactly on that count, and quanta do not stop there on their own:
+ * with 2048-token quanta and a 5120-token interval, every other checkpoint
+ * was skipped. */
+static int server_prefill_slice_target(int done, int prompt_len, int quantum,
+                                       int continued_target) {
+    int target = done + quantum;
+    if (target > prompt_len || target < done) target = prompt_len;
+    if (target <= 0) target = prompt_len;
+    if (continued_target > done && continued_target < target) {
+        target = continued_target;
+    }
+    return target;
+}
+
+static int server_prefill_next_target(server *s, server_slot *slot,
+                                      int done, int prompt_len) {
+    return server_prefill_slice_target(
+        done, prompt_len, server_prefill_quantum(s),
+        kv_cache_slot_continued_next_target(s, slot, done));
+}
+
 /* Synchronize one resident slot without monopolizing the model executor.  A
  * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
  * advances from its current frontier. Absolute positions remain session-local,
@@ -13191,10 +13233,7 @@ static int server_session_sync(server *s, server_slot *slot,
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
-        int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
-        if (target > prompt->len || target < done) target = prompt->len;
-        if (target <= 0) target = prompt->len;
+        int target = server_prefill_next_target(s, slot, done, prompt->len);
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
@@ -13264,10 +13303,8 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
     bool called = false;
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
-        int quantum = server_prefill_quantum(s);
-        int target = done + quantum;
-        if (target > prompt->len || target < done) target = prompt->len;
-        if (target <= 0) target = prompt->len;
+        int target = server_prefill_next_target(s, slot, done, prompt->len);
+        /* A slice cannot end inside an image block. */
         for (size_t i = 0; i < image_count; i++) {
             uint64_t end = (uint64_t)images[i].token_start +
                            images[i].embedding.token_count;
@@ -23446,6 +23483,115 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
+static void test_kv_cache_continued_next_target(void) {
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 0) == 0);
+
+    kc.enabled = true;
+    /* The default interval of 10000 rounds up to the 2048-token alignment. */
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 0) == 10240);
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 10239) == 10240);
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 10240) == 20480);
+
+    /* A frontier that is already on disk, or that a cold checkpoint claimed,
+     * is not due again. */
+    kc.continued_last_store_tokens = 20480;
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 4096) == 30720);
+
+    kc.continued_last_store_tokens = 0;
+    kc.opt.continued_interval_tokens = 5120;
+    kc.opt.boundary_align_tokens = 512;
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 4096) == 5120);
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 5120) == 10240);
+
+    /* Nothing below the minimum checkpoint size is due. */
+    kc.opt.min_tokens = 12000;
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 0) == 15360);
+    kc.opt.min_tokens = 15360;
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 0) == 15360);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 15360) == 15360);
+
+    kc.opt.continued_interval_tokens = 0;
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, 4096) == 0);
+    kc.opt.continued_interval_tokens = 5120;
+    TEST_ASSERT(ds4_kvstore_continued_next_target(&kc, INT_MAX - 100) == 0);
+}
+
+/* Drive the batched prefill loop's slice arithmetic over one prompt and
+ * collect the token counts at which a continued checkpoint gets written. */
+static int test_prefill_continued_stores(server *s, server_slot *slot,
+                                         int start, int prompt_len,
+                                         int quantum, int *stored, int cap) {
+    int n = 0;
+    for (int done = start; done < prompt_len; ) {
+        const int target = server_prefill_slice_target(
+            done, prompt_len, quantum,
+            kv_cache_slot_continued_next_target(s, slot, done));
+        TEST_ASSERT(target > done && target <= prompt_len);
+        TEST_ASSERT(target - done <= quantum);
+        if (target <= done) break;
+        done = target;
+        if (kv_cache_slot_continued_target(s, slot, done) == done) {
+            kv_cache_slot_note_store(slot, done);
+            if (n < cap) stored[n] = done;
+            n++;
+        }
+    }
+    return n;
+}
+
+static void test_prefill_slices_stop_at_continued_frontiers(void) {
+    server s = {0};
+    s.kv.enabled = true;
+    s.kv.opt = kv_cache_default_options();
+    s.kv.opt.continued_interval_tokens = 5120;
+    s.kv.opt.boundary_align_tokens = 512;
+    server_slot slot = {0};
+    int stored[16] = {0};
+
+    /* Issue #28: 2048-token quanta never stand on an odd multiple of 5120,
+     * so every other checkpoint was skipped. */
+    TEST_ASSERT(server_prefill_slice_target(4096, 30000, 2048, 0) == 6144);
+    TEST_ASSERT(server_prefill_slice_target(4096, 30000, 2048, 5120) == 5120);
+    TEST_ASSERT(server_prefill_slice_target(5120, 30000, 2048, 10240) == 7168);
+    TEST_ASSERT(server_prefill_slice_target(29000, 30000, 2048, 30720) == 30000);
+    int n = test_prefill_continued_stores(&s, &slot, 0, 30000, 2048, stored, 16);
+    TEST_ASSERT(n == 5);
+    for (int i = 0; i < 5 && i < n; i++) TEST_ASSERT(stored[i] == 5120 * (i + 1));
+
+    /* A prefill that resumes from an arbitrary live frontier, in the small
+     * quanta used while another slot decodes. */
+    slot.continued_last_store_tokens = 0;
+    n = test_prefill_continued_stores(&s, &slot, 7001, 21000, 128, stored, 16);
+    TEST_ASSERT(n == 3);
+    TEST_ASSERT(stored[0] == 10240 && stored[1] == 15360 && stored[2] == 20480);
+
+    /* The engine's own wide idle chunks. */
+    slot.continued_last_store_tokens = 0;
+    n = test_prefill_continued_stores(&s, &slot, 0, 21000, 8192, stored, 16);
+    TEST_ASSERT(n == 4);
+    TEST_ASSERT(stored[0] == 5120 && stored[3] == 20480);
+
+    /* A frontier claimed by a cold checkpoint is not stopped at again. */
+    slot.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_slot_suppress_continued(&s, &slot, 10240) == 0);
+    TEST_ASSERT(kv_cache_slot_continued_next_target(&s, &slot, 0) == 15360);
+    kv_cache_slot_restore_suppressed(&slot, 0, 10240);
+    TEST_ASSERT(kv_cache_slot_continued_next_target(&s, &slot, 0) == 5120);
+
+    /* Without continued checkpoints the slices are plain quanta. */
+    s.kv.opt.continued_interval_tokens = 0;
+    n = test_prefill_continued_stores(&s, &slot, 0, 21000, 2048, stored, 16);
+    TEST_ASSERT(n == 0);
+    TEST_ASSERT(server_prefill_slice_target(
+        4096, 30000, 2048,
+        kv_cache_slot_continued_next_target(&s, &slot, 4096)) == 6144);
+    s.kv.opt.continued_interval_tokens = 5120;
+    s.kv.enabled = false;
+    TEST_ASSERT(kv_cache_slot_continued_next_target(&s, &slot, 4096) == 0);
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -25818,6 +25964,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_next_target();
+    test_prefill_slices_stop_at_continued_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
