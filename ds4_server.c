@@ -10229,6 +10229,8 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Frontier of the last rewind anchor taken for this slot's session. */
+    int anchor_tokens;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
     time_t last_used;
@@ -12086,7 +12088,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *
  *   responses-visible -> responses-tool-output -> anthropic-tool-output ->
  *   memory-rewind (GLM only) -> memory-token -> thinking-visible ->
- *   memory-text
+ *   memory-text -> memory-anchor
  *
  * Both slot routing (job_slot_score, under dispatch) and the execution
  * ladder consume this probe, so routing decisions and execution-time reuse
@@ -12124,6 +12126,14 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *   is authoritative, so the checkpoint tokens are kept verbatim and only
  *   the suffix text is tokenized (full-prompt BPE may have merged across
  *   the byte boundary).
+ * - memory-anchor: the prompt leaves the checkpoint part way, typically
+ *   inside the last reply, which the client sent back with different bytes
+ *   than were sampled.  Everything before that point is still valid, so the
+ *   live KV returns to the nearest rewind anchor below it (see
+ *   slot_anchor_frontier) and only the rest is evaluated.  It counts as
+ *   reuse only while it keeps most of the checkpoint: a prompt that shares
+ *   less is another conversation, which must not be routed here to destroy
+ *   this one for the sake of a common opening.
  *
  * Locking: slot_probe_reuse_locked() requires tool_mu held (dispatch holds
  * it while scoring); slot_probe_reuse() is the worker-path wrapper.
@@ -12141,6 +12151,7 @@ typedef enum {
     REUSE_MEMORY_TOKEN,
     REUSE_THINKING_VISIBLE,
     REUSE_MEMORY_TEXT,
+    REUSE_MEMORY_ANCHOR,
 } slot_reuse_kind;
 
 typedef struct {
@@ -12283,6 +12294,19 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
+    /* The anchor must leave at least one prompt token to evaluate: logits
+     * do not survive a rewind. */
+    const int anchor = ds4_session_anchor_floor(
+        slot->session, common < req->prompt.len ? common : req->prompt.len - 1);
+    if (anchor > 0 && anchor >= live_pos - anchor &&
+        ds4_session_vision_prefix_matches_at(slot->session, req->images,
+                                             req->image_count, anchor))
+    {
+        pr.kind = REUSE_MEMORY_ANCHOR;
+        pr.reuse_tokens = anchor;
+        return pr;
+    }
+
     return pr;
 }
 
@@ -12305,6 +12329,40 @@ static bool live_continuation_unavailable(const request *req, bool materialized)
     if (req->api == API_ANTHROPIC) return req->anthropic_requires_live_tool_state;
     if (req->api == API_RESPONSES) return req->responses_requires_live_tool_state;
     return false;
+}
+
+/* Rewind anchors for the memory-anchor tier.
+ *
+ * The next request renders this reply again from what the client sends back,
+ * and that is not always what was sampled: a client may trim or reformat the
+ * reply, and tool calls are rebuilt from their arguments when the exact text
+ * is not remembered.  The prompt then leaves the live checkpoint somewhere
+ * inside the reply.  An anchor at the start of every reply and every
+ * LIVE_ANCHOR_INTERVAL tokens inside it lets the session return to just below
+ * that point instead of being evaluated again from the first token.  The
+ * session keeps a bounded number and thins the older ones, so earlier turns
+ * stay reachable too, more coarsely. */
+#define LIVE_ANCHOR_INTERVAL 256
+
+static void slot_anchor_frontier(server *s, server_slot *slot, bool force) {
+    const int pos = ds4_session_pos(slot->session);
+    if (!force && pos >= slot->anchor_tokens &&
+        pos - slot->anchor_tokens < LIVE_ANCHOR_INTERVAL) return;
+    slot->anchor_tokens = pos;
+    pthread_mutex_lock(&s->inference_mu);
+    (void)ds4_session_anchor_save(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+}
+
+/* The session went back to `tokens`: bookkeeping that names a later frontier
+ * now describes tokens that are gone, and a new continuation could reach the
+ * same length with different content. */
+static void slot_note_rewind(server_slot *slot, int tokens) {
+    if (slot->continued_last_store_tokens > tokens)
+        slot->continued_last_store_tokens = tokens;
+    if (slot->disk_frontier_tokens > tokens) slot->disk_frontier_tokens = 0;
+    if (slot->kick_unsaved_tokens > tokens) slot->kick_unsaved_tokens = 0;
+    slot->anchor_tokens = tokens;
 }
 
 /* Refresh the cached rendered text of the slot's checkpoint.  Called by the
@@ -13796,9 +13854,18 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
          * a very long conversation from token zero. */
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, slot,
-                                            rendered.ptr ? rendered.ptr : "",
-                                            NULL, &effective, &path, NULL, false);
+        /* A rewind anchor below the shared prefix is the cheapest way back:
+         * it keeps the live state and replays only the tokens after it. */
+        pthread_mutex_lock(&s->inference_mu);
+        int anchor = ds4_session_anchor_floor(
+            slot->session, common < canonical.len ? common : canonical.len - 1);
+        if (anchor > 0 && !ds4_session_anchor_rewind(slot->session, anchor)) anchor = 0;
+        pthread_mutex_unlock(&s->inference_mu);
+        if (anchor > 0) slot_note_rewind(slot, anchor);
+        int loaded = anchor > 0 ? anchor :
+            kv_cache_try_load_text(s, slot,
+                                   rendered.ptr ? rendered.ptr : "",
+                                   NULL, &effective, &path, NULL, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -13806,7 +13873,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         }
 
         char sync_err[160] = {0};
-        const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        const ds4_tokens *sync_prompt = loaded > 0 && anchor <= 0 ? &effective : &canonical;
         char rebuild_ctx[48];
         request_ctx_span(rebuild_ctx, sizeof(rebuild_ctx), loaded, sync_prompt->len);
         int replay_tokens = sync_prompt->len - loaded;
@@ -13815,7 +13882,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         if (canonical_tail_tokens < 0) canonical_tail_tokens = canonical.len;
         int discarded_live_tokens = live_len - common;
         if (discarded_live_tokens < 0) discarded_live_tokens = 0;
-        const char *source = loaded > 0 ? "disk" : "full";
+        const char *source = anchor > 0 ? "anchor" : loaded > 0 ? "disk" : "full";
         const double rebuild_t0 = now_sec();
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization needs %d tokens rebuild ctx=%s request_ctx=%s reason=canonical-tail-rewrite tail=%d discard=%d common=%d live=%d target=%d cached=%d source=%s%s%s",
@@ -13860,11 +13927,11 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=disk cached=%d replay=%d target=%d %.3fs",
-                           rebuild_ctx, ctx, loaded, replay_tokens, canonical.len, rebuild_sec);
+                           "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d %.3fs",
+                           rebuild_ctx, ctx, source, loaded, replay_tokens, canonical.len, rebuild_sec);
                 trace_event(s, trace_id,
-                            "tool checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
-                            common, live_len, canonical.len, loaded, path ? path : "");
+                            "tool checkpoint canonicalized via %s: common=%d live=%d canonical=%d cached=%d file=%s",
+                            source, common, live_len, canonical.len, loaded, path ? path : "");
             } else {
                 server_log(DS4_LOG_KVCACHE,
                            "ds4-server: tool checkpoint rebuild done ctx=%s request_ctx=%s source=full cached=0 replay=%d target=%d %.3fs",
@@ -14319,6 +14386,33 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cache_source = "memory-text";
         prompt_for_sync = &effective_prompt;
         break;
+    case REUSE_MEMORY_ANCHOR: {
+        pthread_mutex_lock(&s->inference_mu);
+        /* The rewind mutates the session, so check the frontier it left
+         * before trusting it; a failure falls through to the disk cache or a
+         * cold prefill like any other miss. */
+        const bool rewound =
+            ds4_session_anchor_rewind(slot->session, reuse.reuse_tokens) &&
+            ds4_session_common_prefix(slot->session, &j->req.prompt) ==
+                reuse.reuse_tokens &&
+            ds4_session_vision_prefix_matches(slot->session, j->req.images,
+                                              j->req.image_count);
+        pthread_mutex_unlock(&s->inference_mu);
+        if (!rewound) {
+            cached = 0;
+            break;
+        }
+        live_materialized = true;
+        cache_source = "memory-anchor";
+        cache_diag.rewind_to = reuse.reuse_tokens;
+        slot_note_rewind(slot, reuse.reuse_tokens);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: live kv rewind live=%d prompt=%d common=%d anchor=%d: "
+                   "keeping %d tokens, re-evaluating %d that still match",
+                   old_pos, j->req.prompt.len, common, reuse.reuse_tokens,
+                   reuse.reuse_tokens, common - reuse.reuse_tokens);
+        break;
+    }
     case REUSE_NONE:
     default:
         cached = 0;
@@ -14571,6 +14665,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     kv_cache_maybe_store_continued(s, slot);
+    slot_anchor_frontier(s, slot, true);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -14712,6 +14807,7 @@ decode_again:
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
             kv_cache_maybe_store_continued(s, slot);
         }
+        slot_anchor_frontier(s, slot, false);
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
@@ -15609,6 +15705,7 @@ static ds4_session *slot_detach_session(server *s, server_slot *slot) {
     slot->live_text_len = 0;
     slot->live_text_pos = 0;
     slot->continued_last_store_tokens = 0;
+    slot->anchor_tokens = 0;
     slot->disk_frontier_tokens = 0;
     slot->kick_unsaved_tokens = 0;
     return session;
@@ -17862,6 +17959,103 @@ static void test_slot_probe_and_routing_scores(void) {
     ds4_tokens_free(&sub.req.prompt);
     ds4_tokens_free(&ext.req.prompt);
     ds4_tokens_free(&txt.req.prompt);
+}
+
+/* memory-anchor tier (issue #16): a prompt that leaves the checkpoint inside
+ * the last reply goes back to the nearest rewind anchor below that point, and
+ * the slot that keeps the most stays the routing choice. */
+static void test_slot_probe_memory_anchor(void) {
+    server s = {0};
+    const time_t now = 1000000;
+    int live_tok[200];
+    for (int i = 0; i < 200; i++) live_tok[i] = 1000 + i;
+
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    slots[0].last_used = slots[1].last_used = now;
+    slots[0].session = ds4_session_new_test_checkpoint(live_tok, 200);
+    ds4_session_add_test_anchor(slots[0].session, 120);
+    ds4_session_add_test_anchor(slots[0].session, 180);
+    /* An older copy of the same conversation, as left behind by an earlier
+     * miss that was routed to the other slot. */
+    slots[1].session = ds4_session_new_test_checkpoint(live_tok, 150);
+    ds4_session_add_test_anchor(slots[1].session, 120);
+
+    /* Diverges 10 tokens before the live end: back to the anchor at 180. */
+    job j = {0};
+    for (int i = 0; i < 190; i++) ds4_tokens_push(&j.req.prompt, live_tok[i]);
+    for (int i = 0; i < 40; i++) ds4_tokens_push(&j.req.prompt, 5000 + i);
+    slot_reuse pr = slot_probe_reuse_locked(&s, &slots[0], &j.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR);
+    TEST_ASSERT(pr.reuse_tokens == 180);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, -1, now) == 180);
+    /* The stale copy is an exact token prefix; the fresher slot keeps more. */
+    TEST_ASSERT(job_slot_score(&s, &slots[1], &j, -1, now) == 150);
+
+    /* Diverges before the newer anchor: the older one. */
+    j.req.prompt.v[170] = 7;
+    pr = slot_probe_reuse_locked(&s, &slots[0], &j.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 120);
+    /* On the stale copy the same prompt now diverges past its end. */
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[1], &j.req).kind ==
+                REUSE_MEMORY_TOKEN);
+
+    /* Diverges before every anchor: a miss, as before. */
+    j.req.prompt.v[100] = 7;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &j.req).kind == REUSE_NONE);
+    TEST_ASSERT(job_slot_score(&s, &slots[0], &j, -1, now) ==
+                SLOT_PROTECTED_SCORE_BASE - 200);
+    j.req.prompt.v[100] = live_tok[100];
+    j.req.prompt.v[170] = live_tok[170];
+
+    /* A prompt that stops exactly on an anchor still needs one token
+     * evaluated for its logits, so it uses the anchor below. */
+    j.req.prompt.len = 180;
+    pr = slot_probe_reuse_locked(&s, &slots[0], &j.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 120);
+    j.req.prompt.len = 230;
+
+    /* An anchor that keeps less than half of the checkpoint is a shared
+     * opening, not a continuation: no reuse, the slot is only a victim. */
+    {
+        server_slot other = {0};
+        other.last_used = now;
+        other.session = ds4_session_new_test_checkpoint(live_tok, 200);
+        ds4_session_add_test_anchor(other.session, 60);
+        job o = {0};
+        for (int i = 0; i < 80; i++) ds4_tokens_push(&o.req.prompt, live_tok[i]);
+        for (int i = 0; i < 40; i++) ds4_tokens_push(&o.req.prompt, 6000 + i);
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &other, &o.req).kind == REUSE_NONE);
+        TEST_ASSERT(job_slot_score(&s, &other, &o, -1, now) ==
+                    SLOT_PROTECTED_SCORE_BASE - 200);
+        ds4_tokens_free(&o.req.prompt);
+        ds4_session_free_test_checkpoint(other.session);
+    }
+
+    /* Images: the one in the kept history must still match; a new one may
+     * sit anywhere after the anchor, including before the old live end. */
+    ds4_vision_span images[2] = {
+        {.token_start = 50, .embedding = {.token_count = 10, .fingerprint = {7}}},
+        {.token_start = 195, .embedding = {.token_count = 10, .fingerprint = {8}}},
+    };
+    ds4_session_set_test_images(slots[0].session, images, 1);
+    j.req.images = images;
+    j.req.image_count = 2;
+    pr = slot_probe_reuse_locked(&s, &slots[0], &j.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 180);
+    images[1].token_start = 170;    /* before the anchor: not history */
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &j.req).kind == REUSE_NONE);
+    images[1].token_start = 195;
+    images[0].embedding.fingerprint[0] = 9;     /* other pixels */
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &j.req).kind == REUSE_NONE);
+    images[0].embedding.fingerprint[0] = 7;
+    images[0].token_start = 51;     /* moved */
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slots[0], &j.req).kind == REUSE_NONE);
+
+    ds4_tokens_free(&j.req.prompt);
+    ds4_session_free_test_checkpoint(slots[0].session);
+    ds4_session_free_test_checkpoint(slots[1].session);
 }
 
 /* Staleness tiers: a resident checkpoint idle past SLOT_STALE_AFTER_SEC is
@@ -25675,6 +25869,7 @@ static void ds4_server_unit_tests_run(void) {
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
     test_slot_probe_vision_tiers();
+    test_slot_probe_memory_anchor();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
     test_slot_kick_victim_order();

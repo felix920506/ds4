@@ -154,6 +154,16 @@ int ds4_dist_sessions_eval(
         char *err,
         size_t errlen);
 
+/* Rewind anchors (see ds4_session_anchor_save).  The engine keeps the
+ * coordinator stage's anchor itself and notes each save or rewind here so the
+ * remote stages follow.  probe asks the first remote stage, once per
+ * connection, whether its build knows anchors; supported reports the answer
+ * without touching the network, and is false until probe has run.
+ */
+void ds4_dist_session_anchor_probe(ds4_dist_session *d);
+bool ds4_dist_session_anchors_supported(const ds4_dist_session *d);
+void ds4_dist_session_anchor_note(ds4_dist_session *d, uint32_t pos, bool rewind);
+
 /* Save/load use the normal DSV4 payload format. The coordinator gathers or
  * pushes remote layer shards internally so saved files are topology-neutral.
  */

@@ -509,6 +509,12 @@ int ds4_session_sync_multimodal(ds4_session *s,
 bool ds4_session_vision_prefix_matches(const ds4_session *s,
                                        const ds4_vision_span *images,
                                        size_t image_count);
+/* The same test for the checkpoint as a rewind to pos would leave it: only
+ * the images wholly before pos are history. */
+bool ds4_session_vision_prefix_matches_at(const ds4_session *s,
+                                          const ds4_vision_span *images,
+                                          size_t image_count,
+                                          int pos);
 /* Like the prefix check, but also require exactly the same image count. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
@@ -546,6 +552,21 @@ bool ds4_session_restore_vision_identities(ds4_session *s,
 /* False when loading a payload rebuilds the state from its tokens alone (as
  * tensor parallelism does), which cannot reproduce image rows. */
 bool ds4_session_payload_restores_vision(const ds4_session *s);
+/* Rewind anchors (DeepSeek V4 graph sessions and pipelines; elsewhere save
+ * fails and no anchor is ever found).  An anchor lets the live state return to
+ * the frontier it was saved at without replaying the tokens before it.
+ *
+ * save: keep an anchor at the current frontier.  Old anchors are thinned so
+ *   that a bounded number covers the history, densest near the frontier.
+ * floor: position of the newest usable anchor at or below pos, or -1.
+ * rewind: return to the anchor at exactly pos, a value floor returned.  The
+ *   checkpoint keeps its first pos tokens and the images wholly inside them;
+ *   logits are stale until the next token is evaluated.  False means the
+ *   state could not be restored; the checkpoint is then left as it was or
+ *   invalidated, and the caller rebuilds as it would without anchors. */
+bool ds4_session_anchor_save(ds4_session *s);
+int ds4_session_anchor_floor(const ds4_session *s, int pos);
+bool ds4_session_anchor_rewind(ds4_session *s, int pos);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -556,6 +577,8 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
+/* Give a test checkpoint a (stateless) rewind anchor at pos, in ascending order. */
+void ds4_session_add_test_anchor(ds4_session *s, int pos);
 void ds4_session_free_test_checkpoint(ds4_session *s);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */

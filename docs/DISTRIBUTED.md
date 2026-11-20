@@ -197,6 +197,16 @@ that sets either. With differing layouts requests still run, but nothing is
 saved, and the server logs
 `kv cache skipped ... distributed KV shards use different layouts`.
 
+[Live KV rewind](SERVER.md#live-kv-reuse-and-rewind) works across a pipeline:
+every stage keeps the rewind anchors of its own layers, and the coordinator's
+saves and rewinds travel as flags on frames it sends anyway. A worker that has
+lost its anchors, after a restart for example, answers a rewind with an error
+and the coordinator replays the conversation as for any other KV mismatch.
+The coordinator asks each worker connection once whether its build knows
+anchors. If one does not, it logs `a worker refused the rewind-anchor flags`
+and serves as before, without rewind, until it is restarted against workers of
+its own build.
+
 Long prefill chunks can occupy different stages simultaneously. A single
 generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and

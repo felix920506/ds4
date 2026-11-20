@@ -5316,15 +5316,6 @@ static void test_metal_short_prefill_ratio4(void) {
     }
 }
 
-#ifdef DS4_ROCM_BUILD
-/* Host memory still allocatable: on a unified-memory device every GPU buffer
- * is pinned host memory, and unlike the kfd counters this works in a container. */
-static uint64_t test_rocm_free_bytes(void) {
-    uint64_t bytes = 0;
-    TEST_ASSERT(ds4_linux_nonmovable_memory(&bytes));
-    return bytes;
-}
-
 static bool test_logits_identical(ds4_engine *engine, ds4_session *a, ds4_session *b) {
     const int vocab = ds4_engine_vocab_size(engine);
     float *la = malloc((size_t)vocab * sizeof(la[0]));
@@ -5336,6 +5327,15 @@ static bool test_logits_identical(ds4_engine *engine, ds4_session *a, ds4_sessio
     free(la);
     free(lb);
     return same;
+}
+
+#ifdef DS4_ROCM_BUILD
+/* Host memory still allocatable: on a unified-memory device every GPU buffer
+ * is pinned host memory, and unlike the kfd counters this works in a container. */
+static uint64_t test_rocm_free_bytes(void) {
+    uint64_t bytes = 0;
+    TEST_ASSERT(ds4_linux_nonmovable_memory(&bytes));
+    return bytes;
 }
 
 /* On-demand context memory: a session whose compressed caches start at four
@@ -5414,6 +5414,122 @@ cleanup:
     ds4_session_free(upfront);
 }
 #endif
+
+/* Rewind anchors: a session that follows one continuation, returns to an
+ * anchor and takes another must end in exactly the state of a session that
+ * only ever saw the second.  The abandoned continuation is long enough to
+ * overwrite the whole raw ring and to push every compressor through many
+ * windows, and the anchor sits inside a window of both compression ratios. */
+static void test_session_anchor_rewind(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    enum { CTX = 8192, ANCHOR = 331, DETOUR = 2600, DETOUR_STEPS = 40,
+           STEPS = 300, RESUME = 700 };
+    ds4_session *detour = NULL, *straight = NULL;
+    ds4_session_snapshot base = {0}, snap_detour = {0}, snap_straight = {0};
+    ds4_tokens text = {0}, prompt = {0};
+    char err[192] = {0};
+
+    /* Numbered sentences: every stretch of the prompt is different. */
+    char *story = malloc(64 * 1024);
+    size_t used = 0;
+    for (int i = 0; used + 128 < 64 * 1024; i++) {
+        used += (size_t)snprintf(story + used, 64 * 1024 - used,
+            "Entry %d: the river station logged %d boats and a tide of %d cm. ",
+            i, 3 * i + 7, 40 + (i * 37) % 300);
+    }
+    ds4_chat_begin(engine, &text);
+    ds4_chat_append_message(engine, &text, "user", story);
+    free(story);
+    TEST_ASSERT(text.len > ANCHOR + DETOUR + STEPS + RESUME);
+    if (text.len <= ANCHOR + DETOUR + STEPS + RESUME) goto cleanup;
+
+    TEST_ASSERT(ds4_session_create(&detour, engine, CTX) == 0);
+    TEST_ASSERT(ds4_session_create(&straight, engine, CTX) == 0);
+    if (!detour || !straight) goto cleanup;
+
+    /* Both sessions start from one and the same state at the anchor. */
+    for (int i = 0; i < ANCHOR; i++) ds4_tokens_push(&prompt, text.v[i]);
+    TEST_ASSERT(ds4_session_sync(detour, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_save_snapshot(detour, &base, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_load_snapshot(straight, &base, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_anchor_floor(detour, ANCHOR) == -1);
+    if (!ds4_session_anchor_save(detour)) {
+        fprintf(stderr, "ds4-test: rewind anchors are not supported by this session; skipped\n");
+        goto cleanup;
+    }
+    TEST_ASSERT(ds4_session_anchor_floor(detour, ANCHOR - 1) == -1);
+    TEST_ASSERT(ds4_session_anchor_floor(detour, ANCHOR) == ANCHOR);
+
+    /* The detour: other text by prefill, then decode, with a second anchor
+     * on the way that the rewind must forget. */
+    for (int i = 0; i < DETOUR; i++)
+        ds4_tokens_push(&prompt, text.v[text.len - DETOUR + i]);
+    TEST_ASSERT(ds4_session_sync(detour, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_anchor_save(detour));
+    for (int i = 0; i < DETOUR_STEPS; i++) {
+        TEST_ASSERT(ds4_session_eval(detour, ds4_session_argmax(detour),
+                                     err, sizeof(err)) == 0);
+    }
+    TEST_ASSERT(ds4_session_anchor_floor(detour, ANCHOR + DETOUR + DETOUR_STEPS) ==
+                ANCHOR + DETOUR);
+    TEST_ASSERT(ds4_session_anchor_floor(detour, ANCHOR + DETOUR - 1) == ANCHOR);
+    TEST_ASSERT(!ds4_session_anchor_rewind(detour, ANCHOR + 1));
+    TEST_ASSERT(ds4_session_pos(detour) == ANCHOR + DETOUR + DETOUR_STEPS);
+    struct timespec t0, t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    TEST_ASSERT(ds4_session_anchor_save(detour));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    TEST_ASSERT(ds4_session_anchor_rewind(detour, ANCHOR));
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    fprintf(stderr, "ds4-test: anchor save %.1f ms, rewind %.1f ms\n",
+            (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6,
+            (double)(t2.tv_sec - t1.tv_sec) * 1e3 + (double)(t2.tv_nsec - t1.tv_nsec) / 1e6);
+    TEST_ASSERT(ds4_session_pos(detour) == ANCHOR);
+    TEST_ASSERT(ds4_session_anchor_floor(detour, CTX) == ANCHOR);
+
+    /* The real continuation, decoded: crosses windows of both ratios. */
+    for (int i = 0; i < STEPS; i++) {
+        const int token = text.v[ANCHOR + i];
+        TEST_ASSERT(ds4_session_eval(detour, token, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_eval(straight, token, err, sizeof(err)) == 0);
+        if (!test_logits_identical(engine, detour, straight)) {
+            fprintf(stderr, "ds4-test: anchor rewind: logits differ at step %d\n", i);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+    }
+    TEST_ASSERT(ds4_session_save_snapshot(detour, &snap_detour, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_save_snapshot(straight, &snap_straight, err, sizeof(err)) == 0);
+    TEST_ASSERT(snap_detour.len == snap_straight.len &&
+                memcmp(snap_detour.ptr, snap_straight.ptr, snap_straight.len) == 0);
+
+    /* A second rewind over the same anchor, continued by resumed prefill and
+     * compared with the same prefill from the saved state. */
+    TEST_ASSERT(ds4_session_anchor_rewind(detour, ANCHOR));
+    TEST_ASSERT(ds4_session_load_snapshot(straight, &base, err, sizeof(err)) == 0);
+    prompt.len = ANCHOR;
+    for (int i = 0; i < STEPS + RESUME; i++) ds4_tokens_push(&prompt, text.v[ANCHOR + i]);
+    TEST_ASSERT(ds4_session_sync(detour, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(straight, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(detour) == prompt.len);
+    TEST_ASSERT(test_logits_identical(engine, detour, straight));
+    ds4_session_snapshot_free(&snap_detour);
+    ds4_session_snapshot_free(&snap_straight);
+    TEST_ASSERT(ds4_session_save_snapshot(detour, &snap_detour, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_save_snapshot(straight, &snap_straight, err, sizeof(err)) == 0);
+    TEST_ASSERT(snap_detour.len == snap_straight.len &&
+                memcmp(snap_detour.ptr, snap_straight.ptr, snap_straight.len) == 0);
+
+cleanup:
+    ds4_session_snapshot_free(&base);
+    ds4_session_snapshot_free(&snap_detour);
+    ds4_session_snapshot_free(&snap_straight);
+    ds4_tokens_free(&text);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(detour);
+    ds4_session_free(straight);
+}
 
 typedef struct {
     int expected_start;
@@ -7431,6 +7547,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
+    {"--session-anchor-rewind", "session-anchor-rewind", "rewind anchors return a session to an earlier frontier bit for bit", test_session_anchor_rewind},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
