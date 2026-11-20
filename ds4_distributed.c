@@ -5598,8 +5598,9 @@ int ds4_dist_session_load_payload(
             free(n_index_comp);
             return 1;
         }
+        /* Image checkpoints hold the typed image tokens above the vocabulary. */
         if (tok > (uint32_t)INT_MAX ||
-            tok >= (uint32_t)ds4_engine_vocab_size(d->coord->state.engine)) {
+            tok >= (uint32_t)ds4_engine_token_limit(d->coord->state.engine)) {
             free(tokens);
             free(logits);
             free(n_comp);
@@ -8062,8 +8063,12 @@ static int dist_worker_handle_snapshot_load(
         }
         uint32_t token = ntohl(wire_token);
         if (token > (uint32_t)INT_MAX ||
-            token >= (uint32_t)ds4_engine_vocab_size(state->engine)) {
-            snprintf(err, sizeof(err), "snapshot token id is outside the model vocabulary");
+            token >= (uint32_t)ds4_engine_token_limit(state->engine)) {
+            snprintf(err, sizeof(err), "%s",
+                     token >= (uint32_t)ds4_engine_vocab_size(state->engine) &&
+                     ds4_engine_token_limit(state->engine) == ds4_engine_vocab_size(state->engine) ?
+                     "snapshot carries image tokens; start the worker with --vision" :
+                     "snapshot token id is outside the model vocabulary");
             tokens[i] = 0;
         } else {
             tokens[i] = (int)token;
