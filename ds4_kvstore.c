@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1081,6 +1082,19 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     free(score);
 }
 
+/* Continued checkpoints are due at multiples of the interval, rounded up to
+ * the boundary alignment. */
+static int kv_cache_continued_step(const ds4_kvstore *kc) {
+    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return 0;
+    int step = kc->opt.continued_interval_tokens;
+    const int align = kc->opt.boundary_align_tokens;
+    if (align > 0) {
+        step = ((step + align - 1) / align) * align;
+        if (step <= 0) step = align;
+    }
+    return step;
+}
+
 bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
                       bool reject_different_quant, ds4_kvstore_options opt,
                       const char *log_name,
@@ -1112,7 +1126,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             reject_different_quant ? "reject" : "accept",
             kc->opt.min_tokens,
             kc->opt.cold_max_tokens,
-            kc->opt.continued_interval_tokens,
+            kv_cache_continued_step(kc),
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
             (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
@@ -1204,17 +1218,6 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
     return last_user >= kc->opt.min_tokens ? last_user : -1;
 }
 
-static int kv_cache_continued_step(const ds4_kvstore *kc) {
-    if (!kc->enabled || kc->opt.continued_interval_tokens <= 0) return 0;
-    int step = kc->opt.continued_interval_tokens;
-    const int align = kc->opt.boundary_align_tokens;
-    if (align > 0) {
-        step = ((step + align - 1) / align) * align;
-        if (step <= 0) step = align;
-    }
-    return step;
-}
-
 int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     const int step = kv_cache_continued_step(kc);
     if (step <= 0) return 0;
@@ -1222,6 +1225,20 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     if (live_tokens % step != 0) return 0;
     if (live_tokens <= kc->continued_last_store_tokens) return 0;
     return live_tokens;
+}
+
+/* The first token count above live_tokens where a continued checkpoint is
+ * due, or 0 when there is none.  A checkpoint can only be written while the
+ * session stands exactly on that count, so a prefill that advances in larger
+ * steps has to stop there. */
+int ds4_kvstore_continued_next_target(const ds4_kvstore *kc, int live_tokens) {
+    const int step = kv_cache_continued_step(kc);
+    if (step <= 0) return 0;
+    int below = live_tokens > 0 ? live_tokens : 0;
+    if (below < kc->continued_last_store_tokens) below = kc->continued_last_store_tokens;
+    if (below < kc->opt.min_tokens - 1) below = kc->opt.min_tokens - 1;
+    if (below > INT_MAX - step) return 0;
+    return (below / step + 1) * step;
 }
 
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {

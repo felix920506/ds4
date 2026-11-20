@@ -187,6 +187,14 @@ workloads, the controls are `--kv-cache-min-tokens`,
 `--kv-cache-boundary-trim-tokens`, and `--kv-cache-boundary-align-tokens`.
 Check `./ds4-server --help` for their defaults.
 
+During a long prefill or generation a continued checkpoint is due every
+`--kv-cache-continued-interval-tokens` tokens, rounded up to a multiple of the
+boundary alignment; the startup line reports the interval in effect as
+`continued=N`. A checkpoint can only be written while the session stands
+exactly on such a token count. With `--batched-session` a prefill stops at
+each of them. Without it, one is written only where a prefill chunk happens to
+end there.
+
 Quantization variants may share compatible prefixes. Add
 `--kv-cache-reject-different-quant` for same-quant reuse only.
 Cache files contain prompt text and model state: treat the directory as
