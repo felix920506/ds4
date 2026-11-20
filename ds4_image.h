@@ -74,6 +74,11 @@ int ds4_image_decode_file(
 
 void ds4_image_free(ds4_image *image);
 
+/* 1 when the leading bytes are a PNG, JPEG, WebP, GIF, TIFF or BMP signature.
+ * PNG and JPEG decode in-process; the rest, and PNG/JPEG variants the
+ * built-in decoder rejects, need ImageMagick (see DS4_IMAGE_DECODER). */
+int ds4_image_has_known_magic(const uint8_t *data, size_t len);
+
 int ds4_image_preprocess_glm53(
         ds4_image_patches *out,
         const ds4_image   *image,

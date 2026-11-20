@@ -76847,7 +76847,7 @@ typedef struct {
     const uint8_t *encoded;
     size_t encoded_len;
     ds4_image image;
-    char error[160];
+    char error[384];
     int ok;
 } ds4_vision_decode_job;
 

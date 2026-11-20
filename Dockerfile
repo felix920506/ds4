@@ -58,6 +58,7 @@ FROM ${ROCM_IMAGE}
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libgomp1 curl ca-certificates \
+        imagemagick \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/ds4 /opt/ds4

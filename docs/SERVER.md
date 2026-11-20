@@ -121,8 +121,12 @@ For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-use
 Start with the matching language GGUF and `--vision FILE`; see
 [model-specific instructions](MODELS.md#vision).
 
-OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
-base64 image sources. Remote URLs and server-side file paths are rejected.
+OpenAI chat and Responses accept inline PNG, JPEG, WebP, GIF, TIFF and BMP
+data URIs. Anthropic accepts base64 image sources of the same types. Formats
+and variants the built-in PNG/JPEG decoder cannot read (16-bit or interlaced
+PNG, CMYK JPEG, and every type other than PNG and JPEG) are decoded by
+ImageMagick when it is installed; otherwise the request fails with an error
+naming the reason. See `DS4_IMAGE_DECODER` in the [README](../README.md). Remote URLs and server-side file paths are rejected.
 Image blocks preserve their order in the request. A request is rejected when
 its tokens, image blocks included, do not fit the context window; the only
 other limit is a ceiling of 4096 images per request, far above what any

@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
 #include "ds4_help.h"
+#include "ds4_image.h"
 #include "ds4_prompt_prefix.h"
 #include "linenoise.h"
 
@@ -1698,13 +1699,12 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
 }
 
 static bool cli_file_has_image_magic(const char *path) {
-    unsigned char magic[8] = {0};
+    unsigned char magic[16] = {0};
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
     size_t n = fread(magic, 1, sizeof(magic), fp);
     fclose(fp);
-    return (n >= 8 && !memcmp(magic, "\x89PNG\r\n\x1a\n", 8)) ||
-           (n >= 2 && magic[0] == 0xff && magic[1] == 0xd8);
+    return ds4_image_has_known_magic(magic, n);
 }
 
 static int run_repl(ds4_engine *engine, cli_config *cfg) {

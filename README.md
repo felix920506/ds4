@@ -173,6 +173,13 @@ and setup.
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
 
+PNG and JPEG decode in-process. 16-bit, 1/2/4-bit grayscale and interlaced
+PNGs, CMYK or 12-bit JPEGs, and WebP, GIF, TIFF and BMP images are passed to
+ImageMagick (`magick`, else `convert`, from `PATH`), which runs as a separate
+process. Set `DS4_IMAGE_DECODER` to the path of another ImageMagick binary,
+or to `off` to use only the built-in decoders. The Docker image includes
+ImageMagick.
+
 Qwen3.8's smaller Q2 release has **41.73 GiB** of main/MTP weights,
 with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections.
 It is the starting option for 64 GB Macs.

@@ -501,11 +501,18 @@ static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len
     return true;
 }
 
+/* PNG and JPEG decode in-process; the others go through ImageMagick (see
+ * ds4_image.c), and fail with an install hint when it is missing.  The
+ * decoder sniffs the bytes, so the declared type is only a gate. */
 static bool server_image_media_type(const char *media_type) {
-    return media_type &&
-           (!strcasecmp(media_type, "image/png") ||
-            !strcasecmp(media_type, "image/jpeg") ||
-            !strcasecmp(media_type, "image/jpg"));
+    static const char *const types[] = {
+        "image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif",
+        "image/tiff", "image/bmp", "image/x-ms-bmp",
+    };
+    if (!media_type) return false;
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+        if (!strcasecmp(media_type, types[i])) return true;
+    return false;
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
@@ -546,20 +553,17 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
 static bool server_image_inputs_push_data_uri(
         server_image_inputs *images, const char *uri,
         char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    static const char png[] = "data:image/png;base64,";
-    static const char jpeg[] = "data:image/jpeg;base64,";
-    static const char jpg[] = "data:image/jpg;base64,";
-    if (!uri) return false;
-    if (!strncmp(uri, png, sizeof(png) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/png", uri + sizeof(png) - 1, marker);
-    if (!strncmp(uri, jpeg, sizeof(jpeg) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/jpeg", uri + sizeof(jpeg) - 1, marker);
-    if (!strncmp(uri, jpg, sizeof(jpg) - 1))
-        return server_image_inputs_push_base64(
-            images, "image/jpg", uri + sizeof(jpg) - 1, marker);
-    return false;
+    static const char prefix[] = "data:";
+    static const char suffix[] = ";base64,";
+    if (!uri || strncmp(uri, prefix, sizeof(prefix) - 1)) return false;
+    const char *type = uri + sizeof(prefix) - 1;
+    const char *end = strstr(type, suffix);
+    if (!end || end - type >= 32) return false;
+    char media_type[32];
+    memcpy(media_type, type, (size_t)(end - type));
+    media_type[end - type] = '\0';
+    return server_image_inputs_push_base64(
+        images, media_type, end + sizeof(suffix) - 1, marker);
 }
 
 static void append_owned_text(char **dst, const char *text) {
@@ -24429,6 +24433,61 @@ static void test_anthropic_inline_image_content(void) {
     buf_free(&json);
 }
 
+/* Formats the built-in decoder lacks pass the gate and reach ImageMagick;
+ * types nothing decodes, and malformed data URIs, are still refused. */
+static void test_inline_image_media_types(void) {
+    static const char *const accepted[] = {
+        "image/webp", "image/gif", "image/tiff", "image/bmp", "image/jpg", "IMAGE/PNG",
+    };
+    static const char *const refused[] = {
+        "image/svg+xml", "text/plain", "image/heic", "",
+    };
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        server_image_inputs images = {0};
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        char uri[256];
+        snprintf(uri, sizeof(uri), "data:%s;base64,%s", accepted[i], test_inline_png_base64);
+        TEST_ASSERT(server_image_inputs_push_data_uri(&images, uri, marker));
+        TEST_ASSERT(images.len == 1);
+        server_image_inputs_free(&images);
+    }
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        server_image_inputs images = {0};
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        char uri[256];
+        snprintf(uri, sizeof(uri), "data:%s;base64,%s", refused[i], test_inline_png_base64);
+        TEST_ASSERT(!server_image_inputs_push_data_uri(&images, uri, marker));
+        TEST_ASSERT(images.len == 0);
+        server_image_inputs_free(&images);
+    }
+    static const char *const malformed[] = {
+        "data:image/png,iVBORw0KGgo=",
+        "data:image/png;base64",
+        "image/png;base64,iVBORw0KGgo=",
+        "data:image/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;base64,iVBORw0KGgo=",
+    };
+    for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+        server_image_inputs images = {0};
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        TEST_ASSERT(!server_image_inputs_push_data_uri(&images, malformed[i], marker));
+        server_image_inputs_free(&images);
+    }
+
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\","
+        "\"source\":{\"type\":\"base64\",\"media_type\":\"image/gif\","
+        "\"data\":\"");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1 && msgs.v[0].images.len == 1);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
 static void test_responses_inline_image_content(void) {
     buf json = {0};
     buf_puts(&json,
@@ -25308,6 +25367,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
+    test_inline_image_media_types();
     test_responses_inline_image_content();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();

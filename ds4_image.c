@@ -1,12 +1,21 @@
 #include "ds4_image.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <pthread.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+extern char **environ;
 
 #define JPEG_IMPLEMENTATION
 #define PNG_IMPLEMENTATION
@@ -232,6 +241,445 @@ static int ds4_oriented_rgb(
     return 1;
 }
 
+/* ---- External decoder fallback --------------------------------------------
+ *
+ * The embedded Iris decoders cover 8-bit non-interlaced PNG and baseline or
+ * progressive 8-bit JPEG.  Anything they reject, and the formats they do not
+ * read at all (WebP, GIF, TIFF, BMP), goes to ImageMagick when it is
+ * installed.  It runs as a child process so a decoder crash cannot take the
+ * engine down, gets the encoded bytes on stdin and writes binary PPM to
+ * stdout.  The input coder is always named explicitly ("png:-") so a request
+ * can never reach ImageMagick's script-like formats (MVG, SVG, PostScript).
+ *
+ * DS4_IMAGE_DECODER selects the program: a path to `magick` or `convert`, or
+ * "off" to use only the embedded decoders.  Without it, `magick` (ImageMagick
+ * 7) and then `convert` (ImageMagick 6) are looked up in PATH. */
+
+#define DS4_IMAGE_EXTERNAL_TIMEOUT_MS 60000
+#define DS4_IMAGE_EXTERNAL_HINT "install ImageMagick (magick or convert in PATH) to decode it"
+
+typedef enum {
+    DS4_IMAGE_FMT_UNKNOWN = 0,
+    DS4_IMAGE_FMT_PNG,
+    DS4_IMAGE_FMT_JPEG,
+    DS4_IMAGE_FMT_WEBP,
+    DS4_IMAGE_FMT_GIF,
+    DS4_IMAGE_FMT_TIFF,
+    DS4_IMAGE_FMT_BMP,
+} ds4_image_format;
+
+static ds4_image_format ds4_image_sniff(const uint8_t *d, size_t n) {
+    if (n >= 8 && memcmp(d, "\x89PNG\r\n\x1a\n", 8) == 0) return DS4_IMAGE_FMT_PNG;
+    if (n >= 2 && d[0] == 0xff && d[1] == 0xd8) return DS4_IMAGE_FMT_JPEG;
+    if (n >= 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0)
+        return DS4_IMAGE_FMT_WEBP;
+    if (n >= 6 && (memcmp(d, "GIF87a", 6) == 0 || memcmp(d, "GIF89a", 6) == 0))
+        return DS4_IMAGE_FMT_GIF;
+    if (n >= 4 && (memcmp(d, "II*\0", 4) == 0 || memcmp(d, "MM\0*", 4) == 0))
+        return DS4_IMAGE_FMT_TIFF;
+    if (n >= 14 && d[0] == 'B' && d[1] == 'M') return DS4_IMAGE_FMT_BMP;
+    return DS4_IMAGE_FMT_UNKNOWN;
+}
+
+int ds4_image_has_known_magic(const uint8_t *data, size_t len) {
+    return data && ds4_image_sniff(data, len) != DS4_IMAGE_FMT_UNKNOWN;
+}
+
+static const char *ds4_image_format_name(ds4_image_format fmt) {
+    switch (fmt) {
+        case DS4_IMAGE_FMT_PNG: return "PNG";
+        case DS4_IMAGE_FMT_JPEG: return "JPEG";
+        case DS4_IMAGE_FMT_WEBP: return "WebP";
+        case DS4_IMAGE_FMT_GIF: return "GIF";
+        case DS4_IMAGE_FMT_TIFF: return "TIFF";
+        case DS4_IMAGE_FMT_BMP: return "BMP";
+        default: return "image";
+    }
+}
+
+/* ImageMagick coder names; the "[0]" keeps only the first frame. */
+static const char *ds4_image_format_coder(ds4_image_format fmt) {
+    switch (fmt) {
+        case DS4_IMAGE_FMT_PNG: return "png:-[0]";
+        case DS4_IMAGE_FMT_JPEG: return "jpeg:-[0]";
+        case DS4_IMAGE_FMT_WEBP: return "webp:-[0]";
+        case DS4_IMAGE_FMT_GIF: return "gif:-[0]";
+        case DS4_IMAGE_FMT_TIFF: return "tiff:-[0]";
+        case DS4_IMAGE_FMT_BMP: return "bmp:-[0]";
+        default: return NULL;
+    }
+}
+
+/* Why the embedded decoder turned the image down, from its header.  Only
+ * used for the error message, so it never needs to be complete. */
+static void ds4_image_embedded_reason(ds4_image_format fmt, const uint8_t *d,
+                                      size_t n, char *out, size_t cap) {
+    snprintf(out, cap, "invalid or unsupported %s", ds4_image_format_name(fmt));
+    if (fmt == DS4_IMAGE_FMT_PNG) {
+        if (n < 33 || memcmp(d + 12, "IHDR", 4) != 0) return;
+        unsigned depth = d[24], color = d[25], interlace = d[28];
+        bool palette_depth = color == 3 && (depth == 1 || depth == 2 || depth == 4);
+        if (depth != 8 && !palette_depth)
+            snprintf(out, cap, "unsupported PNG: bit depth %u", depth);
+        else if (interlace)
+            snprintf(out, cap, "unsupported PNG: Adam7 interlacing");
+    } else if (fmt == DS4_IMAGE_FMT_JPEG) {
+        size_t pos = 2;
+        while (pos + 9 < n && d[pos] == 0xff) {
+            unsigned marker = d[pos + 1];
+            size_t seg = ((size_t)d[pos + 2] << 8) | d[pos + 3];
+            bool sof = marker >= 0xc0 && marker <= 0xcf &&
+                       marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
+            if (sof) {
+                unsigned precision = d[pos + 4], comps = d[pos + 9];
+                if (marker != 0xc0 && marker != 0xc2)
+                    snprintf(out, cap, "unsupported JPEG: SOF%u coding", marker - 0xc0);
+                else if (precision != 8)
+                    snprintf(out, cap, "unsupported JPEG: %u-bit samples", precision);
+                else if (comps != 1 && comps != 3)
+                    snprintf(out, cap, "unsupported JPEG: %u color components%s",
+                             comps, comps == 4 ? " (CMYK)" : "");
+                return;
+            }
+            if (marker == 0xda || seg < 2) return;
+            pos += 2 + seg;
+        }
+    } else {
+        snprintf(out, cap, "%s is not supported by the built-in decoder",
+                 ds4_image_format_name(fmt));
+    }
+}
+
+static bool ds4_image_find_in_path(const char *name, char *out, size_t cap) {
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/usr/local/bin:/usr/bin:/bin";
+    while (*path) {
+        const char *colon = strchr(path, ':');
+        size_t len = colon ? (size_t)(colon - path) : strlen(path);
+        if (len > 0) {
+            int n = snprintf(out, cap, "%.*s/%s", (int)len, path, name);
+            if (n > 0 && (size_t)n < cap && access(out, X_OK) == 0) return true;
+        }
+        if (!colon) break;
+        path = colon + 1;
+    }
+    out[0] = '\0';
+    return false;
+}
+
+/* Resolved on every fallback: a few access() calls are nothing next to the
+ * process spawn, and the environment can change between requests. */
+static const char *ds4_image_external_program(char *buf, size_t cap) {
+    const char *env = getenv("DS4_IMAGE_DECODER");
+    if (env && *env) {
+        if (!strcmp(env, "off") || !strcmp(env, "none") || !strcmp(env, "0")) return NULL;
+        if (strchr(env, '/')) {
+            snprintf(buf, cap, "%s", env);
+            return buf;
+        }
+        return ds4_image_find_in_path(env, buf, cap) ? buf : NULL;
+    }
+    if (ds4_image_find_in_path("magick", buf, cap) ||
+        ds4_image_find_in_path("convert", buf, cap)) return buf;
+    return NULL;
+}
+
+static int64_t ds4_image_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static bool ds4_image_pipe(int fds[2]) {
+    if (pipe(fds) != 0) return false;
+    for (int i = 0; i < 2; i++) {
+        if (fcntl(fds[i], F_SETFD, FD_CLOEXEC) != 0 ||
+            fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL) | O_NONBLOCK) != 0) {
+            close(fds[0]);
+            close(fds[1]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ds4_image_close(int *fd) {
+    if (*fd >= 0) close(*fd);
+    *fd = -1;
+}
+
+/* Parse "P5"/"P6" output.  Rewrites the samples in place as 8-bit values and
+ * returns a pointer to them, or NULL when the header or the size is wrong. */
+static uint8_t *ds4_image_parse_pnm(uint8_t *d, size_t n, uint32_t *width,
+                                    uint32_t *height, uint32_t *channels) {
+    if (n < 3 || d[0] != 'P' || (d[1] != '5' && d[1] != '6')) return NULL;
+    uint64_t field[3];
+    size_t pos = 2;
+    for (int f = 0; f < 3; f++) {
+        for (;;) {
+            while (pos < n && (d[pos] == ' ' || d[pos] == '\t' || d[pos] == '\n' ||
+                               d[pos] == '\r' || d[pos] == '\v' || d[pos] == '\f')) pos++;
+            if (pos < n && d[pos] == '#') {
+                while (pos < n && d[pos] != '\n') pos++;
+                continue;
+            }
+            break;
+        }
+        if (pos >= n || d[pos] < '0' || d[pos] > '9') return NULL;
+        uint64_t v = 0;
+        while (pos < n && d[pos] >= '0' && d[pos] <= '9') {
+            v = v * 10 + (uint64_t)(d[pos++] - '0');
+            if (v > 0xffffffffu) return NULL;
+        }
+        field[f] = v;
+    }
+    if (pos >= n) return NULL;
+    pos++; /* the single whitespace byte before the raster */
+    const uint64_t w = field[0], h = field[1], maxval = field[2];
+    const uint32_t ch = d[1] == '6' ? 3u : 1u;
+    if (w == 0 || h == 0 || w > DS4_IMAGE_MAX_DIMENSION || h > DS4_IMAGE_MAX_DIMENSION ||
+        w * h > DS4_IMAGE_MAX_PIXELS || maxval == 0 || maxval > 65535) return NULL;
+    const size_t samples = (size_t)(w * h * ch);
+    const size_t bps = maxval > 255 ? 2 : 1;
+    if (n - pos < samples * bps) return NULL;
+    uint8_t *px = d + pos;
+    if (maxval != 255) {
+        for (size_t i = 0; i < samples; i++) {
+            uint32_t v = bps == 2 ? ((uint32_t)px[2 * i] << 8) | px[2 * i + 1] : px[i];
+            if (v > maxval) v = (uint32_t)maxval;
+            px[i] = (uint8_t)((v * 255u + (uint32_t)maxval / 2u) / (uint32_t)maxval);
+        }
+    }
+    *width = (uint32_t)w;
+    *height = (uint32_t)h;
+    *channels = ch;
+    return px;
+}
+
+/* Run `program <args>`, feed it `input` on stdin, collect stdout and the head
+ * of stderr.  Returns the exit status, or -1 when the child could not be run,
+ * or got killed for the timeout or for writing more than out_cap bytes. */
+static int ds4_image_run(const char *program, char *const argv[],
+                         const uint8_t *input, size_t input_len,
+                         uint8_t **out, size_t *out_len, size_t out_cap,
+                         char *err, size_t err_cap) {
+    int in[2] = {-1, -1}, op[2] = {-1, -1}, ep[2] = {-1, -1};
+    *out = NULL;
+    *out_len = 0;
+    if (err_cap) err[0] = '\0';
+    if (!ds4_image_pipe(in) || !ds4_image_pipe(op) || !ds4_image_pipe(ep)) {
+        ds4_image_close(&in[0]); ds4_image_close(&in[1]);
+        ds4_image_close(&op[0]); ds4_image_close(&op[1]);
+        snprintf(err, err_cap, "pipe: %s", strerror(errno));
+        return -1;
+    }
+    /* The child must see blocking pipes; only the parent ends poll. */
+    fcntl(in[0], F_SETFL, fcntl(in[0], F_GETFL) & ~O_NONBLOCK);
+    fcntl(op[1], F_SETFL, fcntl(op[1], F_GETFL) & ~O_NONBLOCK);
+    fcntl(ep[1], F_SETFL, fcntl(ep[1], F_GETFL) & ~O_NONBLOCK);
+#ifdef F_SETNOSIGPIPE
+    fcntl(in[1], F_SETNOSIGPIPE, 1);
+#endif
+
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, in[0], 0);
+    posix_spawn_file_actions_adddup2(&fa, op[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, ep[1], 2);
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34)
+    /* Engine sockets and model fds without O_CLOEXEC stay out of the child. */
+    posix_spawn_file_actions_addclosefrom_np(&fa, 3);
+#endif
+#endif
+    posix_spawnattr_init(&attr);
+    sigset_t none, dfl;
+    sigemptyset(&none);
+    sigemptyset(&dfl);
+    sigaddset(&dfl, SIGPIPE);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setsigdefault(&attr, &dfl);
+    short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    flags |= POSIX_SPAWN_CLOEXEC_DEFAULT; /* Darwin: only the dup2 targets survive. */
+#endif
+    posix_spawnattr_setflags(&attr, flags);
+    pid_t pid = -1;
+    int rc = posix_spawn(&pid, program, &fa, &attr, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
+    ds4_image_close(&in[0]);
+    ds4_image_close(&op[1]);
+    ds4_image_close(&ep[1]);
+    if (rc != 0) {
+        ds4_image_close(&in[1]);
+        ds4_image_close(&op[0]);
+        ds4_image_close(&ep[0]);
+        snprintf(err, err_cap, "%.160s: %s", program, strerror(rc));
+        return -1;
+    }
+
+#ifndef F_SETNOSIGPIPE
+    /* A child that exits before reading all of stdin turns the next write
+     * into SIGPIPE.  Block it on this thread and drop the one we caused. */
+    sigset_t pipe_set, old_set;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &pipe_set, &old_set);
+    sigset_t pending;
+    sigpending(&pending);
+    const bool pipe_was_pending = sigismember(&pending, SIGPIPE) == 1;
+    bool raised_pipe = false;
+#endif
+
+    size_t written = 0, cap = 0, err_len = 0;
+    uint8_t *buf = NULL;
+    bool killed = false;
+    const int64_t deadline = ds4_image_now_ms() + DS4_IMAGE_EXTERNAL_TIMEOUT_MS;
+    if (input_len == 0) ds4_image_close(&in[1]);
+    while (op[0] >= 0 || ep[0] >= 0) {
+        struct pollfd pfd[3];
+        int nfd = 0, iin = -1, iout = -1, ierr = -1;
+        if (in[1] >= 0) { iin = nfd; pfd[nfd++] = (struct pollfd){.fd = in[1], .events = POLLOUT}; }
+        if (op[0] >= 0) { iout = nfd; pfd[nfd++] = (struct pollfd){.fd = op[0], .events = POLLIN}; }
+        if (ep[0] >= 0) { ierr = nfd; pfd[nfd++] = (struct pollfd){.fd = ep[0], .events = POLLIN}; }
+        int64_t left = deadline - ds4_image_now_ms();
+        if (left <= 0) {
+            snprintf(err, err_cap, "timed out after %d s", DS4_IMAGE_EXTERNAL_TIMEOUT_MS / 1000);
+            killed = true;
+            break;
+        }
+        int pr = poll(pfd, (nfds_t)nfd, (int)left);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            snprintf(err, err_cap, "poll: %s", strerror(errno));
+            killed = true;
+            break;
+        }
+        if (iin >= 0 && pfd[iin].revents) {
+            ssize_t w = write(in[1], input + written, input_len - written);
+            if (w > 0) {
+                written += (size_t)w;
+                if (written == input_len) ds4_image_close(&in[1]);
+            } else if (w < 0 && errno != EAGAIN && errno != EINTR) {
+#ifndef F_SETNOSIGPIPE
+                if (errno == EPIPE) raised_pipe = true;
+#endif
+                ds4_image_close(&in[1]);
+            }
+        }
+        if (iout >= 0 && pfd[iout].revents) {
+            if (cap - *out_len < 65536) {
+                size_t grow = cap ? cap * 2 : (size_t)1 << 20;
+                if (grow > out_cap) grow = out_cap;
+                if (grow <= *out_len) {
+                    snprintf(err, err_cap, "decoded output exceeds the size limit");
+                    killed = true;
+                    break;
+                }
+                uint8_t *nb = realloc(buf, grow);
+                if (!nb) {
+                    snprintf(err, err_cap, "out of memory");
+                    killed = true;
+                    break;
+                }
+                buf = nb;
+                cap = grow;
+            }
+            ssize_t r = read(op[0], buf + *out_len, cap - *out_len);
+            if (r > 0) *out_len += (size_t)r;
+            else if (r == 0 || (errno != EAGAIN && errno != EINTR)) ds4_image_close(&op[0]);
+        }
+        if (ierr >= 0 && pfd[ierr].revents) {
+            char tmp[512];
+            ssize_t r = read(ep[0], tmp, sizeof(tmp));
+            if (r > 0) {
+                size_t keep = err_cap > err_len + 1 ? err_cap - err_len - 1 : 0;
+                if ((size_t)r < keep) keep = (size_t)r;
+                memcpy(err + err_len, tmp, keep);
+                err_len += keep;
+                if (err_cap) err[err_len] = '\0';
+            } else if (r == 0 || (errno != EAGAIN && errno != EINTR)) {
+                ds4_image_close(&ep[0]);
+            }
+        }
+    }
+    ds4_image_close(&in[1]);
+    ds4_image_close(&op[0]);
+    ds4_image_close(&ep[0]);
+    if (killed) kill(pid, SIGKILL);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+
+#ifndef F_SETNOSIGPIPE
+    if (raised_pipe && !pipe_was_pending) {
+        struct timespec zero = {0, 0};
+        while (sigtimedwait(&pipe_set, NULL, &zero) < 0 && errno == EINTR) {}
+    }
+    pthread_sigmask(SIG_SETMASK, &old_set, NULL);
+#endif
+
+    *out = buf;
+    if (killed) return -1;
+    if (WIFSIGNALED(status)) {
+        if (!err_len) snprintf(err, err_cap, "killed by signal %d", WTERMSIG(status));
+        return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void ds4_image_first_line(char *s) {
+    while (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t') memmove(s, s + 1, strlen(s));
+    char *nl = strpbrk(s, "\r\n");
+    if (nl) *nl = '\0';
+}
+
+static int ds4_image_decode_external(ds4_image *out, ds4_image_format fmt,
+                                     const char *program,
+                                     const uint8_t *encoded, size_t encoded_len,
+                                     char *why, size_t why_cap) {
+    char lim_w[16], lim_h[16], lim_area[24];
+    snprintf(lim_w, sizeof(lim_w), "%u", DS4_IMAGE_MAX_DIMENSION);
+    snprintf(lim_h, sizeof(lim_h), "%u", DS4_IMAGE_MAX_DIMENSION);
+    snprintf(lim_area, sizeof(lim_area), "%u", DS4_IMAGE_MAX_PIXELS);
+    char *argv[] = {
+        (char *)program,
+        "-limit", "width", lim_w,
+        "-limit", "height", lim_h,
+        "-limit", "area", lim_area,
+        "-limit", "time", "60",
+        (char *)ds4_image_format_coder(fmt),
+        "-auto-orient",
+        "-alpha", "off",
+        "-depth", "8",
+        "ppm:-",
+        NULL,
+    };
+    uint8_t *pnm = NULL;
+    size_t pnm_len = 0;
+    char err[256];
+    const size_t out_cap = 64 + (size_t)DS4_IMAGE_MAX_PIXELS * 3u;
+    int status = ds4_image_run(program, argv, encoded, encoded_len,
+                               &pnm, &pnm_len, out_cap, err, sizeof(err));
+    ds4_image_first_line(err);
+    uint32_t w = 0, h = 0, ch = 0;
+    uint8_t *px = status == 0 ? ds4_image_parse_pnm(pnm, pnm_len, &w, &h, &ch) : NULL;
+    int ok = 0;
+    if (px) {
+        ok = ds4_oriented_rgb(out, px, w, h, ch, 1);
+        if (!ok) snprintf(why, why_cap, "unable to allocate decoded pixels");
+    } else if (status == 0) {
+        snprintf(why, why_cap, "%.160s wrote no usable image", program);
+    } else if (err[0]) {
+        snprintf(why, why_cap, "%s", err);
+    } else {
+        snprintf(why, why_cap, "%.160s exited with status %d", program, status);
+    }
+    free(pnm);
+    return ok;
+}
+
 int ds4_image_decode_memory(
         ds4_image *out,
         const uint8_t *encoded,
@@ -245,38 +693,53 @@ int ds4_image_decode_memory(
         return 0;
     }
 
-    if (encoded_len >= 8 &&
-        memcmp(encoded, "\x89PNG\r\n\x1a\n", 8) == 0) {
-        png_image *decoded = png_load_mem(encoded, encoded_len);
-        if (!decoded) {
-            ds4_image_error(error, error_cap, "invalid or unsupported PNG image");
-            return 0;
-        }
-        int ok = ds4_oriented_rgb(out, decoded->data,
-                                  (uint32_t)decoded->width,
-                                  (uint32_t)decoded->height,
-                                  (uint32_t)decoded->channels, 1);
-        png_free(decoded);
-        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded PNG pixels");
-        return ok;
+    const ds4_image_format fmt = ds4_image_sniff(encoded, encoded_len);
+    if (fmt == DS4_IMAGE_FMT_UNKNOWN) {
+        ds4_image_error(error, error_cap,
+                        "image must be PNG, JPEG, WebP, GIF, TIFF or BMP");
+        return 0;
     }
-    if (encoded_len >= 2 && encoded[0] == 0xff && encoded[1] == 0xd8) {
-        jpeg_image *decoded = jpeg_load_mem(encoded, encoded_len);
-        if (!decoded) {
-            ds4_image_error(error, error_cap, "invalid or unsupported JPEG image");
-            return 0;
+    if (fmt == DS4_IMAGE_FMT_PNG) {
+        png_image *decoded = png_load_mem(encoded, encoded_len);
+        if (decoded) {
+            int ok = ds4_oriented_rgb(out, decoded->data,
+                                      (uint32_t)decoded->width,
+                                      (uint32_t)decoded->height,
+                                      (uint32_t)decoded->channels, 1);
+            png_free(decoded);
+            if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded PNG pixels");
+            return ok;
         }
-        int orientation = ds4_jpeg_orientation(encoded, encoded_len);
-        int ok = ds4_oriented_rgb(out, decoded->data,
-                                  (uint32_t)decoded->width,
-                                  (uint32_t)decoded->height,
-                                  (uint32_t)decoded->channels, orientation);
-        jpeg_free(decoded);
-        if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded JPEG pixels");
-        return ok;
+    } else if (fmt == DS4_IMAGE_FMT_JPEG) {
+        jpeg_image *decoded = jpeg_load_mem(encoded, encoded_len);
+        if (decoded) {
+            int orientation = ds4_jpeg_orientation(encoded, encoded_len);
+            int ok = ds4_oriented_rgb(out, decoded->data,
+                                      (uint32_t)decoded->width,
+                                      (uint32_t)decoded->height,
+                                      (uint32_t)decoded->channels, orientation);
+            jpeg_free(decoded);
+            if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded JPEG pixels");
+            return ok;
+        }
     }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+    /* The embedded decoder could not take it: try ImageMagick. */
+    char reason[128];
+    ds4_image_embedded_reason(fmt, encoded, encoded_len, reason, sizeof(reason));
+    char program_buf[4096];
+    const char *program = ds4_image_external_program(program_buf, sizeof(program_buf));
+    if (!program) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "%s; " DS4_IMAGE_EXTERNAL_HINT, reason);
+        return 0;
+    }
+    char why[256];
+    if (ds4_image_decode_external(out, fmt, program, encoded, encoded_len,
+                                  why, sizeof(why)))
+        return 1;
+    if (error && error_cap) snprintf(error, error_cap, "%s; ImageMagick fallback failed: %s",
+                                     reason, why);
     return 0;
 }
 
