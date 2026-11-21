@@ -112,3 +112,32 @@ keep the integer kernels.
   172 ms layer.
 - A step ends with the worker finishing the last chunk alone, one chunk in
   eight at this step size.  Longer prefills amortize it.
+
+## Long contexts: the F16 weight cache
+
+Two slots (`ds4-server --batched-session 2`, 2048-token slices) growing to
+160K tokens each on the coordinator, with `--simulate-used-memory 27GB`
+standing in for the memory a longer context would take.  At about 120K tokens
+per slot the contexts start taking the Q8->F16 weight cache (5.1 GiB for
+layers `0:20`).
+
+An evicted weight used to send its projection to the Q8 kernels, which are
+built for decode.  Now the cache keeps 512 MiB, and a batch of 128 tokens or
+more expands a missing weight over the least recently used entry of the same
+size.  Per 2048-token slice on the coordinator, all 21 layers:
+
+| Stage | Cache intact | Evicting, before | Evicting, after |
+|---|---:|---:|---:|
+| Attention output projection | 0.24 s | 5.65 s | 0.28 s |
+| Q path | 0.17 s | 0.54 s | 0.19 s |
+| Routed experts | 0.83 s | 1.46 s | 0.85 s |
+| Whole slice at 140K tokens | 2.7 s | 9.7 s | 2.7 s |
+
+The whole prefill of 2 x 160K tokens: 427 tok/s before, 761 after.
+
+With the cache held at 512 MiB on both nodes from the start
+(`DS4_ROCM_Q8_F16_CACHE_MB=512`, a diagnostic), the benchmark at the top
+gives 841, 838 and 786 tok/s against 857, 853 and 797, and frontier logits at
+4096, 8192 and 12288 tokens identical to the full cache.
+`make test-rocm-q8-f16-reuse` cycles seven weights through a four-entry cache
+and checks every product against a host evaluation.
