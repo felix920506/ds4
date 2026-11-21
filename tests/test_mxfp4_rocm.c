@@ -6,6 +6,10 @@
  * patterns keep the 512-token reference inexpensive while still exercising
  * token indexing, expert bucketing, rectangular expert matrices, multiple
  * Q8_K chunks per row, and expert IDs at both ends of a 256-expert table.
+ *
+ * Prefill batches of 128 tokens and more run the tiled F16 kernels on gfx1151
+ * by default; tests/test_rocm_moe_mxfp4.cu checks those.  This test holds the
+ * Q8_K kernels to their oracle at every batch size, so it turns the tiles off.
  */
 
 #include "ds4_gpu.h"
@@ -573,6 +577,7 @@ int main(void) {
     }
     ds4_gpu_set_quality(false);
     ds4_gpu_set_ssd_streaming(false);
+    setenv("DS4_ROCM_MXFP4_TILES", "0", 1);
     const uint64_t model_offsets[] = {
         gate_offset, up_offset, down_offset,
     };

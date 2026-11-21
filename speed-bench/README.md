@@ -164,6 +164,13 @@ To compare the smaller Q2_K routed-down blocks, use
 same command. `make test-rocm-moe-down` covers the production routing path.
 See [routed-down measurements](gfx1151-moe-down/README.md).
 
+### Pipeline prefill on Strix Halo
+
+[gfx1151-pipeline-prefill.md](gfx1151-pipeline-prefill.md) has two-node
+prefill numbers for the MXFP4 checkpoint and the routed-expert kernels behind
+them. `make test-rocm-moe-mxfp4` checks those kernels against a host
+evaluation.
+
 ### Pipeline decode on Strix Halo
 
 [gfx1151-pipeline-decode.md](gfx1151-pipeline-decode.md) has two-node decode
