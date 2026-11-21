@@ -141,5 +141,6 @@ __pycache__/
 /speed-bench/rocm_prefill_variant_bench
 
 /tests/test_rocm_moe_down
+/tests/test_rocm_moe_mxfp4
 /tests/test_rocm_indexer
 /tests/test_rocm_visual_attention

@@ -212,6 +212,10 @@ generation stream cannot use that overlap: each token must finish the route
 before the next one is sampled. Use pipeline mode primarily for capacity and
 long-prefill throughput, not as a guaranteed decode speedup.
 
+On two Strix Halo machines over 2.5 GbE, Flash MXFP4 prefills at about
+800 tok/s with one worker; see the
+[pipeline prefill notes](../speed-bench/gfx1151-pipeline-prefill.md).
+
 On Strix Halo a stage decodes in bursts, idle while the other stages hold the
 token, and right after a long prefill the hot SoC runs those bursts at less
 than half speed until it has cooled. Measurements are in the

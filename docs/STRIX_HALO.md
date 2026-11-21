@@ -166,5 +166,6 @@ ROCm. Add the matching encoder with `--vision FILE`, as described in
 0.28 s per image on this machine; see the
 [encoder notes](../speed-bench/gfx1151-vision-encoder.md).
 
-For a model-free routed-kernel check, use `make test-mxfp4-rocm`.
+For a model-free routed-kernel check, use `make test-mxfp4-rocm` and, for the
+tiled MXFP4 prefill kernels, `make test-rocm-moe-mxfp4`.
 Full-model validation is described in [testing](TESTING.md).
