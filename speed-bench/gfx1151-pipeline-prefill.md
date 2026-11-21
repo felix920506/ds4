@@ -141,3 +141,59 @@ gives 841, 838 and 786 tok/s against 857, 853 and 797, and frontier logits at
 4096, 8192 and 12288 tokens identical to the full cache.
 `make test-rocm-q8-f16-reuse` cycles seven weights through a four-entry cache
 and checks every product against a host evaluation.
+
+## Chunk size
+
+`--prefill-chunk N` on both nodes, everything else as at the top, at fe1d24c.
+The best size depends on what is prefilled, so there are three workloads:
+
+- Addition: `ds4-bench` steps of 8192 tokens on top of a context that is
+  already there (`--ctx-start 49152 --ctx-max 262144 --step-incr 8192`), a
+  conversation that grows.  The first step of that run is the cold 49K
+  prefill.
+- Cold: steps of 32768 tokens (`--ctx-start 32768 --ctx-max 262144
+  --step-incr 32768`), a long prompt without a KV cache.
+- Server: `ds4-server --batched-session 2` on the coordinator, one request
+  of 50K tokens with the other slot idle, then two requests of 200K tokens
+  together.
+
+| Workload | Context after | 4096 (default) | 2048 | 1024 |
+|---|---:|---:|---:|---:|
+| Cold 49K | 49K | 871 tok/s | 869 tok/s | 776 tok/s |
+| 8K addition | 57K | 633 tok/s | 705 tok/s | 679 tok/s |
+| 8K addition | 131K | 535 tok/s | 602 tok/s | 581 tok/s |
+| 8K addition | 197K | 469 tok/s | 535 tok/s | 521 tok/s |
+| 8K addition | 262K | 416 tok/s | 471 tok/s | 461 tok/s |
+| Cold 32K step | 66K | 851 tok/s | 839 tok/s | 746 tok/s |
+| Cold 32K step | 131K | 748 tok/s | 714 tok/s | 631 tok/s |
+| Cold 32K step | 197K | 652 tok/s | 582 tok/s | 548 tok/s |
+| Cold 32K step | 262K | 555 tok/s | 480 tok/s | 486 tok/s |
+| Server, one 50K | 50K | 430, 427 tok/s | 434, 429 tok/s | 516 tok/s |
+| Server, 2 x 200K | 2 x 200K | 612, 745 tok/s | 657, 712 tok/s | 455 tok/s |
+
+One run each, two where two numbers are given.  The two-slot server run
+moved by 20% between its two runs, more than the sizes differ.  Free memory
+on the worker after the cold run: 31.0, 33.2 and 34.4 GiB; the coordinator
+moves by the same amounts.
+
+Every size slows down as the context grows, an 8K addition by a third
+between 57K and 262K tokens.
+
+Use 2048 on both nodes for conversations: after the first prompt they are
+additions, and those are 11 to 13% faster than at 4096 at every depth
+measured.  The first prompt and two busy server slots are no slower, and
+each node keeps 2.2 GiB more for context.  A server slot prefills 2048
+tokens at a time while nothing decodes, so it never fills a 4096 chunk.
+
+Keep 4096 when the load is mostly long prompts without a KV cache.  Beyond
+100K tokens of context it is ahead there, 5% at 131K and 16% at 262K.
+
+1024 loses on everything except a lone request in a two-slot server (20%
+faster), and it costs a third of the throughput when both slots are busy.
+
+Shorter contexts, measured earlier with steps ending at 8K to 98K tokens,
+gave the same order.  512 was slower than 1024 throughout (584 tok/s on
+32K steps to 98K).  8192 was slower than 4096 (744 tok/s on the same steps,
+443 on 8K additions) and took 4.8 GiB more; with `--ctx 1000000` the worker
+then refused the session of a second coordinator run after the first had
+disconnected (`not enough memory for a 1000000 token context`).

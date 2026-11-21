@@ -62,6 +62,10 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+For a two-machine pipeline, start both stages with `--prefill-chunk 2048`;
+see [distributed inference](DISTRIBUTED.md) and the
+[chunk size measurements](../speed-bench/gfx1151-pipeline-prefill.md#chunk-size).
+
 ### Context memory on demand
 
 Resident Flash on ROCm commits a session's context memory as the context

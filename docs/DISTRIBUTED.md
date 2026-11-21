@@ -213,8 +213,13 @@ before the next one is sampled. Use pipeline mode primarily for capacity and
 long-prefill throughput, not as a guaranteed decode speedup.
 
 On two Strix Halo machines over 2.5 GbE, Flash MXFP4 prefills at about
-800 tok/s with one worker; see the
-[pipeline prefill notes](../speed-bench/gfx1151-pipeline-prefill.md).
+800 tok/s with one worker. Start both stages with `--prefill-chunk 2048`
+there for conversations: additions to an existing context are 11 to 13%
+faster than at the default 4096, out to 262K tokens, and each node keeps
+2 GiB more for context. Keep 4096 if the load is mostly long prompts without
+a KV cache, where it is up to 16% faster beyond 100K tokens. Smaller chunks
+are slower.
+See the [pipeline prefill notes](../speed-bench/gfx1151-pipeline-prefill.md).
 
 On Strix Halo a stage decodes in bursts, idle while the other stages hold the
 token, and right after a long prefill the hot SoC runs those bursts at less
