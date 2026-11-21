@@ -683,7 +683,7 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34u)) return 0;
     const uint64_t weight_bytes = out_dim * blocks * 34u;
     if (weight_bytes > model_size - weight_offset) return 0;
-    const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, "attn_q_b");
+    const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, n_tok, "attn_q_b");
     if (!w_f16) return 0;
     const uint64_t xh_count = (uint64_t)n_tok * in_dim;
     __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "attn q_b f16 activations");

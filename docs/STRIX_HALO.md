@@ -62,6 +62,10 @@ larger mixed and Q4 models have substantially higher memory requirements.
 Flash's ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
+For a two-machine pipeline, start both stages with `--prefill-chunk 2048`;
+see [distributed inference](DISTRIBUTED.md) and the
+[chunk size measurements](../speed-bench/gfx1151-pipeline-prefill.md#chunk-size).
+
 ### Context memory on demand
 
 Resident Flash on ROCm commits a session's context memory as the context
@@ -81,15 +85,18 @@ When an allocation does not fit, memory is taken back in this order:
 
 1. Idle server slots: saved to the disk KV cache and freed (see
    [Serving](SERVER.md)).
-2. The Q8->F16 weight cache: later prefill runs the Q8 kernels.
+2. The Q8->F16 weight cache, down to 512 MiB. A prefill batch of 128 tokens
+   or more that finds its weights gone expands them again over the least
+   recently used of what is left, which costs about 2% of prefill speed;
+   smaller batches run the Q8 kernels.
 3. Routed experts: read back from the GGUF on demand (next section). This is
    the last resort; it costs real speed.
 
 Free memory goes back the other way: experts first, then the F16 cache. A
 session is refused at creation only if its full reservation could not be
 committed with all three given up. Output does not depend on the first and
-third step. The second changes which kernels prefill runs, as a small or large
-`--ctx` already did.
+third step. The second changes which kernels small batches run, as a small or
+large `--ctx` already did.
 
 ### Elastic expert weights
 

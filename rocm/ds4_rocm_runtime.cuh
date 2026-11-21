@@ -277,6 +277,7 @@ static int g_q8_f16_disabled_for_multi_model;
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_q8_f16_clock;
 static int g_q8_f16_evicted; /* the context pushed entries out; refill with hysteresis */
+static uint64_t g_q8_f16_reuses; /* expansions over another entry, see cuda_q8_f16_reuse */
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -4758,12 +4759,30 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_evicted = 0;
 }
 
+/* What a growing context leaves of the cache: about two layers of expanded
+ * weights.  A prefill batch that finds its weights gone expands them again
+ * over the least recently used of these (cuda_q8_f16_reuse), which costs a
+ * few milliseconds a matrix.  The Q8 kernels it would otherwise fall back to
+ * are built for decode and take twenty times as long on the attention output
+ * projection of a 2048-token batch. */
+static const uint64_t DS4_ROCM_Q8_F16_KEEP_BYTES = 512ull << 20;
+
+static uint64_t cuda_q8_f16_range_bytes(const cuda_q8_f16_range &r) {
+    return r.in_dim * r.out_dim * sizeof(__half);
+}
+
+static uint64_t cuda_q8_f16_evictable_bytes(void) {
+    return g_q8_f16_bytes > DS4_ROCM_Q8_F16_KEEP_BYTES
+        ? g_q8_f16_bytes - DS4_ROCM_Q8_F16_KEEP_BYTES : 0;
+}
+
 /* Reclaim step: give expanded weights back to a growing context.  They are
- * rebuilt from the resident Q8 weights, so losing one only sends its matmuls
- * back to the Q8 kernels.  Least recently used go first: a long decode keeps
- * the entries it reads and drops the ones only prefill wanted. */
+ * rebuilt from the resident Q8 weights, so losing one costs its next batch an
+ * expansion and sends smaller calls back to the Q8 kernels.  Least recently
+ * used go first: a long decode keeps the entries it reads and drops the ones
+ * only prefill wanted. */
 static uint64_t cuda_q8_f16_cache_evict(uint64_t need_bytes) {
-    if (need_bytes == 0 || g_q8_f16_ranges.empty()) return 0;
+    if (need_bytes == 0 || cuda_q8_f16_evictable_bytes() == 0) return 0;
     /* Kernels already launched may still read the expanded weights. */
     if (!cuda_ok(cudaDeviceSynchronize(), "q8 fp16 cache eviction sync")) return 0;
     std::sort(g_q8_f16_ranges.begin(), g_q8_f16_ranges.end(),
@@ -4773,7 +4792,9 @@ static uint64_t cuda_q8_f16_cache_evict(uint64_t need_bytes) {
     uint64_t freed = 0;
     while (freed < need_bytes && !g_q8_f16_ranges.empty()) {
         const cuda_q8_f16_range &r = g_q8_f16_ranges.back();
-        freed += r.in_dim * r.out_dim * sizeof(__half);
+        const uint64_t bytes = cuda_q8_f16_range_bytes(r);
+        if (g_q8_f16_bytes - freed < DS4_ROCM_Q8_F16_KEEP_BYTES + bytes) break;
+        freed += bytes;
         (void)cudaFree(r.device_ptr);
         g_q8_f16_ranges.pop_back();
     }
@@ -4785,7 +4806,7 @@ static uint64_t cuda_q8_f16_cache_evict(uint64_t need_bytes) {
     g_q8_f16_bytes -= freed;
     g_q8_f16_evicted = 1;
     /* Growth evicts a little at every step; report each GiB given back. */
-    if ((before >> 30) != (g_q8_f16_bytes >> 30) || g_q8_f16_bytes == 0) {
+    if ((before >> 30) != (g_q8_f16_bytes >> 30)) {
         fprintf(stderr,
                 DS4_GPU_LOG_PREFIX "q8 fp16 cache shrinking for the growing context "
                 "(%.2f GiB left)\n",
@@ -4916,6 +4937,14 @@ static bool cuda_q8_prequant_decode_enabled(void) {
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
+    /* Diagnostic: a small cache makes batches reuse its entries on a machine
+     * with free memory. */
+    static int64_t diag_mb = -1;
+    if (diag_mb < 0) {
+        const char *mb = getenv("DS4_ROCM_Q8_F16_CACHE_MB");
+        diag_mb = mb && mb[0] ? (int64_t)strtoull(mb, NULL, 10) : 0;
+    }
+    if (diag_mb > 0) return (uint64_t)diag_mb << 20;
     if (!g_ssd_streaming_mode) return UINT64_MAX;
     const char *env = getenv("DS4_ROCM_STREAM_Q8_F16_CACHE_GB");
     if (env && env[0]) {
@@ -4974,7 +5003,7 @@ static void cuda_q8_f16_cache_budget_notice(
     g_q8_f16_budget_notice_printed = 1;
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "q8 fp16 cache %s; using q8 kernels "
+                DS4_GPU_LOG_PREFIX "q8 fp16 cache %s; batches expand over cached entries, other calls use q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
@@ -4982,7 +5011,7 @@ static void cuda_q8_f16_cache_budget_notice(
                 (double)limit_bytes / 1073741824.0);
     } else if (limit_bytes == UINT64_MAX) {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "q8 fp16 cache %s; using q8 kernels "
+                DS4_GPU_LOG_PREFIX "q8 fp16 cache %s; batches expand over cached entries, other calls use q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
@@ -4992,7 +5021,7 @@ static void cuda_q8_f16_cache_budget_notice(
                 (double)total_bytes / 1073741824.0);
     } else {
         fprintf(stderr,
-                DS4_GPU_LOG_PREFIX "q8 fp16 cache %s; using q8 kernels "
+                DS4_GPU_LOG_PREFIX "q8 fp16 cache %s; batches expand over cached entries, other calls use q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
                 (double)request_bytes / 1048576.0,
@@ -5005,6 +5034,7 @@ static void cuda_q8_f16_cache_budget_notice(
 }
 
 static int cuda_elastic_weights_evicted(void); /* ds4_rocm_elastic.cuh */
+static uint64_t cuda_memory_os_reserve_bytes(void);
 
 static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
     (void)label;
@@ -5031,8 +5061,13 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
 
     const uint64_t free_bytes = (uint64_t)free_b;
     const uint64_t total_bytes = (uint64_t)total_b;
-    const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes) +
-        (g_q8_f16_evicted ? DS4_ROCM_Q8_F16_REFILL_HYSTERESIS_BYTES : 0);
+    /* Up to the part no context takes, the cache only leaves the OS reserve:
+     * a process that starts short of memory still gets entries to reuse. */
+    const uint64_t reserve_bytes =
+        g_q8_f16_bytes + request_bytes <= DS4_ROCM_Q8_F16_KEEP_BYTES && !g_ssd_streaming_mode
+        ? cuda_memory_os_reserve_bytes()
+        : cuda_q8_f16_cache_reserve_bytes(total_bytes) +
+          (g_q8_f16_evicted ? DS4_ROCM_Q8_F16_REFILL_HYSTERESIS_BYTES : 0);
     if (request_bytes > free_bytes ||
         free_bytes - request_bytes < reserve_bytes) {
         cuda_q8_f16_cache_budget_notice("budget exhausted", request_bytes,
@@ -5107,12 +5142,70 @@ static int cuda_q8_f16_preload_allowed(const char *label, uint64_t in_dim, uint6
     return cuda_q8_f16_cache_allowed(label, in_dim, out_dim);
 }
 
+/* Batches from this size on expand a missing weight again rather than run the
+ * Q8 kernels.  On gfx1151 an expansion costs about a millisecond for a
+ * 64 MiB matrix, which the F16 GEMM wins back within some tens of tokens;
+ * below that are decode and verify batches, which come too often for it. */
+#define DS4_ROCM_Q8_F16_REUSE_MIN_TOKENS 128u
+/* A launch holds at most two cached pointers until its kernels are queued, so
+ * the entries of the last two lookups are not reused. */
+#define DS4_ROCM_Q8_F16_REUSE_GUARD 2u
+
+/* No room for one more expansion: expand over the least recently used entry
+ * of the same size.  Every reader of a cached weight is queued on the default
+ * stream, as is this kernel, so the entry's earlier readers finish first. */
+static const __half *cuda_q8_f16_reuse(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    size_t victim = g_q8_f16_ranges.size();
+    for (size_t i = 0; i < g_q8_f16_ranges.size(); i++) {
+        const cuda_q8_f16_range &r = g_q8_f16_ranges[i];
+        if (r.in_dim * r.out_dim != in_dim * out_dim) continue;
+        if (victim == g_q8_f16_ranges.size() ||
+            r.last_use < g_q8_f16_ranges[victim].last_use) victim = i;
+    }
+    if (victim == g_q8_f16_ranges.size() ||
+        g_q8_f16_clock - g_q8_f16_ranges[victim].last_use < DS4_ROCM_Q8_F16_REUSE_GUARD) {
+        return NULL;
+    }
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
+    if (!q8) return NULL;
+    cuda_q8_f16_range &r = g_q8_f16_ranges[victim];
+    const uint64_t n = in_dim * out_dim;
+    dequant_q8_0_to_f16_kernel<<<(n + 255) / 256, 256>>>(r.device_ptr,
+                                                          (const unsigned char *)q8,
+                                                          in_dim,
+                                                          out_dim,
+                                                          (in_dim + 31) / 32);
+    /* The entry holds neither weight if this failed. */
+    const int launched = cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch");
+    auto old = g_q8_f16_by_offset.find(r.offset);
+    if (old != g_q8_f16_by_offset.end() && old->second == victim) g_q8_f16_by_offset.erase(old);
+    r.host_base = launched ? model_map : NULL;
+    r.offset = offset;
+    r.weight_bytes = weight_bytes;
+    r.in_dim = in_dim;
+    r.out_dim = out_dim;
+    if (!launched) {
+        r.last_use = 0;
+        return NULL;
+    }
+    r.last_use = ++g_q8_f16_clock;
+    g_q8_f16_by_offset[offset] = victim;
+    g_q8_f16_reuses++;
+    return r.device_ptr;
+}
+
 static const __half *cuda_q8_f16_ptr(
         const void *model_map,
         uint64_t offset,
         uint64_t weight_bytes,
         uint64_t in_dim,
         uint64_t out_dim,
+        uint64_t n_tok,
         const char *label) {
     auto exact = g_q8_f16_by_offset.find(offset);
     if (exact != g_q8_f16_by_offset.end()) {
@@ -5136,7 +5229,10 @@ static const __half *cuda_q8_f16_ptr(
     uint64_t out_bytes = 0;
     if (in_dim == 0u || out_dim == 0u ||
         !cuda_u64_mul3_checked(in_dim, out_dim, sizeof(__half), &out_bytes)) return NULL;
-    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) return NULL;
+    if (!cuda_q8_f16_cache_has_budget(out_bytes, label)) {
+        return n_tok >= DS4_ROCM_Q8_F16_REUSE_MIN_TOKENS
+            ? cuda_q8_f16_reuse(model_map, offset, weight_bytes, in_dim, out_dim) : NULL;
+    }
 
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
@@ -6038,9 +6134,10 @@ extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_head
     /* With the F16 cache gone nothing else keeps room for the temporaries of
      * a kernel launch, which cannot reclaim (their caller holds weight
      * pointers) and fail the request instead. */
-    const uint64_t transient = g_q8_f16_bytes == 0 && ds4_rocm_uses_host_ram()
+    const uint64_t evictable = cuda_q8_f16_evictable_bytes();
+    const uint64_t transient = evictable == 0 && ds4_rocm_uses_host_ram()
         ? 1ull << 30 : 0;
-    const uint64_t need = bytes + (keep_cache_headroom && g_q8_f16_bytes != 0
+    const uint64_t need = bytes + (keep_cache_headroom && evictable != 0
         ? cuda_q8_f16_cache_reserve_bytes(total_b)
         : cuda_memory_os_reserve_bytes() + transient);
     return need > free_b ? need - free_b : 0;
@@ -6055,7 +6152,7 @@ extern "C" uint64_t ds4_gpu_memory_ceiling(int movable) {
     }
     const uint64_t reserve = cuda_memory_os_reserve_bytes();
     /* Evictable routed experts are pinned device memory like the F16 cache. */
-    return (free_b > reserve ? (uint64_t)free_b - reserve : 0) + g_q8_f16_bytes +
+    return (free_b > reserve ? (uint64_t)free_b - reserve : 0) + cuda_q8_f16_evictable_bytes() +
            ds4_gpu_reclaimable_weight_bytes() +
            (movable && ds4_rocm_uses_host_ram() ? ds4_linux_cma_free_memory() : 0);
 }
@@ -6417,7 +6514,7 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     if (optional_q8_preload_disabled) return 1;
     const char *cache_label = label ? label : "q8_0";
     if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
-    const __half *f16 = cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label);
+    const __half *f16 = cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, 0, cache_label);
     if (f16) {
         if (strstr(cache_label, "attn_output_a") != NULL && in_dim == 4096u && out_dim == 8192u) {
             cuda_q8_f16_warmup_attention_output_a_gemm(f16, in_dim, 1024u, 8u);
@@ -6428,6 +6525,11 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     }
     optional_q8_preload_disabled = 1;
     return 1;
+}
+
+/* For tests: how often a batch expanded a weight over another entry. */
+extern "C" uint64_t ds4_gpu_q8_f16_reuse_count(void) {
+    return g_q8_f16_reuses;
 }
 
 extern "C" void ds4_gpu_release_q8_f16_cache(void) {
@@ -6451,7 +6553,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             DS4_GPU_LOG_PREFIX "memory %s: used=%.2f GiB free=%.2f GiB total=%.2f GiB "
             "placement=%s model_image=%.2f GiB range_cache=%.2f GiB "
             "elastic_experts=%.2f GiB "
-            "q8_f16_cache=%.2f GiB scratch=%.2f GiB",
+            "q8_f16_cache=%.2f GiB (%llu reused) scratch=%.2f GiB",
             label ? label : "",
             (double)used_b / 1073741824.0,
             (double)free_b / 1073741824.0,
@@ -6461,6 +6563,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             (double)g_model_range_bytes / 1073741824.0,
             (double)cuda_elastic_resident_bytes() / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
+            (unsigned long long)g_q8_f16_reuses,
             (double)g_cuda_tmp_bytes / 1073741824.0);
     fprintf(stderr, "\n");
 }
