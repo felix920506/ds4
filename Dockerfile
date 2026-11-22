@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 #
-# ds4 (DwarfStar) engine for DeepSeek V4 Flash, built for Strix Halo (gfx1151).
+# ds4 (DwarfStar) for Strix Halo (gfx1151), published as ghcr.io/felix920506/ds4.
+# Compose files for one and two machines are in docker/; see docs/DOCKER.md.
 #
 # Produces a flat /opt/ds4 layout holding all five binaries, mirroring the
 # /opt/llama layout the llama.cpp images use:
@@ -42,9 +43,8 @@ COPY . /src
 # defaults to gfx1151 in the Makefile; it is passed explicitly so the image can
 # be retargeted with --build-arg without editing the Makefile.
 #
-# STRIXHALO.md documents installing a complete rocWMMA header tree by hand
-# because Ubuntu's librocwmma-dev omits rocwmma/internal/. That workaround is
-# NOT needed here: this ROCm image already ships rocwmma/internal.
+# Some packaged rocWMMA headers omit rocwmma/internal/ (docs/STRIX_HALO.md).
+# This ROCm image ships the complete tree, so no workaround is needed here.
 RUN make strix-halo -j"$(nproc)" ROCM_ARCH=${ROCM_ARCH} NATIVE_CPU_FLAG="${NATIVE_CPU_FLAG}"
 
 RUN mkdir -p /opt/ds4 && \

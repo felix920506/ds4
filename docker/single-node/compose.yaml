@@ -1,0 +1,62 @@
+# DwarfStar on one Strix Halo machine (128 GB, Radeon 8060S / gfx1151).
+#
+# Serves DeepSeek V4 Flash Vision Experimental Q2 (about 81 GiB) fully
+# resident, with its vision encoder, as an OpenAI / Anthropic compatible API
+# on port 8000.  See docs/DOCKER.md.
+#
+#   cd docker/single-node
+#   cp .env.example .env        # then adjust DS4_MODELS if needed
+#   docker compose up -d
+#   docker compose logs -f      # wait for the server to listen
+#
+# Run at most one ds4 process per machine: two model processes on one unified
+# memory node can exhaust memory badly enough to panic the kernel.
+name: ds4
+
+services:
+  ds4-server:
+    image: ${DS4_IMAGE:-ghcr.io/felix920506/ds4:dev-rocm}
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    ports:
+      - "${DS4_BIND:-127.0.0.1}:${DS4_PORT:-8000}:8000"
+    volumes:
+      - ${DS4_MODELS:-../../gguf}:/models:ro
+      - ds4-kv:/kv
+      # Shared by every ds4 container on this host, so ds4's instance lock
+      # also refuses a second container (e.g. a `docker compose run` bench).
+      - /tmp/ds4-lock:/run/ds4-lock
+    environment:
+      DS4_LOCK_FILE: /run/ds4-lock/ds4.lock
+    stop_grace_period: 30s
+    # The image's entrypoint is /opt/ds4/ds4-server.
+    command:
+      - -m
+      - /models/${DS4_MODEL:-DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf}
+      - --vision
+      - /models/${DS4_VISION:-DeepSeek-V4-Flash-Vision-Encoder.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      # A reservation: context memory is committed as the conversation grows.
+      - --ctx
+      - "${DS4_CTX:-1000000}"
+      # Disk KV checkpoints: resumed conversations skip most of the prefill.
+      - --kv-disk-dir
+      - /kv
+      - --kv-disk-space-mb
+      - "${DS4_KV_DISK_MB:-32768}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/v1/models"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10m
+      retries: 3
+
+volumes:
+  ds4-kv:

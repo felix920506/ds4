@@ -1,6 +1,6 @@
 # Models and Vision
 
-[README](../README.md) | [Getting started](../README.md#start-here)
+[README](../README.md) | [Quick start](../README.md#quick-start-with-docker) | [Models on Strix Halo](STRIX_HALO.md)
 
 DwarfStar is not a general GGUF runner. Use the download targets below: other
 GGUFs may have unsupported tensor layouts, metadata, or quantization mixes.

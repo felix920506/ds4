@@ -1,6 +1,11 @@
 # Inference Across Machines
 
-[README](../README.md)
+[README](../README.md) | [Strix Halo](STRIX_HALO.md#two-machines) | [Docker](DOCKER.md#two-machines)
+
+On two Strix Halo machines, use pipeline parallelism: the
+[two-node compose file](DOCKER.md#two-machines) sets it up with the
+recommended model, split and chunk size. Tensor parallelism below is for
+Macs and DGX Sparks.
 
 There are two modes:
 

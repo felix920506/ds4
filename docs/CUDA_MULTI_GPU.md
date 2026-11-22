@@ -1,6 +1,9 @@
 # NVIDIA CUDA GPUs
 
-[README](../README.md) | [Getting started](../README.md#start-here)
+[README](../README.md) | [Upstream](https://github.com/antirez/ds4)
+
+> Inherited from upstream [antirez/ds4](https://github.com/antirez/ds4).
+> This Strix Halo fork does not test this backend.
 
 **Ada Lovelace is supported, including 48 GB L40S cards.** This is an important
 use case: a model whose other inference implementations require newer GPUs

@@ -2,273 +2,247 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
-**DwarfStar** aims to be the best way to run a few excellent large
-language models on consumer hardware (that is, hardware that people
-can actually own). To reach this goal, we are building
-a small native inference engine optimized first for
-**DeepSeek V4 Flash** (including the experimental vision model),
-**DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
-and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
-deliberately narrow, not a general GGUF runner: you need to use the
-GGUF files the project produces, that are part of the project
-itself.
+# DwarfStar for Strix Halo
 
-We test things in integration: model loading, prompt rendering,
-tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
-The repository also includes tools and data for GGUF, imatrix, quality, and speed.
+> **This is a fork.** It is a downstream fork of
+> [antirez/ds4](https://github.com/antirez/ds4) (**DwarfStar**), a small native
+> inference engine for a few large open-weight models. This fork tunes it for
+> **AMD Strix Halo** machines (Ryzen AI Max+ 395, Radeon 8060S `gfx1151`,
+> 128 GB unified memory), such as the Framework Desktop, on one machine or
+> two. For Metal, CUDA and the project as a whole, see upstream.
 
-## Supported hardware
+The fork follows upstream and merges it regularly; its own work is on the
+ROCm backend, memory management on unified memory, pipelines across Strix
+Halo machines, and the HTTP server. Changes that are not Strix Halo specific
+are meant to go upstream.
 
-* **Metal**, the primary target, on Macs with 64 GB (for Qwen Flash next) and 96 GB or more (for DeepSeek and GLM). Smaller machines can use SSD streaming. SSD streaming is also needed in order to run very large models such as full GLM 5.x (not Flash) on 128GB systems.
-* **NVIDIA CUDA**, the DGX Spark is our main gaol. DwarfStar also supports multi-GPU systems that are not supported by other backends, for instance it can run DeepSeek v4 Flash on Ada Lovelace cards.
-* **ROCm** on Strix Halo systems such as the Framework Desktop.
+## What this fork adds
 
-This project would not exist without **llama.cpp and GGML**, make sure to read
-the acknowledgements section, a big thank you to Georgi Gerganov and all the
-other contributors.
+**Speed on `gfx1151`.** Retuned ROCm kernels for DeepSeek V4 Flash prefill
+(WMMA tiles for the IQ2_XXS, Q2_K and MXFP4 routed experts), decode, long
+context attention and the vision encoder.
 
-**Model support is intentionally opportunistic**. The project follows the best open
-weights for useful local machine sizes, especially 128 GB laptops and 256/512 GB
-workstations. A model may be removed when a better replacement arrives.
+**Memory on a 128 GB unified memory box.**
+- Context memory is committed on demand: `--ctx 1000000` costs a short
+  conversation nothing.
+- When memory runs short, idle server sessions go to the disk KV cache first,
+  then the Q8->F16 weight cache shrinks, then cold routed experts are evicted
+  and read back from the GGUF on demand, instead of failing the request.
+- Sessions that take turns on the GPU share one indexer scratch buffer.
 
-# So, what can I do with this software?
+**Two machines as one.** Pipeline parallelism across two Strix Halo boxes
+over ordinary Ethernet, to run the 145 GiB MXFP4 model resident: concurrent
+prefills overlap across the stages, vision and DSpark work in pipeline mode,
+a restarted worker is waited for and replayed into, and disk KV checkpoints
+and live KV rewind work across stages.
 
-* You can run a very capable models in your consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you have not enough RAM, with SSD streaming, you can run it at a decent speed.
-* You can use multiple CUDA cards as a multi-user LLM server. Ada Lovelace, including L40S, is supported: newer models can run here even when their other inference implementations require newer GPUs. Our eight-L40S Flash setup has reached about 126 t/s aggregate generation with 16 sessions.
-* Using two 128 GB Macs connected with RDMA, you can run 4-bit DeepSeek Flash or GLM 5.3 Flash with tensor parallelism. Larger GLM 5.2 quants need larger machines, such as Mac Studios.
-* You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
+**Server.** Disk KV cache for conversations with images, live KV rewind
+instead of prefilling from zero, requests that wait for a busy session
+instead of failing with 503, as many images per request as fit the context,
+Prometheus metrics at `/metrics`, and `--reasoning-effort`.
 
-## Motivations
+**A Docker image** with every binary, built from `main` by CI and published
+as `ghcr.io/felix920506/ds4`, plus ready-to-use compose files.
 
-* Capable open-weight models now fit on high-end personal machines.
-* DeepSeek V4 Flash and PRO, GLM 5.2, tolerate aggressive routed-expert quantization.
-* Compressed KV caches and fast local SSDs make long contexts practical.
-* The idea of an inference system specialized for a few models.
+## Performance
 
-# AI full disclosure
+DeepSeek V4 Flash, text path, measured with `ds4-bench` on 128 GB
+Ryzen AI Max+ 395 machines in the published container:
 
-* This software is developed with **strong assistance from AI coding agents** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
+| Setup | Model | Prefill | Decode |
+| --- | --- | ---: | ---: |
+| One machine | 0731 / Vision Exp Q2 | 617 tok/s at 2K-4K, 553 at 32K | 17.6 tok/s at 2K, 15.9 at 32K |
+| Two machines, 2.5 GbE | Vision Exp MXFP4 | 800-850 tok/s to 98K | 14.6-14.9 tok/s at 2K, 13.2 at 100K, 12.5 at 400K |
 
-## Acknowledgements to llama.cpp and GGML
+Method and details: [single-node decode](speed-bench/gfx1151-decode.md),
+[single-node memory and prefill](docs/STRIX_HALO.md#elastic-expert-weights),
+[pipeline prefill](speed-bench/gfx1151-pipeline-prefill.md) and
+[pipeline decode](speed-bench/gfx1151-pipeline-decode.md). On a pipeline,
+decode right after a long prefill is slower for about a minute while the
+SoC cools.
 
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
-llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
-engineering knowledge developed there**.
-We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
-and its contributors. Their implementation, kernels, tests, and design choices were
-an essential reference while building this DeepSeek V4 specific inference path.
-Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
-reason, and because we are genuinely grateful, we keep the GGML authors copyright
-notice in our `LICENSE` file.
+## Quick start with Docker
 
-## Status
+You need a 128 GB Strix Halo machine running Linux with the `amdgpu` driver
+(`/dev/kfd` and `/dev/dri` present), Docker with Compose, and most of the
+memory made visible to the GPU (see
+[GPU-visible memory](docs/STRIX_HALO.md#gpu-visible-memory)). No ROCm
+installation on the host is needed: it is in the image.
 
-The software is currently very fast changing. Consider it beta quality.
-Before each release, a big QA run is executed, however instabilities
-and regressions are definitely possible.
-
-# How to use this project?
-
-I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
-
-1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
-2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
-
-So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
-
-## Start Here
+Clone the fork, which brings the model downloader and the compose files:
 
 ```sh
-git clone https://github.com/antirez/ds4.git
+git clone https://github.com/felix920506/ds4.git
 cd ds4
 ```
 
-Choose your build. The platform guides cover prerequisites, memory sizing,
-and hardware-specific setups:
+Pick one of the two recommended setups.
 
-| Platform guide | Build |
+### One machine
+
+DeepSeek V4 Flash Vision Experimental Q2 (about 81 GiB) with its vision
+encoder, fully resident:
+
+```sh
+./download_model.sh ds4f-vision-q2     # model and encoder into gguf/
+cd docker/single-node
+cp .env.example .env
+docker compose up -d
+docker compose logs -f                 # loading takes a few minutes
+```
+
+### Two machines
+
+DeepSeek V4 Flash Vision Experimental MXFP4 (about 145 GiB) with its vision
+encoder, split in a pipeline: the coordinator runs layers 0-20 and the API,
+the worker layers 21 to the output. Connect the machines with a direct
+or switched link of 2.5 GbE or faster. On **both** machines:
+
+```sh
+./download_model.sh ds4f-vision-mxfp4
+cd docker/two-node
+cp .env.example .env
+# edit .env: COMPOSE_PROFILES=coordinator on one machine, worker on the other,
+#            COORDINATOR_IP=<coordinator's address on the link> on both
+docker compose up -d
+```
+
+### Talk to it
+
+The API listens on `127.0.0.1:8000` of the machine running the server or
+coordinator (set `DS4_BIND=0.0.0.0` in `.env` to expose it; it has no
+authentication):
+
+```sh
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+It speaks the OpenAI Chat Completions and Responses APIs and the Anthropic
+Messages API. To use it from Pi, OpenCode, Codex CLI or Claude Code, see the
+[client setup guide](docs/CLIENTS.md).
+
+[Docker guide](docs/DOCKER.md): what the compose files set and why, image
+tags, running the CLI, agent and benchmarks in the container, and upgrading.
+
+## Building from source
+
+On the host you need ROCm with HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA and
+hipCUB development files; [the Strix Halo guide](docs/STRIX_HALO.md) lists
+the packages. Then:
+
+```sh
+make strix-halo
+./download_model.sh ds4f-vision-q2
+./ds4 -m gguf/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf \
+  --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+```
+
+To build the image yourself: `docker build -t ds4:rocm-gfx1151 .` from the
+repository root, then set `DS4_IMAGE=ds4:rocm-gfx1151` in `.env`.
+
+## Using DwarfStar
+
+The image and the build ship the same tools:
+
+| Binary | Use |
 | --- | --- |
-| [Metal on Apple Silicon](docs/METAL.md) | `make` |
-| [DGX Spark](docs/DGX_SPARK.md) | `make cuda-spark` |
-| [Strix Halo / Framework Desktop](docs/STRIX_HALO.md) | `make strix-halo` |
-| [One or more CUDA cards, including Ada/L40S](docs/CUDA_MULTI_GPU.md) | `make cuda-generic` |
+| `ds4-server` | OpenAI / Anthropic compatible HTTP server ([serving](docs/SERVER.md)) |
+| `ds4` | Interactive CLI and one-shot prompts (`-p "..."`); also the pipeline worker |
+| `ds4-agent` | Native coding agent that runs the model in-process |
+| `ds4-bench` | Prefill and decode benchmarks ([performance](docs/PERFORMANCE.md)) |
+| `ds4-eval` | Capability regression tests against a real GGUF |
 
-For a first run on a 96 or 128 GB machine, download DeepSeek V4 Flash Q2:
+Run any of them with `--help`. A few things worth knowing:
 
-```sh
-./download_model.sh ds4f-q2
-```
+- Thinking is on by default. `--nothink` / `/nothink` turns it off;
+  `--reasoning-effort max` on the server needs `--ctx` of at least 393216.
+- Images: pass the matching encoder with `--vision FILE`, then use
+  `/read image.png` in the CLI, `view_image` in the agent, or image content in
+  API requests. PNG and JPEG decode in-process; other formats go through
+  ImageMagick, which the image includes.
+- The interactive CLI keeps a multi-turn conversation: `/help`, `/read FILE`,
+  `/ctx N`, `/quit`. Ctrl+C interrupts generation.
+- `ds4-agent` stores sessions in `~/.ds4/kvcache`: `/save`, `/list`,
+  `/switch <sha>`, `/del <sha>`, `/strip <sha>`. Saved sessions and traces
+  may contain private information.
+- Sampling defaults are temperature 1, top-p 1, min-p 0.05; `--temp 0` is
+  greedy.
 
-Downloads go in `gguf/`. Repeat the command to resume an interrupted download.
-Leave memory for the context and runtime buffers as well as the model.
-See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
-on a smaller Mac.
+## Models on Strix Halo
 
-## Everyday Use
+| Download target | Size | Fits | Notes |
+| --- | ---: | --- | --- |
+| `ds4f-vision-q2` | 81 GiB + encoder | One machine | **Recommended**; text and images |
+| `ds4f-q2` | 81 GiB | One machine | Flash 0731, text only |
+| `ds4f-vision-mxfp4` | 145 GiB + encoder | Two machines | **Recommended** for two; DeepSeek's native MXFP4 experts |
+| `ds4f-mxfp4`, `ds4f-q4` | 153-156 GiB | Two machines | Flash 0731, text only |
+| `ds41f-q2` | 341 GiB on disk | One machine, SSD streaming | DeepSeek V4.1 Flash; text only, slow large prefills |
+| `glm53-q2` | 90 GiB | One machine, SSD streaming | GLM 5.3 Flash; images with `glm53-vision` |
 
-Once built and with a model downloaded:
+Run `./download_model.sh --help` for every target. Downloads go to `gguf/`
+(or `DS4_GGUF_DIR`) and resume when repeated. Commands for each model are in
+the [Strix Halo guide](docs/STRIX_HALO.md); all models are described in
+[models and vision](docs/MODELS.md).
 
-```sh
-./ds4
-./ds4 -p "Explain Redis streams in one paragraph."
-./ds4-agent
-./ds4-server --ctx 32768
-```
+## Guides
 
-The default model is `ds4flash.gguf`, a link updated by main-model downloads.
-Pass `-m FILE` to choose explicitly. Commands normally run from the repository
-root; use `--chdir /path/to/ds4` when launching elsewhere.
+- [Strix Halo](docs/STRIX_HALO.md): host setup, GPU-visible memory, memory
+  management, and every model on this hardware.
+- [Docker](docs/DOCKER.md): the image and the compose files.
+- [Inference across machines](docs/DISTRIBUTED.md): pipelines, layer splits,
+  recovery and tuning.
+- [Serving](docs/SERVER.md): APIs, images, multiple sessions, disk KV cache,
+  live KV rewind, and metrics.
+- [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, Claude Code.
+- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark and MTP.
+- [Performance](docs/PERFORMANCE.md) and [speed-bench](speed-bench/README.md):
+  benchmark commands and recorded results.
+- [Testing and development](docs/TESTING.md): regression tests and tools.
 
-The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
-for API access and multiple sessions.
+### Other hardware
 
-The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
-`/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
-Run each binary with `--help` for its full options.
+The Metal (Apple Silicon) and CUDA (DGX Spark, multi-GPU) backends are
+inherited from upstream and still build from this tree, but this fork does
+not test them. Use [upstream](https://github.com/antirez/ds4) for those, or
+read the inherited guides: [Metal](docs/METAL.md), [DGX Spark](docs/DGX_SPARK.md),
+[CUDA multi-GPU](docs/CUDA_MULTI_GPU.md), [SSD streaming](docs/SSD_STREAMING.md),
+[Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md).
 
-### Native coding agent
+## Status and contributing
 
-`ds4-agent` runs inference directly, without a separate HTTP server. It keeps
-the token history and live model state together, shows prefill progress, and
-uses the model's native tool format. DeepSeek and GLM have their own templates.
+Like upstream, this is fast-moving beta software. Report problems seen on
+Strix Halo or with the image and compose files to
+[this fork](https://github.com/felix920506/ds4/issues), and problems on other
+hardware upstream. Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a
+pull request: correctness is checked before speed, and speed changes come with
+measurements.
 
-Use `/hints on` for occasional, brief explanations of the programming choices
-behind the work, and `/hints off` to stop them. Changes take effect at the next
-conversation boundary without rebuilding the cached context. New and resumed
-sessions start with hints off.
+## AI disclosure
 
-Sessions are stored in `~/.ds4/kvcache`:
+DwarfStar, upstream and in this fork, is developed with **strong assistance
+from AI coding agents**, with humans leading the ideas, testing and debugging.
+If you are not happy with AI-developed code, this software is not for you.
 
-| Command | Action |
-| --- | --- |
-| `/save` | Save the current session |
-| `/list` | List saved sessions |
-| `/switch <sha>` | Resume a session |
-| `/del <sha>` | Delete a saved session |
-| `/strip <sha>` | Keep text and title, removing the large KV payload |
+Upstream's suggestion applies here too: if you have a coding agent, use it to
+explore the code and adapt it to your setup. This fork is itself an example of
+that: hardware-specific work on top of a project that is deliberately narrow.
 
-Compatible local KV snapshots avoid rebuilding the prompt. Stripped sessions
-and network TP restores require prefill. Sessions containing images cannot yet
-be saved. Saved conversations and traces may contain private information.
+## Acknowledgements
 
-For Pi, OpenCode, Codex CLI, or Claude Code, use `ds4-server` instead and follow
-the [client setup guide](docs/CLIENTS.md).
+DwarfStar is created and maintained by Salvatore Sanfilippo
+([antirez](https://github.com/antirez)) and its contributors; this fork builds
+on their work.
 
-### Models, images, and speculation
-
-[Models and vision](docs/MODELS.md) lists the supported downloads and memory
-requirements. DeepSeek Vision Experimental uses a different checkpoint from
-Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
-model through a separate encoder.
-
-DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
-Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
-Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac.
-Engram tables remain on disk in every mode, so use a fast
-local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
-and setup.
-
-With the matching encoder passed as `--vision FILE`, use `/read image.png`
-in the CLI or `view_image` in the native agent.
-
-PNG and JPEG decode in-process. 16-bit, 1/2/4-bit grayscale and interlaced
-PNGs, CMYK or 12-bit JPEGs, and WebP, GIF, TIFF and BMP images are passed to
-ImageMagick (`magick`, else `convert`, from `PATH`), which runs as a separate
-process. Set `DS4_IMAGE_DECODER` to the path of another ImageMagick binary,
-or to `off` to use only the built-in decoders. The Docker image includes
-ImageMagick.
-
-Qwen3.8's smaller Q2 release has **41.73 GiB** of main/MTP weights,
-with imatrix IQ2_XXS gate/up experts and padded Q2_K down projections.
-It is the starting option for 64 GB Macs.
-The GGUF also contains 95.37 GiB of original BF16 n-grams, read directly
-from disk rather than loaded into RAM. Keep it on a fast SSD. Start with 8K context:
-
-```sh
-./download_model.sh qwen38-q2
-./ds4 --ctx 8192 --prefill-chunk 1024
-```
-
-The download fetches one 137.10 GiB file and updates `ds4flash.gguf`.
-Add `--mtp` for speculative decoding. The larger
-`qwen38-q4k` target is also available. Download the optional vision encoder
-with `./download_model.sh qwen38-vision` and pass it with `--vision`.
-See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
-
-Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
-support GGUF. It can improve generation, but not every workload benefits.
-Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
-difference between default opportunistic sampling and `--mtp-exact-sampling`.
-
-### Output and power
-
-Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
-answers, and `--think` or `/think` to enable it again.
-For V4.1, `ds4` and `ds4-agent` also accept
-`--think-level 25` or `/think 25`: 1 to 100 sets the reasoning effort, and
-0 disables thinking. `--think` selects 75, `--think-max` selects 100.
-Changing the level in a conversation rebuilds its cached prefix.
-The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
-`--temp 0` selects greedy output.
-
-For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
-The default is 100. V4.1 and GLM currently require `--power 100`.
-
-DeepSeek V4 Flash and GLM 5.3 Flash also support directional steering. Load a
-vector with `--dir-steering-file FILE`; `/steer F` adjusts its scale for
-subsequent tokens in a local CLI or agent session, without rebuilding the
-existing KV cache. See [steering documentation](dir-steering/README.md).
-
-`--prefix-file FILE` preloads complete `USER:` / `ASSISTANT:` pairs before
-the live conversation. A turn marker must start a line, roles must alternate,
-and the last turn must be `ASSISTANT:`.
-
-## Capability Evaluation
-
-`ds4-eval` runs embedded capability regression tests against a real GGUF.
-These are DwarfStar integration checks, not official leaderboard scores.
-
-```sh
-./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
-./ds4-eval -m ds4flash.gguf --suite hard-smoke
-./ds4-eval -m ds4flash.gguf --suite hard --retry-incomplete
-```
-
-The default suite is `core`; `--suite all` runs core and hard cases.
-`--list-cases` lists tests without loading a model. `--plain` selects
-non-interactive output, and `--regrade-trace FILE` scores an existing trace
-without generating again. Sources and licenses are in [EVAL_DATA.md](EVAL_DATA.md).
-For inference correctness and release checks, read [testing](docs/TESTING.md).
-
-## Speed
-
-This recorded DeepSeek V4 Flash Q2 sweep uses an M5 Max with 128 GB RAM,
-2048-token continued-prefill intervals, and 128 greedy generation tokens per
-frontier. It is a baseline, not a fresh benchmark of every commit.
-
-![M5 Max Flash Q2 throughput](speed-bench/m5_max_ts.svg)
-
-See [performance and benchmarking](docs/PERFORMANCE.md) for the full numbers,
-DGX Spark results, comparison conditions, and benchmark commands.
-
-## Detailed Guides
-
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
-- [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
-- [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
-- [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
-- [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
-- [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
-- [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
-- [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
-
-## Logo
+`ds4.c` does not link against GGML, but it **exists thanks to the path opened
+by the llama.cpp project and the kernels, quantization formats, GGUF
+ecosystem, and hard-won engineering knowledge developed there**. We are
+thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
+and its contributors. Some source-level pieces are retained or adapted here
+under the MIT license: GGUF quant layouts and tables, CPU quant/dot logic,
+and certain kernels. For this reason, and out of gratitude, the GGML authors'
+copyright notice is kept in the [`LICENSE`](LICENSE) file.
 
 The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
-graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
-it rock.
+graphical with AI, and manually reworked by Ben Gnomino.
