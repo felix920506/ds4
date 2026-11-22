@@ -1,17 +1,24 @@
 # AMD Strix Halo
 
-[README](../README.md) | [Getting started](../README.md#start-here)
+[README](../README.md) | [Quick start](../README.md#quick-start-with-docker) | [Docker](DOCKER.md)
 
 The reference system is a 128 GB Strix Halo with Radeon 8060S (`gfx1151`),
-such as the Framework Desktop. The ROCm build uses the standard binary names
-and selects the ROCm backend by default.
+such as the Framework Desktop: one machine, or two connected by 2.5 GbE for
+a pipeline. The ROCm build uses the standard binary names and selects the
+ROCm backend by default.
 
 ## Prerequisites
 
-For a container setup, see the maintained
-[ROCm toolbox](https://github.com/kyuz0/strix-halo-ds4-toolbox/blob/main/toolboxes/Dockerfile.rocm-10.0).
-It can also be managed with
-[AI Toolbox Cockpit](https://github.com/kyuz0/ai-toolbox-cockpit).
+Whichever way you run DwarfStar, first make enough memory visible to the
+GPU (next section).
+
+The simplest setup is the published image and the compose files for one or
+two machines: see [Docker](DOCKER.md). The host then needs only the `amdgpu`
+driver and Docker. A community
+[ROCm toolbox](https://github.com/kyuz0/strix-halo-ds4-toolbox/blob/main/toolboxes/Dockerfile.rocm-10.0),
+which can be managed with
+[AI Toolbox Cockpit](https://github.com/kyuz0/ai-toolbox-cockpit), is another
+container option.
 
 For a native Ubuntu build you need HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA,
 and hipCUB development files. The Ubuntu 26.04 setup used these packages:
@@ -53,18 +60,42 @@ configuration; doing so changes device isolation.
 
 ```sh
 make strix-halo
-./download_model.sh ds4f-q2
-./ds4 --rocm
+./download_model.sh ds4f-vision-q2
+./ds4 -m gguf/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf \
+  --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
 ```
 
-`make rocm` is an alias. Use the current 0731 Q2 download for a first run;
-larger mixed and Q4 models have substantially higher memory requirements.
-Flash's ROCm resident and pipeline paths should not be confused with the GLM
+`make rocm` is an alias. On one machine use a Q2 model: Vision Experimental
+(`ds4f-vision-q2`, text and images) or 0731 (`ds4f-q2`, text only), both about
+81 GiB. The Q4 and MXFP4 models (145 to 156 GiB) need two machines. Flash's
+ROCm resident and pipeline paths should not be confused with the GLM
 SSD-streaming path.
 
-For a two-machine pipeline, start both stages with `--prefill-chunk 2048`;
-see [distributed inference](DISTRIBUTED.md) and the
+### Two machines
+
+Split the MXFP4 model between two machines, coordinator on layers `0:20` and
+worker on `21:output`, and start both stages with the same `--ctx` and
+`--prefill-chunk 2048`:
+
+```sh
+./download_model.sh ds4f-vision-mxfp4      # on both machines
+M=gguf/DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf
+V=gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+
+# Machine A, coordinator and HTTP API.
+./ds4-server -m $M --vision $V --role coordinator --layers 0:20 \
+  --listen 192.168.1.10 9911 --ctx 1000000 --prefill-chunk 2048
+
+# Machine B, worker.
+./ds4 -m $M --vision $V --role worker --layers 21:output \
+  --coordinator 192.168.1.10 9911 --ctx 1000000 --prefill-chunk 2048
+```
+
+The [two-node compose file](DOCKER.md#two-machines) runs exactly this. See
+[inference across machines](DISTRIBUTED.md) for recovery and tuning, and the
 [chunk size measurements](../speed-bench/gfx1151-pipeline-prefill.md#chunk-size).
+Never run both stages on one machine: two model processes on one unified
+memory machine can panic the kernel.
 
 ### Context memory on demand
 

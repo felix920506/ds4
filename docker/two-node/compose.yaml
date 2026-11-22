@@ -1,0 +1,103 @@
+# DwarfStar across two Strix Halo machines (128 GB each), pipeline parallel.
+#
+# Serves DeepSeek V4 Flash Vision Experimental MXFP4 (about 145 GiB), with its
+# vision encoder: the coordinator holds layers 0-20 and the HTTP API, the
+# worker layers 21 to the output head.  Both machines need the same GGUF files
+# and the same image tag.  See docs/DOCKER.md.
+#
+# On each machine:
+#   cd docker/two-node
+#   cp .env.example .env        # set COMPOSE_PROFILES and COORDINATOR_IP
+#   docker compose up -d
+#
+# Start order does not matter: the worker retries until the coordinator is up.
+# Both containers use the host network: the stages talk over TCP port 9911
+# and the activations are large.  The link has no authentication or
+# encryption, so keep it on a trusted network.
+#
+# Run at most one ds4 process per machine: two model processes on one unified
+# memory node can exhaust memory badly enough to panic the kernel.
+name: ds4
+
+x-ds4: &ds4
+  image: ${DS4_IMAGE:-ghcr.io/felix920506/ds4:dev-rocm}
+  restart: unless-stopped
+  network_mode: host
+  devices:
+    - /dev/kfd
+    - /dev/dri
+  group_add:
+    - video
+  environment:
+    DS4_LOCK_FILE: /run/ds4-lock/ds4.lock
+  stop_grace_period: 30s
+
+services:
+  coordinator:
+    <<: *ds4
+    profiles: [coordinator]
+    volumes:
+      - ${DS4_MODELS:-../../gguf}:/models:ro
+      - ds4-kv:/kv
+      - /tmp/ds4-lock:/run/ds4-lock
+    # The image's entrypoint is /opt/ds4/ds4-server.
+    command:
+      - -m
+      - /models/${DS4_MODEL:-DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf}
+      - --vision
+      - /models/${DS4_VISION:-DeepSeek-V4-Flash-Vision-Encoder.gguf}
+      - --role
+      - coordinator
+      - --layers
+      - "0:${DS4_SPLIT_LAST_COORDINATOR_LAYER:-20}"
+      - --listen
+      - ${COORDINATOR_IP:?set COORDINATOR_IP in .env}
+      - "${DS4_DIST_PORT:-9911}"
+      - --host
+      - ${DS4_BIND:-127.0.0.1}
+      - --port
+      - "${DS4_PORT:-8000}"
+      # --ctx and --prefill-chunk must match on both stages, or disk KV
+      # checkpoints are skipped.  --ctx is a reservation: context memory is
+      # committed as the conversation grows.
+      - --ctx
+      - "${DS4_CTX:-1000000}"
+      - --prefill-chunk
+      - "${DS4_PREFILL_CHUNK:-2048}"
+      - --kv-disk-dir
+      - /kv
+      - --kv-disk-space-mb
+      - "${DS4_KV_DISK_MB:-32768}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${DS4_PORT:-8000}/v1/models"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15m
+      retries: 3
+
+  worker:
+    <<: *ds4
+    profiles: [worker]
+    entrypoint: ["/opt/ds4/ds4"]
+    volumes:
+      - ${DS4_MODELS:-../../gguf}:/models:ro
+      - /tmp/ds4-lock:/run/ds4-lock
+    command:
+      - -m
+      - /models/${DS4_MODEL:-DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf}
+      - --vision
+      - /models/${DS4_VISION:-DeepSeek-V4-Flash-Vision-Encoder.gguf}
+      - --role
+      - worker
+      - --layers
+      - "${DS4_SPLIT_FIRST_WORKER_LAYER:-21}:output"
+      - --coordinator
+      - ${COORDINATOR_IP:?set COORDINATOR_IP in .env}
+      - "${DS4_DIST_PORT:-9911}"
+      - --ctx
+      - "${DS4_CTX:-1000000}"
+      - --prefill-chunk
+      - "${DS4_PREFILL_CHUNK:-2048}"
+
+volumes:
+  ds4-kv:
