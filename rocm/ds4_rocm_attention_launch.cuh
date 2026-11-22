@@ -1099,10 +1099,10 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         return 0;
     }
     const __half *out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes,
-                                              group_dim, low_dim, "attn_output_a");
+                                              group_dim, low_dim, n_tokens, "attn_output_a");
     if (!out_a_f16) return 0;
     const __half *out_b_f16 = cuda_q8_f16_ptr(model_map, out_b_offset, out_b_bytes,
-                                              low_dim, out_dim, "attn_output_b");
+                                              low_dim, out_dim, n_tokens, "attn_output_b");
     if (!out_b_f16) return 0;
 
     const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
@@ -1218,14 +1218,14 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= 2u) {
-        out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
+        out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, n_tokens, "attn_output_a");
     }
     if (out_a_f16) {
         /* Both projections as F16 GEMMs: the eight head groups are one strided
          * batch whose F16 results interleave into low_h[n_tokens][low_dim], so
          * the B projection consumes them without a repack. */
         const __half *out_b_f16 = !g_quality_mode && !cuda_runtime_config()->graph_dump
-            ? cuda_q8_f16_ptr(model_map, out_b_offset, out_b_bytes, low_dim, out_dim, "attn_output_b")
+            ? cuda_q8_f16_ptr(model_map, out_b_offset, out_b_bytes, low_dim, out_dim, n_tokens, "attn_output_b")
             : NULL;
         if (out_b_f16) {
             const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
