@@ -5420,6 +5420,91 @@ cleanup:
  * only ever saw the second.  The abandoned continuation is long enough to
  * overwrite the whole raw ring and to push every compressor through many
  * windows, and the anchor sits inside a window of both compression ratios. */
+typedef struct {
+    bool committed;   /* a non-final prefill chunk has been committed */
+} test_prefill_metrics_cancel;
+
+static void test_prefill_metrics_progress(void *ud, const char *event, int current, int total) {
+    test_prefill_metrics_cancel *c = ud;
+    if (!strcmp(event, "prefill_chunk") && current > 0 && current < total) c->committed = true;
+}
+
+static bool test_prefill_metrics_should_cancel(void *ud) {
+    return ((test_prefill_metrics_cancel *)ud)->committed;
+}
+
+static uint64_t test_metric_delta(const uint64_t *before, ds4_metric m) {
+    uint64_t now[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(now);
+    return now[m] - before[m];
+}
+
+/* Prefill accounting: an interrupted sync counts the chunks it committed, a
+ * marked continuation does not count its live prefix as reused again, and an
+ * ordinary extension does. */
+static void test_prefill_metrics(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    const int chunk = (int)ds4_engine_prefill_chunk(engine);
+    ds4_session *session = NULL;
+    ds4_tokens prompt = {0}, longer = {0};
+    char err[192] = {0};
+    uint64_t before[DS4_METRIC_COUNT];
+
+    const size_t cap = (size_t)(chunk + 1024) * 16;
+    char *story = malloc(cap);
+    size_t used = 0;
+    for (int i = 0; used + 128 < cap; i++) {
+        used += (size_t)snprintf(story + used, cap - used,
+            "Entry %d: the river station logged %d boats and a tide of %d cm. ",
+            i, 3 * i + 7, 40 + (i * 37) % 300);
+    }
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", story);
+    free(story);
+    TEST_ASSERT(prompt.len > chunk + 256);
+    if (prompt.len <= chunk + 256) goto cleanup;
+    TEST_ASSERT(ds4_session_create(&session, engine, prompt.len + 512) == 0);
+    if (!session) goto cleanup;
+
+    /* 1. Cancelled after the first chunk: its tokens are counted. */
+    test_prefill_metrics_cancel cancel = {0};
+    ds4_metrics_snapshot(before);
+    ds4_session_set_progress(session, test_prefill_metrics_progress, &cancel);
+    ds4_session_set_cancel(session, test_prefill_metrics_should_cancel, &cancel);
+    int rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+    ds4_session_set_progress(session, NULL, NULL);
+    ds4_session_set_cancel(session, NULL, NULL);
+    TEST_ASSERT(rc == DS4_SESSION_SYNC_INTERRUPTED);
+    const int partial = ds4_session_checkpoint_valid(session) ? ds4_session_pos(session) : 0;
+    TEST_ASSERT(partial > 0 && partial < prompt.len);
+    TEST_ASSERT(test_metric_delta(before, DS4_METRIC_PREFILL_TOKENS) == (uint64_t)partial);
+    TEST_ASSERT(test_metric_delta(before, DS4_METRIC_PREFILL_REUSED_TOKENS) == 0);
+    TEST_ASSERT(test_metric_delta(before, DS4_METRIC_PREFILL_NS) > 0);
+
+    /* 2. A marked continuation prefills the rest and reuses nothing. */
+    ds4_metrics_snapshot(before);
+    ds4_session_metrics_continue_prefill(session);
+    TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    TEST_ASSERT(test_metric_delta(before, DS4_METRIC_PREFILL_TOKENS) ==
+                (uint64_t)(prompt.len - partial));
+    TEST_ASSERT(test_metric_delta(before, DS4_METRIC_PREFILL_REUSED_TOKENS) == 0);
+
+    /* 3. An unmarked extension reuses the whole live prefix. */
+    for (int i = 0; i < prompt.len; i++) ds4_tokens_push(&longer, prompt.v[i]);
+    ds4_chat_append_message(engine, &longer, "user", "Which entry logged the most boats?");
+    ds4_metrics_snapshot(before);
+    TEST_ASSERT(ds4_session_sync(session, &longer, err, sizeof(err)) == 0);
+    TEST_ASSERT(test_metric_delta(before, DS4_METRIC_PREFILL_REUSED_TOKENS) == (uint64_t)prompt.len);
+    TEST_ASSERT(test_metric_delta(before, DS4_METRIC_PREFILL_TOKENS) ==
+                (uint64_t)(longer.len - prompt.len));
+
+cleanup:
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&longer);
+}
+
 static void test_session_anchor_rewind(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -7547,6 +7632,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
+    {"--prefill-metrics", "prefill-metrics", "prefill counters for interrupted, continued, and extended syncs", test_prefill_metrics},
     {"--session-anchor-rewind", "session-anchor-rewind", "rewind anchors return a session to an earlier frontier bit for bit", test_session_anchor_rewind},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},

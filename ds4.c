@@ -63780,6 +63780,9 @@ struct ds4_session {
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
+    /* Set by ds4_session_metrics_continue_prefill(); consumed by the next
+     * ds4_session_sync(). */
+    bool metrics_continue_prefill;
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
@@ -79957,6 +79960,16 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
 static int ds4_session_sync_unmetered(ds4_session *s, const ds4_tokens *prompt,
                                       char *err, size_t errlen);
 
+/* Length of the live checkpoint when it is a prefix of `prompt`, else 0. */
+static int session_live_prefix_of(const ds4_session *s, const ds4_tokens *prompt) {
+    return s && prompt && s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
+           ds4_tokens_starts_with(prompt, &s->checkpoint) ? s->checkpoint.len : 0;
+}
+
+void ds4_session_metrics_continue_prefill(ds4_session *s) {
+    if (s) s->metrics_continue_prefill = true;
+}
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
 #if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     rocm_diag_evict_weights(s);
@@ -79967,20 +79980,26 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
     }
+    const bool continues = s && s->metrics_continue_prefill;
+    if (s) s->metrics_continue_prefill = false;
     const uint64_t t0 = metrics_begin();
     /* Every backend reuses the live state only when the prompt extends the
      * checkpoint; any other prompt is evaluated from the first token. */
-    const int reused = t0 && s && prompt && s->checkpoint_valid &&
-                       prompt->len >= s->checkpoint.len &&
-                       ds4_tokens_starts_with(prompt, &s->checkpoint) ? s->checkpoint.len : 0;
+    const int live = t0 ? session_live_prefix_of(s, prompt) : 0;
     const int rc = ds4_session_sync_unmetered(s, prompt, err, errlen);
     metrics_end(t0, DS4_METRIC_PREFILL_NS);
     if (t0) {
         ds4_metric_add(DS4_METRIC_PREFILL_CALLS, 1);
-        if (rc == 0 && prompt) {
-            ds4_metric_add(DS4_METRIC_PREFILL_REUSED_TOKENS, (uint64_t)reused);
-            ds4_metric_add(DS4_METRIC_PREFILL_TOKENS,
-                           prompt->len > reused ? (uint64_t)(prompt->len - reused) : 0);
+        /* An interrupted or failed sync may still have committed whole
+         * chunks; count those, so the time spent on them has its tokens. */
+        const int reached = !prompt ? 0 :
+                            rc == 0 ? prompt->len : session_live_prefix_of(s, prompt);
+        if (reached > live) {
+            if (!continues)
+                ds4_metric_add(DS4_METRIC_PREFILL_REUSED_TOKENS, (uint64_t)live);
+            ds4_metric_add(DS4_METRIC_PREFILL_TOKENS, (uint64_t)(reached - live));
+        } else if (rc == 0 && !continues) {
+            ds4_metric_add(DS4_METRIC_PREFILL_REUSED_TOKENS, (uint64_t)live);
         }
     }
     return rc;
@@ -80081,6 +80100,10 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+    /* Hold the continuation mark across the validation below, so an early
+     * return cannot leave it set for an unrelated later sync. */
+    const bool continues = s && s->metrics_continue_prefill;
+    if (s) s->metrics_continue_prefill = false;
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -80134,6 +80157,7 @@ int ds4_session_sync_multimodal(
     s->graph.prefill_vision_spans = images;
     s->graph.prefill_vision_span_count = image_count;
 #endif
+    s->metrics_continue_prefill = continues;
     const int rc = ds4_session_sync(s, prompt, err, errlen);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
@@ -85479,12 +85503,21 @@ int ds4_sessions_eval_batch_with_prefill(
     const int tokens = prefill_session && prefill_prompt && prefill_session->checkpoint_valid &&
                        prefill_prompt->len > prefill_session->checkpoint.len ?
                        prefill_prompt->len - prefill_session->checkpoint.len : 0;
+    const int start = prefill_session && prefill_prompt && prefill_session->checkpoint_valid ?
+                      prefill_session->checkpoint.len : 0;
     const int rc = ds4_sessions_eval_batch_with_prefill_unmetered(
             items, count, prefill_session, prefill_prompt, err, errlen);
     metrics_end(t0, DS4_METRIC_PREFILL_NS);
     if (t0) {
         ds4_metric_add(DS4_METRIC_PREFILL_CALLS, 1);
-        if (rc == 0) ds4_metric_add(DS4_METRIC_PREFILL_TOKENS, (uint64_t)tokens);
+        if (rc == 0) {
+            ds4_metric_add(DS4_METRIC_PREFILL_TOKENS, (uint64_t)tokens);
+        } else {
+            /* Count chunks a failed pass still committed (see ds4_session_sync). */
+            const int reached = session_live_prefix_of(prefill_session, prefill_prompt);
+            if (reached > start)
+                ds4_metric_add(DS4_METRIC_PREFILL_TOKENS, (uint64_t)(reached - start));
+        }
     }
     return rc;
 }

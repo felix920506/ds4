@@ -7145,6 +7145,7 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
                                                const request *r,
                                                int n_prompt_tokens,
                                                int ctx_size) {
+    metrics_note_http_error();
     buf b = {0};
     char msg[160];
     snprintf(msg, sizeof(msg),
@@ -10225,6 +10226,9 @@ struct server_slot {
     server *srv;
     int id;
     ds4_session *session;
+    /* The next server_session_sync*() continues a prefill this request
+     * already started (metrics only; see ds4_session_metrics_continue_prefill). */
+    bool prefill_continues;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
@@ -10516,6 +10520,11 @@ struct job {
     uint64_t id;      /* Request number for the scheduling trace. */
     double t_arrive;  /* now_sec() when the HTTP request was read. */
     double t_start;   /* now_sec() when a worker picked the job up. */
+    /* Metrics: whether the request's outcome was counted, and its prompt
+     * and cached token counts once known (for outcomes counted late). */
+    bool metrics_done;
+    int metrics_prompt_tokens;
+    int metrics_cached_tokens;
     bool done;
     bool cancelled;
     pthread_mutex_t mu;
@@ -10544,6 +10553,30 @@ static void job_complete(job *j) {
     j->done = true;
     pthread_cond_signal(&j->cv);
     pthread_mutex_unlock(&j->mu);
+}
+
+/* Count a request's outcome exactly once.  ttft is absolute (now_sec()), or
+ * <= 0 when no token was generated.  A job cancelled while still queued has
+ * no t_start; its whole wait counts as queue time. */
+static void job_metrics_done(job *j, const char *finish, int prompt_tokens,
+                             int cached_tokens, int completion_tokens, double t_first) {
+    if (!j || j->metrics_done) return;
+    j->metrics_done = true;
+    const double now = now_sec();
+    const double started = j->t_start > 0.0 ? j->t_start : now;
+    metrics_note_request_done(finish, prompt_tokens, cached_tokens, completion_tokens,
+                              started - j->t_arrive,
+                              t_first > 0.0 ? t_first - j->t_arrive : -1.0,
+                              now - j->t_arrive);
+}
+
+/* Requests that end before generation (cancelled during prefill or in the
+ * queue, prefill failures, no session memory, rejected continuations) return
+ * without reaching the generation epilogue; count them here. */
+static void job_metrics_done_fallback(job *j) {
+    if (!j || j->metrics_done) return;
+    job_metrics_done(j, job_cancelled(j) ? "cancelled" : "error",
+                     j->metrics_prompt_tokens, j->metrics_cached_tokens, 0, -1.0);
 }
 
 static bool slot_job_cancelled(const server_slot *slot) {
@@ -13281,8 +13314,11 @@ static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
                                char *err, size_t errlen) {
     if (!s || !slot || !prompt) return 1;
+    const bool continues = slot->prefill_continues;
+    slot->prefill_continues = false;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (continues) ds4_session_metrics_continue_prefill(slot->session);
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
         server_prefill_leave(s, slot);
         if (rc == 0) server_prefill_finished(slot, prompt->len);
@@ -13303,6 +13339,8 @@ static int server_session_sync(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        /* Later slices extend the slice before; only the first reuses. */
+        if (continues || called) ds4_session_metrics_continue_prefill(slot->session);
         int rc = server_gated_session_sync(s, slot, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
         server_prefill_leave(s, slot);
@@ -13348,8 +13386,11 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
     if (!image_count)
         return server_session_sync(s, slot, prompt, err, errlen);
     if (!s || !slot || !prompt || !images) return 1;
+    const bool continues = slot->prefill_continues;
+    slot->prefill_continues = false;
     if (!s->batched_mode) {
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (continues) ds4_session_metrics_continue_prefill(slot->session);
         int rc = ds4_session_sync_multimodal(slot->session, prompt,
                                              images, image_count,
                                              err, errlen);
@@ -13388,6 +13429,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         ds4_tokens prefix = *prompt;
         prefix.len = target;
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (continues || called) ds4_session_metrics_continue_prefill(slot->session);
         int rc = server_gated_session_sync_multimodal(s, slot, &prefix,
                                                       images, prefix_images,
                                                       err, errlen);
@@ -14527,6 +14569,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
+    j->metrics_prompt_tokens = prompt_tokens;
+    j->metrics_cached_tokens = cached;
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
@@ -14668,6 +14712,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             suppressed_continued_last = -1;
         }
         ds4_tokens_free(&prefix);
+        /* The sync below finishes the prompt the cold prefix started. */
+        slot->prefill_continues = true;
     }
 
     int prompt_sync_rc = multimodal ?
@@ -15181,10 +15227,7 @@ decode_again:
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
-        metrics_note_request_done("cancelled", prompt_tokens, cached, completion,
-                                  j->t_start - j->t_arrive,
-                                  t_first > 0.0 ? t_first - j->t_arrive : -1.0,
-                                  now_sec() - j->t_arrive);
+        job_metrics_done(j, "cancelled", prompt_tokens, cached, completion, t_first);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
@@ -15652,10 +15695,7 @@ decode_again:
                        now_sec() - t0);
         }
     }
-    metrics_note_request_done(final_finish, prompt_tokens, cached, completion,
-                              j->t_start - j->t_arrive,
-                              t_first > 0.0 ? t_first - j->t_arrive : -1.0,
-                              now_sec() - j->t_arrive);
+    job_metrics_done(j, final_finish, prompt_tokens, cached, completion, t_first);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -15939,7 +15979,9 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->prefill_gate_wait = 0.0;
     slot->prefill_compute = 0.0;
     slot->prefill_remote = 0.0;
+    slot->prefill_continues = false;
     j->t_start = now_sec();
+    j->metrics_prompt_tokens = j->req.prompt.len;
     server_log(DS4_LOG_DEFAULT,
                "sched t=%.3f req#%llu slot %d: worker started job "
                "(%.1f ms after arrival)",
@@ -15960,6 +16002,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         generate_job_inner(s, slot, j);
         ds4_session_set_cancel(slot->session, NULL, NULL);
     }
+    job_metrics_done_fallback(j);
     server_log(DS4_LOG_DEFAULT,
                "sched t=%.3f req#%llu slot %d: job finished "
                "(%.1f ms after arrival, prefill chunks=%d compute=%.1f ms "
@@ -16477,14 +16520,14 @@ static void metrics_render_prometheus(server *s, buf *b) {
     }
 
     const server_metrics m = metrics_copy();
-    metrics_prom_header(b, "ds4_server_requests_total", "counter", "Accepted API requests by endpoint.");
+    metrics_prom_header(b, "ds4_server_requests_total", "counter", "API requests accepted into the queue, by endpoint.");
     for (int i = 0; i < METRICS_ENDPOINT_COUNT; i++)
         buf_printf(b, "ds4_server_requests_total{endpoint=\"%s\"} %llu\n",
                    metrics_endpoint_names[i], (unsigned long long)m.requests[i]);
     metrics_prom_u64(b, "ds4_server_http_errors_total", "counter",
                      "Error responses sent, any status.", m.http_errors);
     metrics_prom_header(b, "ds4_server_requests_finished_total", "counter",
-                        "Generations completed by finish reason.");
+                        "Accepted requests by outcome; each is counted once, including those cancelled before generation.");
     for (int i = 0; i < METRICS_FINISH_COUNT; i++)
         buf_printf(b, "ds4_server_requests_finished_total{finish=\"%s\"} %llu\n",
                    metrics_finish_names[i], (unsigned long long)m.finished[i]);
@@ -16817,7 +16860,11 @@ static void server_cancel_job(server *s, job *j) {
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
 
-    if (detached) job_complete(j);
+    if (detached) {
+        /* It never reached a worker. */
+        job_metrics_done(j, "cancelled", j->req.prompt.len, 0, 0, -1.0);
+        job_complete(j);
+    }
 }
 
 static void wait_for_job_or_disconnect(server *s, job *j) {
@@ -16937,7 +16984,6 @@ static void *client_main(void *arg) {
     /* raw_body is only ever written to the --trace log; skip the copy of a
      * possibly multi-GiB body otherwise. */
     if (ok && s->trace) req.raw_body = xstrndup(hr.body, hr.body_len);
-    if (ok) metrics_note_request(req.api, req.kind);
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -16970,6 +17016,9 @@ static void *client_main(void *arg) {
         request_free(&j.req);
         goto done;
     }
+    /* Only queued requests are accepted ones; every one of them is counted
+     * again exactly once in ds4_server_requests_finished_total. */
+    metrics_note_request(j.req.api, j.req.kind);
     wait_for_job_or_disconnect(s, &j);
 
     pthread_cond_destroy(&j.cv);
@@ -26031,9 +26080,80 @@ static void test_metrics_export(void) {
     pthread_mutex_destroy(&s.mu);
 }
 
+/* Every accepted request ends up in exactly one finish bucket, including
+ * the ones that never reach generation. */
+static void test_metrics_job_outcomes(void) {
+    const server_metrics m0 = metrics_copy();
+    job j;
+    memset(&j, 0, sizeof(j));
+    pthread_mutex_init(&j.mu, NULL);
+    j.req.prompt.len = 50;
+    j.t_arrive = now_sec() - 2.0;
+
+    /* Cancelled while queued: no t_start, the whole wait is queue time. */
+    job_metrics_done(&j, "cancelled", j.req.prompt.len, 0, 0, -1.0);
+    job_metrics_done(&j, "stop", 1, 1, 1, -1.0);   /* counted once only */
+    job_metrics_done_fallback(&j);
+    server_metrics m1 = metrics_copy();
+    TEST_ASSERT(m1.finished[METRICS_FINISH_CANCELLED] - m0.finished[METRICS_FINISH_CANCELLED] == 1);
+    TEST_ASSERT(m1.finished[METRICS_FINISH_STOP] == m0.finished[METRICS_FINISH_STOP]);
+    TEST_ASSERT(m1.prompt_tokens - m0.prompt_tokens == 50);
+    TEST_ASSERT(m1.queue_wait.total - m0.queue_wait.total == 1);
+    TEST_ASSERT(m1.queue_wait.sum - m0.queue_wait.sum >= 2.0);
+    TEST_ASSERT(m1.ttft.total == m0.ttft.total);
+    TEST_ASSERT(m1.duration.total - m0.duration.total == 1);
+
+    /* Cancelled during prefill: the fallback uses the known token counts. */
+    memset(&j, 0, sizeof(j));
+    pthread_mutex_init(&j.mu, NULL);
+    j.t_arrive = now_sec() - 1.0;
+    j.t_start = j.t_arrive + 0.25;
+    j.metrics_prompt_tokens = 30;
+    j.metrics_cached_tokens = 10;
+    job_mark_cancelled(&j);
+    job_metrics_done_fallback(&j);
+    server_metrics m2 = metrics_copy();
+    TEST_ASSERT(m2.finished[METRICS_FINISH_CANCELLED] - m1.finished[METRICS_FINISH_CANCELLED] == 1);
+    TEST_ASSERT(m2.cached_prompt_tokens - m1.cached_prompt_tokens == 10);
+    TEST_ASSERT(m2.queue_wait.sum - m1.queue_wait.sum < 0.5);
+
+    /* Ended early without a cancel (prefill failure, no session memory). */
+    memset(&j, 0, sizeof(j));
+    pthread_mutex_init(&j.mu, NULL);
+    j.t_arrive = j.t_start = now_sec();
+    job_metrics_done_fallback(&j);
+    server_metrics m3 = metrics_copy();
+    TEST_ASSERT(m3.finished[METRICS_FINISH_ERROR] - m2.finished[METRICS_FINISH_ERROR] == 1);
+
+    /* A generation that counted itself is left alone by the fallback. */
+    memset(&j, 0, sizeof(j));
+    pthread_mutex_init(&j.mu, NULL);
+    j.t_arrive = j.t_start = now_sec();
+    job_metrics_done(&j, "length", 5, 0, 3, now_sec());
+    job_metrics_done_fallback(&j);
+    server_metrics m4 = metrics_copy();
+    TEST_ASSERT(m4.finished[METRICS_FINISH_LENGTH] - m3.finished[METRICS_FINISH_LENGTH] == 1);
+    TEST_ASSERT(m4.finished[METRICS_FINISH_ERROR] == m3.finished[METRICS_FINISH_ERROR]);
+    TEST_ASSERT(m4.ttft.total - m3.ttft.total == 1);
+    pthread_mutex_destroy(&j.mu);
+
+    /* The context-length rejection is an HTTP error response. */
+    int fds[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    request r;
+    memset(&r, 0, sizeof(r));
+    r.api = API_OPENAI;
+    r.kind = REQ_CHAT;
+    http_error_context_length_exceeded(fds[1], false, &r, 9000, 4096);
+    close(fds[0]);
+    close(fds[1]);
+    TEST_ASSERT(metrics_copy().http_errors - m4.http_errors == 1);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_metrics_histogram();
     test_metrics_export();
+    test_metrics_job_outcomes();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();

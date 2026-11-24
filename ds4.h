@@ -505,6 +505,12 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* Metrics: the next ds4_session_sync() on `s` continues a prefill the caller
+ * split into several calls (to checkpoint a prefix, or to interleave other
+ * sessions).  Its live prefix was prefilled by the earlier calls, so it is not
+ * added to prefill_reused_tokens_total again.  The mark is cleared by that
+ * next sync whatever its outcome. */
+void ds4_session_metrics_continue_prefill(ds4_session *s);
 int ds4_session_sync_multimodal(ds4_session *s,
                                 const ds4_tokens *prompt,
                                 const ds4_vision_span *images,
