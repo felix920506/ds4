@@ -21,8 +21,8 @@
  * _seconds_total by the Prometheus renderer. */
 #define DS4_METRICS(X) \
     X(PREFILL_CALLS, "prefill_calls_total", "Prompt syncs executed.") \
-    X(PREFILL_TOKENS, "prefill_tokens_total", "Prompt tokens evaluated by prefill.") \
-    X(PREFILL_REUSED_TOKENS, "prefill_reused_tokens_total", "Prompt tokens served by the live KV prefix instead of prefill.") \
+    X(PREFILL_TOKENS, "prefill_tokens_total", "Prompt tokens evaluated by prefill, including committed chunks of an interrupted prefill.") \
+    X(PREFILL_REUSED_TOKENS, "prefill_reused_tokens_total", "Prompt tokens served by the live KV prefix instead of prefill, once per prompt.") \
     X(PREFILL_NS, "prefill_ns", "Wall time spent in prefill, including mixed prefill/decode batches.") \
     X(DECODE_PASSES, "decode_passes_total", "Decode forward passes; tokens/passes is the speculative gain.") \
     X(DECODE_ROWS, "decode_rows_total", "Session rows across decode passes; rows/passes is the batch size.") \

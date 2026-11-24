@@ -252,6 +252,16 @@ so a request's cost is split into:
 | `ds4_ssd_read_*` | Routed-expert bytes streamed from disk and seconds |
 | `ds4_server_*` | Requests by endpoint and finish reason, prompt/cached/completion tokens, queue-wait, time-to-first-token and request-duration histograms, disk KV and image cache hits, slot kicks (`ds4_server_slot_kicks_total`, `state="saved"` when nothing was lost and `"dropped"` when the conversation must be prefilled again; `ds4_server_slot_kick_bytes_total`), live gauges including `ds4_server_resident_sessions` |
 
+Every request accepted into the queue is counted once in
+`ds4_server_requests_finished_total`. A request dropped while queued or
+during prefill counts as `cancelled`, and one that ends before generating
+counts as `error`. A request rejected before it is queued (malformed body,
+prompt longer than `--ctx`) counts only in `ds4_server_http_errors_total`.
+An interrupted prefill still counts the chunks it committed in
+`ds4_prefill_tokens_total`. A prompt the server prefills in several calls
+counts its live prefix in `ds4_prefill_reused_tokens_total` only once:
+batched slices, and the cold checkpoint split before a disk save.
+
 On a distributed coordinator the network wait is nested inside prefill and
 decode time; `network_transport_seconds_estimate` in the JSON view subtracts
 the compute the workers reported, leaving transport latency. The JSON
@@ -272,6 +282,11 @@ no separate restore counter.
 deltas: prefill and decode throughput, time shares, network and disk I/O,
 requests completed, and average time to first token and queue wait. The
 interactive `ds4` CLI exposes the same engine accounting with `/stats`.
+
+To keep a history without Prometheus, run
+[metrics-logger](../metrics-logger/README.md). It scrapes `/metrics` on an
+interval into SQLite and is published as the `ds4-metrics-logger` container
+image.
 
 ## Tool history and debugging
 
