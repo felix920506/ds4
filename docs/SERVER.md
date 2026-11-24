@@ -273,6 +273,11 @@ deltas: prefill and decode throughput, time shares, network and disk I/O,
 requests completed, and average time to first token and queue wait. The
 interactive `ds4` CLI exposes the same engine accounting with `/stats`.
 
+To keep a history without Prometheus, run
+[metrics-logger](../metrics-logger/README.md). It scrapes `/metrics` on an
+interval into SQLite and is published as the `ds4-metrics-logger` container
+image.
+
 ## Tool history and debugging
 
 For DeepSeek, the server preserves sampled DSML tool blocks and assigns

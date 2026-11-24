@@ -1,0 +1,105 @@
+# Test the metrics logger (metrics-logger/), then build its image and push it
+# to GitHub Container Registry as ghcr.io/<owner>/ds4-metrics-logger.
+#
+# Tags: `latest` and `sha-<short sha>` for main, `<version>` for v* tags.
+# Pull requests test and build without pushing.
+name: docker-metrics-logger
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'metrics-logger/**'
+      - '.github/workflows/docker-metrics-logger.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'metrics-logger/**'
+      - '.github/workflows/docker-metrics-logger.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-metrics-logger-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ['3.10', '3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Unit tests
+        working-directory: metrics-logger
+        run: python -m unittest -v test_metrics_logger
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/ds4-metrics-logger" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=ref,event=pr,prefix=pr-
+          labels: |
+            org.opencontainers.image.title=ds4-metrics-logger
+            org.opencontainers.image.description=Logs ds4-server /metrics samples to SQLite
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: metrics-logger
+          file: metrics-logger/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=metrics-logger
+          cache-to: type=gha,mode=max,scope=metrics-logger
+          provenance: false
