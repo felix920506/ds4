@@ -6236,10 +6236,10 @@ static int dist_batch_submit_member(
         char *err,
         size_t errlen) {
     ds4_dist_session *d = item->dist;
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
-
     const uint32_t pos0 = (uint32_t)item->checkpoint->len;
     member->pos0 = pos0;
+    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+
     uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
     if (dist_session_prefix_hash(d, item->owner, pos0, &prefix_hash,
                                  err, errlen) != 0) {
