@@ -167,6 +167,24 @@ Diagnostics: `DS4_ROCM_ELASTIC_STATS=1` prints reclaim and hit/miss counters,
 `DS4_ROCM_ELASTIC_NO_GROW=1` stops evicted layers from growing back while
 memory is free, `DS4_ROCM_ELASTIC_TRACE=FILE` records every routed selection.
 
+### Prefill precision and `--quality`
+
+The default `gfx1151` Flash prefill path uses F16 WMMA attention, F16 hipBLASLt
+dense projections (at 32+ tokens), and tiled F16 WMMA routed-MoE kernels (at
+128+ tokens). Its logits are not bit-identical to upstream `antirez/ds4`
+(typically max-abs 0.6 to 3.4, RMSE 0.12 to 0.62; see
+[the prefill notes](../speed-bench/gfx1151-prefill-results.md)), so greedy
+completions can differ where the top-two token margin is thin. Because DeepSeek
+V4 Flash amplifies small rounding differences across E4M3 KV quantization and
+43 layers of top-6/256 MoE routing, the fork and upstream default paths sit at
+a comparable distance from `--quality` (RMSE 0.25 to 0.32 for the fork vs 0.16
+to 0.91 for upstream across 16 to 4096 tokens).
+
+Pass `--quality` to disable the fast F16/WMMA, hipBLASLt, and MMQ kernels and
+run the conservative native path instead. `--quality` matches upstream
+`--quality` (not upstream's default path) and runs substantially slower (~55
+tok/s vs 450 to 590 tok/s at 2K to 4K prefill).
+
 ## DeepSeek V4.1 Flash
 
 Use Q2 with SSD streaming on a 128 GB machine:
