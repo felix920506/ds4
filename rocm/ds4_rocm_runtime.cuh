@@ -6151,10 +6151,13 @@ extern "C" uint64_t ds4_gpu_memory_ceiling(int movable) {
         return 0;
     }
     const uint64_t reserve = cuda_memory_os_reserve_bytes();
+    /* CMA is the rest of the same host budget on unified-memory devices;
+     * reserve once from both ordinary free memory and CMA. */
+    const uint64_t usable = (uint64_t)free_b +
+        (movable && ds4_rocm_uses_host_ram() ? ds4_linux_cma_free_memory() : 0);
     /* Evictable routed experts are pinned device memory like the F16 cache. */
-    return (free_b > reserve ? (uint64_t)free_b - reserve : 0) + cuda_q8_f16_evictable_bytes() +
-           ds4_gpu_reclaimable_weight_bytes() +
-           (movable && ds4_rocm_uses_host_ram() ? ds4_linux_cma_free_memory() : 0);
+    return (usable > reserve ? usable - reserve : 0) + cuda_q8_f16_evictable_bytes() +
+           ds4_gpu_reclaimable_weight_bytes();
 }
 
 extern "C" uint64_t ds4_gpu_reclaim_memory(uint64_t need_bytes) {

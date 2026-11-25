@@ -40,14 +40,22 @@ static inline bool ds4_linux_nonmovable_memory(uint64_t *bytes) {
     return ok;
 }
 
+/* CmaFree is raw free pages, not already included in MemAvailable. */
+static inline bool ds4_linux_cma_free_memory_parse(FILE *fp, uint64_t *bytes) {
+    uint64_t available, cma;
+    if (!ds4_linux_memory_parse(fp, &available, &cma)) return false;
+    *bytes = cma < available ? cma : available;
+    return true;
+}
+
 /* Free memory only movable allocations (managed GPU memory) can take. */
 static inline uint64_t ds4_linux_cma_free_memory(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return 0;
-    uint64_t available, cma;
-    const bool ok = ds4_linux_memory_parse(fp, &available, &cma);
+    uint64_t bytes;
+    const bool ok = ds4_linux_cma_free_memory_parse(fp, &bytes);
     fclose(fp);
-    return ok && cma < available ? cma : 0;
+    return ok ? bytes : 0;
 }
 
 #endif
