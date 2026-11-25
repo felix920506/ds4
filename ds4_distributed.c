@@ -249,6 +249,16 @@ typedef struct {
 
 typedef struct ds4_dist_worker_entry {
     int fd;
+    /* Session releases owed to this worker, as a byte queue rather than a
+     * frame list: a short non-blocking write leaves the rest of a frame
+     * queued, so a retry can never split one frame across two attempts.
+     * Bounded by DS4_DIST_RELEASE_OUT_MAX so a worker that stops reading
+     * cannot grow coordinator memory without limit.  Guarded by state->mu,
+     * which also serializes the control-link writes. */
+    uint8_t *release_out;
+    uint32_t release_out_len;
+    uint32_t release_out_off;
+    uint32_t release_out_dropped;
     char peer_host[NI_MAXHOST];
     char peer_port[NI_MAXSERV];
     char model_name[DS4_DIST_MAX_MODEL_NAME + 1u];
@@ -263,6 +273,12 @@ typedef struct ds4_dist_worker_entry {
     uint32_t listen_port;
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
+
+static void dist_worker_entry_free(ds4_dist_worker_entry *entry) {
+    if (!entry) return;
+    free(entry->release_out);
+    free(entry);
+}
 
 typedef struct {
     ds4_engine *engine;
@@ -280,10 +296,10 @@ typedef struct {
     uint32_t prefill_window;
     uint32_t activation_bits;
     uint64_t generation;
+    /* Also serializes control-link release writes: every queued release is
+     * pushed with state->mu held, so two session frees cannot interleave
+     * bytes on one stream. */
     pthread_mutex_t mu;
-    /* Orders release frames on the workers' control streams; concurrent
-     * session frees could otherwise interleave their bytes. */
-    pthread_mutex_t control_write_mu;
     ds4_dist_worker_entry *workers;
     bool shutting_down;
     /* A worker from an older build refused the anchor flags: no session
@@ -1223,6 +1239,13 @@ static int dist_set_socket_low_latency(int fd) {
 #else
 #define DS4_DIST_SEND_FLAGS 0
 #endif
+/* Best-effort non-blocking send.  Darwin defines MSG_DONTWAIT, but if a
+ * platform does not, the socket's send timeout still bounds the call. */
+#ifdef MSG_DONTWAIT
+#define DS4_DIST_SEND_NONBLOCK (DS4_DIST_SEND_FLAGS | MSG_DONTWAIT)
+#else
+#define DS4_DIST_SEND_NONBLOCK DS4_DIST_SEND_FLAGS
+#endif
 
 static int dist_write_full(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
@@ -1890,13 +1913,17 @@ static void dist_session_release_to_wire(ds4_dist_session_release_fixed *r) {
     r->session_lo = htonl(r->session_lo);
 }
 
-/* One send for header and body, so a session-free cannot leave half a frame
- * on a control stream that another release might write to next. */
-static int dist_write_session_release(
-        int fd,
+#define DS4_DIST_RELEASE_FRAME_BYTES \
+    (sizeof(ds4_dist_frame_header) + sizeof(ds4_dist_session_release_fixed))
+/* At the bound, further releases are dropped for that stage; its slots come
+ * back when it disconnects, which clears everything it holds. */
+#define DS4_DIST_RELEASE_OUT_MAX (4096u * DS4_DIST_RELEASE_FRAME_BYTES)
+
+/* Encode one release as a single header+body frame, so a short write can be
+ * resumed at a byte offset without ever splitting a frame differently. */
+static void dist_encode_session_release(
+        uint8_t frame[DS4_DIST_RELEASE_FRAME_BYTES],
         const ds4_dist_session_release_fixed *wire) {
-    uint8_t frame[sizeof(ds4_dist_frame_header) +
-                  sizeof(ds4_dist_session_release_fixed)];
     ds4_dist_frame_header header = {
         htonl(DS4_DIST_MAGIC),
         htonl(DS4_DIST_MSG_SESSION_RELEASE),
@@ -1904,7 +1931,116 @@ static int dist_write_session_release(
     };
     memcpy(frame, &header, sizeof(header));
     memcpy(frame + sizeof(header), wire, sizeof(*wire));
-    return dist_write_full(fd, frame, sizeof(frame));
+}
+
+/* Non-blocking push from a queued frame.  Returns 1 when the queue is empty,
+ * 0 when the control socket has no room right now (the offset is advanced by
+ * whatever went out, so a later call resumes mid-frame), and -1 when the peer
+ * is gone.  Never blocks: the caller may hold the server's inference lock. */
+static int dist_worker_flush_releases_locked(ds4_dist_worker_entry *entry) {
+    if (!entry || entry->release_out_off >= entry->release_out_len) return 1;
+    if (entry->fd < 0) {
+        /* The descriptor is already gone; the disconnect path clears this
+         * stage's sessions, so queued frames have nothing left to do. */
+        entry->release_out_off = 0;
+        entry->release_out_len = 0;
+        return -1;
+    }
+    while (entry->release_out_off < entry->release_out_len) {
+        const uint32_t remaining = entry->release_out_len - entry->release_out_off;
+        ssize_t n = send(entry->fd, entry->release_out + entry->release_out_off,
+                         remaining, DS4_DIST_SEND_NONBLOCK);
+        if (n > 0) {
+            entry->release_out_off += (uint32_t)n;
+            ds4_metric_add(DS4_METRIC_NET_SEND_BYTES, (uint64_t)n);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+        /* Dead or reset link: keep nothing.  The worker is about to be
+         * removed, and removal is what actually clears its KV. */
+        entry->release_out_off = 0;
+        entry->release_out_len = 0;
+        return -1;
+    }
+    entry->release_out_off = 0;
+    entry->release_out_len = 0;
+    return 1;
+}
+
+/* Queue one release for this worker and try to flush it.  The queue is bounded
+ * so a stage that stops reading cannot grow coordinator memory without limit;
+ * if it is full the release is dropped and that stage's slots are reclaimed on
+ * its next disconnect, which clears everything it holds. */
+static void dist_worker_queue_release_locked(
+        ds4_dist_worker_entry *entry,
+        const uint8_t frame[DS4_DIST_RELEASE_FRAME_BYTES]) {
+    if (!entry || entry->fd < 0) return;
+    if (dist_worker_flush_releases_locked(entry) < 0) return;
+    if (entry->release_out_off == entry->release_out_len) {
+        entry->release_out_off = 0;
+        entry->release_out_len = 0;
+    } else if (entry->release_out_off != 0) {
+        memmove(entry->release_out,
+                entry->release_out + entry->release_out_off,
+                entry->release_out_len - entry->release_out_off);
+        entry->release_out_len -= entry->release_out_off;
+        entry->release_out_off = 0;
+    }
+    if (entry->release_out_len > DS4_DIST_RELEASE_OUT_MAX - DS4_DIST_RELEASE_FRAME_BYTES) {
+        /* Only a stage that has stopped reading its control link gets here.
+         * Say so once per 4096 drops rather than per release, so a wedged peer
+         * is visible without flooding the log. */
+        if ((entry->release_out_dropped++ & 0xfffu) == 0) {
+            fprintf(stderr,
+                    "ds4: distributed coordinator: worker %s:%s is not draining "
+                    "its control link; dropping session releases (%u so far)\n",
+                    entry->peer_host, entry->peer_port,
+                    entry->release_out_dropped);
+        }
+        return;
+    }
+    uint8_t *grown = realloc(entry->release_out,
+                             (size_t)entry->release_out_len +
+                             DS4_DIST_RELEASE_FRAME_BYTES);
+    if (!grown) return;
+    entry->release_out = grown;
+    memcpy(entry->release_out + entry->release_out_len, frame,
+           DS4_DIST_RELEASE_FRAME_BYTES);
+    entry->release_out_len += DS4_DIST_RELEASE_FRAME_BYTES;
+    (void)dist_worker_flush_releases_locked(entry);
+}
+
+/* Retry a worker's queued releases.  The accept thread calls this when that
+ * stage's control link reports room, so a release skipped for backpressure is
+ * delivered as soon as the stage drains, without disconnecting a live peer. */
+static void dist_coordinator_flush_releases(ds4_dist_coordinator_state *state,
+                                            int fd) {
+    if (!state) return;
+    pthread_mutex_lock(&state->mu);
+    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) {
+        if (it->fd != fd) continue;
+        (void)dist_worker_flush_releases_locked(it);
+        break;
+    }
+    pthread_mutex_unlock(&state->mu);
+}
+
+/* Does this worker have release bytes still to deliver?  The accept thread
+ * only asks the socket for writability when it does; an idle control link is
+ * otherwise read-only, so the loop sleeps in poll() instead of spinning on an
+ * always-writable descriptor. */
+static bool dist_coordinator_releases_pending(ds4_dist_coordinator_state *state,
+                                              int fd) {
+    bool pending = false;
+    pthread_mutex_lock(&state->mu);
+    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) {
+        if (it->fd != fd) continue;
+        pending = it->release_out_off < it->release_out_len;
+        break;
+    }
+    pthread_mutex_unlock(&state->mu);
+    return pending;
 }
 
 static void dist_session_release_from_wire(ds4_dist_session_release_fixed *r) {
@@ -2074,7 +2210,7 @@ static void dist_coordinator_add_worker(
     pthread_mutex_lock(&state->mu);
     if (state->shutting_down) {
         pthread_mutex_unlock(&state->mu);
-        free(entry);
+        dist_worker_entry_free(entry);
         return;
     }
     ds4_dist_worker_entry **link = &state->workers;
@@ -2099,7 +2235,7 @@ static void dist_coordinator_add_worker(
                              old->layer_start,
                              old->layer_end,
                              old->has_output ? "+output" : "");
-            free(old);
+            dist_worker_entry_free(old);
             continue;
         }
         link = &old->next;
@@ -2323,7 +2459,7 @@ static void dist_coordinator_forget_route_workers(
                              entry->layer_start,
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
-            free(entry);
+            dist_worker_entry_free(entry);
             removed_any = true;
             break;
         }
@@ -4526,7 +4662,7 @@ static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, in
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
             pthread_mutex_unlock(&state->mu);
-            free(entry);
+            dist_worker_entry_free(entry);
             if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
             return;
         }
@@ -4672,7 +4808,40 @@ static void *dist_coordinator_client_main(void *arg) {
     if (state->use_control_for_work) {
         dist_coordinator_monitor_worker_fd(state, fd, peer_host, peer_port);
     } else {
+        /* This thread owns the control descriptor, so it is also where queued
+         * releases are retried: a session free that found the socket full
+         * leaves the frame here, and this loop delivers it as soon as the
+         * worker drains.  Workers send nothing after HELLO, but the read side
+         * still watches for a close or a protocol error. */
         for (;;) {
+            struct pollfd pfd = {
+                .fd = fd,
+                .events = POLLIN |
+                    (dist_coordinator_releases_pending(state, fd) ? POLLOUT : 0),
+                .revents = 0,
+            };
+            const int prc = poll(&pfd, 1, 100);
+            if (prc < 0) {
+                if (errno == EINTR) continue;
+                DIST_COORD_DEBUG(state,
+                                 "ds4: distributed coordinator: worker %s:%s control poll failed: %s\n",
+                                 peer_host, peer_port, strerror(errno));
+                break;
+            }
+            if (prc == 0) continue;
+            if ((pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) break;
+            if ((pfd.revents & POLLOUT) != 0) {
+                dist_coordinator_flush_releases(state, fd);
+                /* A zero-window socket can still report POLLOUT on some
+                 * kernels; if bytes remain after the attempt, back off instead
+                 * of spinning at the top of this loop. */
+                if (dist_coordinator_releases_pending(state, fd)) {
+                    struct timespec pause = {0, 1000 * 1000};
+                    nanosleep(&pause, NULL);
+                }
+            }
+            if ((pfd.revents & POLLIN) == 0) continue;
+
             uint32_t type = 0, bytes = 0;
             rc = dist_read_frame_header(fd, &type, &bytes, err, sizeof(err));
             if (rc == 0) break;
@@ -5892,7 +6061,6 @@ int ds4_dist_coordinator_open(
     c->state.prefill_window = opt->prefill_window;
     c->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
     pthread_mutex_init(&c->state.mu, NULL);
-    pthread_mutex_init(&c->state.control_write_mu, NULL);
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
@@ -5911,7 +6079,6 @@ int ds4_dist_coordinator_open(
     c->accept_ctx.listen_fd = listen_fd;
     if (pthread_create(&c->accept_tid, NULL, dist_coordinator_accept_main, &c->accept_ctx) != 0) {
         close(listen_fd);
-        pthread_mutex_destroy(&c->state.control_write_mu);
         pthread_mutex_destroy(&c->state.mu);
         free(c);
         if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
@@ -5979,20 +6146,20 @@ int ds4_dist_session_create(
  * gone), while every stage registered on the coordinator has a control link.
  * A worker that never saw the id simply drops nothing.
  *
- * Each descriptor is dup()'d under the registry mutex, then written after it
- * is dropped.  That keeps a slow or dead worker from stalling registration and
- * route building on a full send buffer, without racing the accepting thread,
- * which closes the original descriptor after removing its entry under the same
- * mutex.  The dup keeps the socket alive for the write; the release is
- * best-effort because a worker that missed it reclaims everything when its
- * control link drops.
- *
  * This runs inside ds4_session_free(), which the server calls while holding
- * its inference lock, so every write is bounded by a short poll.  A worker
- * whose stream stays unwritable misses this release; its next work error or
- * disconnect clears the stale session.  A missed release therefore costs
- * capacity, never correctness: ids are not reused within a coordinator
- * process, so a stale entry cannot be mistaken for a newer conversation. */
+ * its inference lock, so nothing here may block.  Each stage gets the frame
+ * appended to a small per-worker queue that is flushed with non-blocking
+ * sends under state->mu; a stage with no room keeps the bytes and the accept
+ * thread retries them from its poll loop.  A release is therefore never
+ * silently dropped while the job it belongs to is still registered, and a slow
+ * stage is never disconnected just to reclaim its sessions.
+ *
+ * The queue is bounded (DS4_DIST_RELEASE_OUT_MAX).  Only a stage that has
+ * stopped draining its control link can fill it, and such a stage is one
+ * failed WORK away from being dropped by the route code; until then the extra
+ * releases are dropped, costing that stage capacity until it disconnects and
+ * clears everything it holds.  Ids are never reused within a coordinator
+ * process, so a stale entry can never be mistaken for a newer conversation. */
 static void dist_coordinator_release_session(
         ds4_dist_coordinator_state *state,
         uint64_t session_id) {
@@ -6003,57 +6170,28 @@ static void dist_coordinator_release_session(
     dist_u64_to_halves(session_id, &release.session_hi, &release.session_lo);
     dist_session_release_to_wire(&release);
 
+    uint8_t frame[DS4_DIST_RELEASE_FRAME_BYTES];
+    dist_encode_session_release(frame, &release);
+
+    /* Each worker's queue is flushed non-blockingly under state->mu, which is
+     * also what keeps the accept thread from closing a descriptor mid-write.
+     * A worker with no room keeps the frame queued and gets it on the accept
+     * thread's next poll wakeup: teardown runs inside the server's inference
+     * lock, so it must never wait on the socket.  Nothing is disconnected
+     * here; a release that cannot be delivered costs that stage one slot of
+     * --max-sessions until it drains, which is strictly better than dropping
+     * every session it holds to force cleanup. */
+    pthread_mutex_lock(&state->mu);
     /* The one-shot coordinator multiplexes WORK and RESULT on this link and
      * never builds a ds4_dist_session, so there is no session to release.
      * During shutdown the links are already torn down. */
-    pthread_mutex_lock(&state->mu);
-    const bool skip = state->use_control_for_work || state->shutting_down;
-    pthread_mutex_unlock(&state->mu);
-    if (skip) return;
-
-    /* control_write_mu orders release frames against each other; state->mu
-     * protects the registry.  Nothing takes them in the other order. */
-    pthread_mutex_lock(&state->control_write_mu);
-    int *fds = NULL;
-    uint32_t fd_count = 0;
-    pthread_mutex_lock(&state->mu);
-    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) {
-        if (it->fd < 0) continue;
-        int *grown = realloc(fds, (size_t)(fd_count + 1u) * sizeof(fds[0]));
-        if (!grown) break;
-        fds = grown;
-        int copy = dup(it->fd);
-        if (copy >= 0) fds[fd_count++] = copy;
+    if (!state->use_control_for_work && !state->shutting_down) {
+        for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) {
+            if (it->fd < 0) continue;
+            dist_worker_queue_release_locked(it, frame);
+        }
     }
     pthread_mutex_unlock(&state->mu);
-
-    /* Teardown runs inside the server's inference lock, so never let a wedged
-     * worker hold it for the socket's full send timeout.  The frame is 24
-     * bytes: if no stage is writable within 100 ms, skip the release and let
-     * the disconnect path reclaim that stage's sessions. */
-    struct pollfd *pollfds = fd_count ? calloc(fd_count, sizeof(pollfds[0])) : NULL;
-    if (pollfds) {
-        for (uint32_t i = 0; i < fd_count; i++) {
-            pollfds[i].fd = fds[i];
-            pollfds[i].events = POLLOUT;
-        }
-        (void)poll(pollfds, fd_count, 100);
-    }
-    for (uint32_t i = 0; i < fd_count; i++) {
-        const bool writable = pollfds &&
-            (pollfds[i].revents & POLLOUT) != 0 &&
-            (pollfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) == 0;
-        /* A half-written frame would leave the worker's control reader one
-         * body short forever, so drop the link and let the reconnect path
-         * clear that stage's sessions instead. */
-        if (writable && dist_write_session_release(fds[i], &release) != 0) {
-            shutdown(fds[i], SHUT_RDWR);
-        }
-        close(fds[i]);
-    }
-    free(pollfds);
-    free(fds);
-    pthread_mutex_unlock(&state->control_write_mu);
 }
 
 void ds4_dist_session_free(ds4_dist_session *d) {
@@ -7066,7 +7204,6 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.prefill_window = opt->prefill_window;
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
     pthread_mutex_init(&state.mu, NULL);
-    pthread_mutex_init(&state.control_write_mu, NULL);
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");

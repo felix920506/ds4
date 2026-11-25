@@ -48,7 +48,6 @@ static void test_release_broadcast(uint64_t id, uint64_t other_id) {
     ds4_dist_coordinator_state *coord = &coordinator->state;
     coord->model_id = 17;
     pthread_mutex_init(&coord->mu, NULL);
-    pthread_mutex_init(&coord->control_write_mu, NULL);
     ds4_dist_worker_entry *entry_a = calloc(1, sizeof(*entry_a));
     ds4_dist_worker_entry *entry_b = calloc(1, sizeof(*entry_b));
     assert(entry_a && entry_b);
@@ -106,8 +105,8 @@ static void test_release_broadcast(uint64_t id, uint64_t other_id) {
 
     free(state_a.sessions);
     free(state_b.sessions);
-    free(entry_a);
-    free(entry_b);
+    dist_worker_entry_free(entry_a);
+    dist_worker_entry_free(entry_b);
     free(coordinator);
     pthread_mutex_destroy(&state_a.mu);
     pthread_mutex_destroy(&state_b.mu);
@@ -137,7 +136,9 @@ static void test_worker_control_loop(int (*loop)(ds4_dist_worker_state *, int),
     };
     dist_u64_to_halves(id, &release.session_hi, &release.session_lo);
     dist_session_release_to_wire(&release);
-    assert(dist_write_session_release(pair[0], &release) == 0);
+    uint8_t frame[DS4_DIST_RELEASE_FRAME_BYTES];
+    dist_encode_session_release(frame, &release);
+    assert(dist_write_full(pair[0], frame, sizeof(frame)) == 0);
     shutdown(pair[0], SHUT_WR);
 
     assert(loop(&state, pair[1]) == 0);
@@ -145,6 +146,76 @@ static void test_worker_control_loop(int (*loop)(ds4_dist_worker_state *, int),
     assert(dist_worker_session_released(&state, id));
 
     pthread_mutex_destroy(&state.mu);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+/* A stage whose control socket is momentarily full must keep the release and
+ * get it later, not lose it and not have its (live) link closed.  Fill the
+ * socket buffer first so the non-blocking flush cannot complete, then drain the
+ * far end and check the accept-thread retry delivers the frame. */
+static void test_release_backpressure(uint64_t id) {
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    /* Small buffers make "full" quick and deterministic. */
+    int small = 4096;
+    assert(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
+
+    ds4_dist_coordinator *coordinator = calloc(1, sizeof(*coordinator));
+    assert(coordinator);
+    ds4_dist_coordinator_state *coord = &coordinator->state;
+    coord->model_id = 17;
+    pthread_mutex_init(&coord->mu, NULL);
+    ds4_dist_worker_entry *entry = calloc(1, sizeof(*entry));
+    assert(entry);
+    entry->fd = pair[0];
+    coord->workers = entry;
+
+    /* Fill one byte at a time: stopping on EAGAIN for a single byte proves the
+     * sender has no room at all, so the 24-byte frame cannot slip out and the
+     * queued path is exercised deterministically. */
+    const char one = 'x';
+    for (;;) {
+        ssize_t n = send(pair[0], &one, 1, DS4_DIST_SEND_NONBLOCK);
+        if (n < 0) {
+            assert(errno == EAGAIN || errno == EWOULDBLOCK);
+            break;
+        }
+        assert(n == 1);
+    }
+
+    dist_coordinator_release_session(coord, id);
+    /* Nothing could go out, so the frame is queued for this worker and the
+     * link is still open. */
+    assert(entry->release_out_len > entry->release_out_off);
+    assert(entry->release_out_len == DS4_DIST_RELEASE_FRAME_BYTES);
+    assert(dist_coordinator_releases_pending(coord, pair[0]));
+
+    /* Draining the far end frees the window, but only the coordinator's
+     * control thread delivers queued bytes; the frame is still pending until
+     * it runs. */
+    char drain[4096];
+    for (;;) {
+        ssize_t n = recv(pair[1], drain, sizeof(drain), MSG_DONTWAIT);
+        if (n <= 0) break;
+    }
+    assert(dist_coordinator_releases_pending(coord, pair[0]));
+    dist_coordinator_flush_releases(coord, pair[0]);
+    assert(!dist_coordinator_releases_pending(coord, pair[0]));
+
+    ds4_dist_worker_state state;
+    memset(&state, 0, sizeof(state));
+    pthread_mutex_init(&state.mu, NULL);
+    state.model_id = 17;
+    state.sessions = placeholder_session(id);
+    state.session_count = 1;
+    expect_release(pair[1], &state);
+    assert(state.sessions == NULL && state.session_count == 0);
+
+    free(state.sessions);
+    pthread_mutex_destroy(&state.mu);
+    dist_worker_entry_free(entry);
+    free(coordinator);
     close(pair[0]);
     close(pair[1]);
 }
@@ -157,6 +228,7 @@ int main(void) {
     test_worker_control_loop(dist_worker_read_loop, UINT64_C(0xabc000000003));
     test_worker_control_loop(dist_worker_read_loop_prefetch,
                              UINT64_C(0xabc000000004));
+    test_release_backpressure(UINT64_C(0xabc000000005));
     fprintf(stderr, "test_dist_session_release PASS\n");
     return 0;
 }

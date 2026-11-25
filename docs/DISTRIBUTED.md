@@ -233,13 +233,19 @@ than half speed until it has cooled. Measurements are in the
 
 `--max-sessions` on a worker bounds live coordinator sessions, not the total
 number over the worker's lifetime: freeing a coordinator session releases its
-KV on every stage immediately, so a server that recycles resident slots reuses
-the same worker budget. Size it for the largest number of conversations that
-can be in flight at once. In particular, a coordinator serving
-`--batched-session N` needs `--max-sessions` at least N on every worker; the
-default worker cap is 8. The release frame is part of the pipeline protocol:
-an older worker rejects it and drops its control link, so update coordinator
-and workers together.
+KV on every stage, so a server that recycles resident slots reuses the same
+worker budget. Size it for the largest number of conversations that can be in
+flight at once. In particular, a coordinator serving `--batched-session N`
+needs `--max-sessions` at least N on every worker; the default worker cap is 8.
+
+A release is queued per stage and sent without blocking, because freeing a
+session happens under the server's inference lock. A stage whose control link
+is momentarily full keeps the release and gets it when it drains, so a busy
+stage is never disconnected to reclaim memory. Only a stage that has stopped
+reading its control link entirely can fill the small per-worker queue; that
+stage is already failing work, and its slots come back when it disconnects.
+The release frame is part of the pipeline protocol: an older worker rejects it
+and drops its control link, so update coordinator and workers together.
 
 ### Full PRO Q4
 
