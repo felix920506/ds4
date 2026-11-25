@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -456,20 +457,66 @@ static uint8_t *ds4_image_parse_pnm(uint8_t *d, size_t n, uint32_t *width,
     return px;
 }
 
+static int ds4_image_rm_tree(const char *path, const struct stat *sb,
+                             int flags, struct FTW *ftw) {
+    (void)sb; (void)flags; (void)ftw;
+    remove(path); /* unlink for files; empty dirs rmdir after their children */
+    return 0;
+}
+
 /* Run `program <args>`, feed it `input` on stdin, collect stdout and the head
- * of stderr.  Returns the exit status, or -1 when the child could not be run,
- * or got killed for the timeout or for writing more than out_cap bytes. */
+ * of stderr.  tmpdir, when set, becomes the child's TMPDIR: ImageMagick
+ * keeps its pixel-cache spill files there, and this function deletes the
+ * whole tree once the child is gone.  ImageMagick cleans up on a normal
+ * exit, but a child killed for the timeout or for writing past out_cap
+ * never can, and a multi-GiB temp file in (RAM-backed) /tmp would survive
+ * every rejected request.
+ * Returns the exit status, or -1 when the child could not be run, or got
+ * killed for the timeout or for writing more than out_cap bytes. */
 static int ds4_image_run(const char *program, char *const argv[],
                          const uint8_t *input, size_t input_len,
                          uint8_t **out, size_t *out_len, size_t out_cap,
-                         char *err, size_t err_cap) {
+                         char *err, size_t err_cap, const char *tmpdir) {
+    char tmpdir_var[544];
+    const char *child_env[128];
     int in[2] = {-1, -1}, op[2] = {-1, -1}, ep[2] = {-1, -1};
     *out = NULL;
     *out_len = 0;
     if (err_cap) err[0] = '\0';
+    /* The child env is built before anything can fail, per call: pthreads
+     * has no setenv that is safe against other threads' getenv, and the
+     * caller's TMPDIR must not leak to the child either -- argv's
+     * -define registry:temporary-path redirects the spill itself (it
+     * outranks MAGICK_TEMPORARY_PATH, MAGICK_TMPDIR and TMPDIR alike;
+     * only a site policy's resource:temporary-path still wins, and that
+     * is an administrator's explicit directory choice).  A fixed array
+     * keeps this allocation-free; a caller with more environment
+     * variables than fit only loses the external fallback. */
+    if (tmpdir) {
+        static const char *const spill_vars[] = {
+            "TMPDIR=", "MAGICK_TEMPORARY_PATH=", "MAGICK_TMPDIR=" };
+        snprintf(tmpdir_var, sizeof(tmpdir_var), "TMPDIR=%s", tmpdir);
+        size_t j = 0;
+        for (size_t i = 0; environ[i]; i++) {
+            int strip = 0;
+            for (int v = 0; v < 3; v++)
+                strip |= strncmp(environ[i], spill_vars[v],
+                                 strlen(spill_vars[v])) == 0;
+            if (strip) continue;
+            if (j + 2 >= sizeof(child_env) / sizeof(child_env[0])) {
+                remove(tmpdir);
+                snprintf(err, err_cap, "environment too large");
+                return -1;
+            }
+            child_env[j++] = environ[i];
+        }
+        child_env[j++] = tmpdir_var;
+        child_env[j] = NULL;
+    }
     if (!ds4_image_pipe(in) || !ds4_image_pipe(op) || !ds4_image_pipe(ep)) {
         ds4_image_close(&in[0]); ds4_image_close(&in[1]);
         ds4_image_close(&op[0]); ds4_image_close(&op[1]);
+        if (tmpdir) remove(tmpdir);
         snprintf(err, err_cap, "pipe: %s", strerror(errno));
         return -1;
     }
@@ -506,7 +553,8 @@ static int ds4_image_run(const char *program, char *const argv[],
 #endif
     posix_spawnattr_setflags(&attr, flags);
     pid_t pid = -1;
-    int rc = posix_spawn(&pid, program, &fa, &attr, argv, environ);
+    int rc = posix_spawn(&pid, program, &fa, &attr, argv,
+                         tmpdir ? (char **)child_env : environ);
     posix_spawn_file_actions_destroy(&fa);
     posix_spawnattr_destroy(&attr);
     ds4_image_close(&in[0]);
@@ -516,6 +564,7 @@ static int ds4_image_run(const char *program, char *const argv[],
         ds4_image_close(&in[1]);
         ds4_image_close(&op[0]);
         ds4_image_close(&ep[0]);
+        if (tmpdir) remove(tmpdir);
         snprintf(err, err_cap, "%.160s: %s", program, strerror(rc));
         return -1;
     }
@@ -611,6 +660,7 @@ static int ds4_image_run(const char *program, char *const argv[],
     if (killed) kill(pid, SIGKILL);
     int status = 0;
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (tmpdir) nftw(tmpdir, ds4_image_rm_tree, 8, FTW_DEPTH | FTW_PHYS);
 
 #ifndef F_SETNOSIGPIPE
     if (raised_pipe && !pipe_was_pending) {
@@ -642,13 +692,53 @@ static int ds4_image_decode_external(ds4_image *out, ds4_image_format fmt,
     char lim_w[16], lim_h[16], lim_area[24];
     snprintf(lim_w, sizeof(lim_w), "%u", DS4_IMAGE_MAX_DIMENSION);
     snprintf(lim_h, sizeof(lim_h), "%u", DS4_IMAGE_MAX_DIMENSION);
-    snprintf(lim_area, sizeof(lim_area), "%u", DS4_IMAGE_MAX_PIXELS);
+    /* ImageMagick's area limit counts pixels, but exceeding it does not
+     * reject the image: the pixel cache spills to backing files under
+     * TMPDIR instead, and a child killed for writing past out_cap cannot
+     * remove them -- one 16384x16384 PNG left 2.8 GiB of files in the
+     * tmpfs /tmp of a Strix Halo box.  So: spill to a private directory
+     * that the parent deletes after waitpid, and cap it at the 2 GiB
+     * ImageMagick's own disk default already allows: every image ds4
+     * accepts then decodes exactly as before, while an oversized one
+     * fills the cap and errors out instead of writing without bound.
+     * Area is compared strictly (size < limit), so the +1 keeps a
+     * legitimate exactly-64 MP image on its in-RAM cache. */
+    snprintf(lim_area, sizeof(lim_area), "%u", DS4_IMAGE_MAX_PIXELS + 1u);
+    /* Private scratch dir under the caller's TMPDIR.  The fallback refuses
+     * to run without it: a child we later kill can only be cleaned up by
+     * us if its files are somewhere we know. */
+    const char *scratch = getenv("TMPDIR");
+    if (!scratch || !*scratch) scratch = "/tmp";
+    size_t scratch_len = strlen(scratch);
+    while (scratch_len > 1 && scratch[scratch_len - 1] == '/') scratch_len--;
+    char tmpdir_path[512];
+    if (scratch_len + 24 >= sizeof(tmpdir_path)) {
+        snprintf(why, why_cap, "TMPDIR is too long");
+        return 0;
+    }
+    snprintf(tmpdir_path, sizeof(tmpdir_path), "%.*s/ds4-img-XXXXXX",
+             (int)scratch_len, scratch);
+    if (!mkdtemp(tmpdir_path)) {
+        snprintf(why, why_cap, "cannot create the decoder temp directory");
+        return 0;
+    }
+    const char *tmpdir = tmpdir_path;
+    /* ImageMagick picks its spill directory from a define, an explicit
+     * site policy, or MAGICK_TEMPORARY_PATH / MAGICK_TMPDIR / TMPDIR, in
+     * that order.  The define outranks the rest, so the spill always
+     * lands in the private directory; a policy's resource:temporary-path
+     * still wins, and that is an administrator's explicit choice. */
+    char temp_dir_def[560];
+    snprintf(temp_dir_def, sizeof(temp_dir_def),
+             "registry:temporary-path=%s", tmpdir);
     char *argv[] = {
         (char *)program,
         "-limit", "width", lim_w,
         "-limit", "height", lim_h,
         "-limit", "area", lim_area,
+        "-limit", "disk", "2GiB",
         "-limit", "time", "60",
+        "-define", temp_dir_def,
         (char *)ds4_image_format_coder(fmt),
         "-auto-orient",
         "-alpha", "off",
@@ -661,7 +751,7 @@ static int ds4_image_decode_external(ds4_image *out, ds4_image_format fmt,
     char err[256];
     const size_t out_cap = 64 + (size_t)DS4_IMAGE_MAX_PIXELS * 3u;
     int status = ds4_image_run(program, argv, encoded, encoded_len,
-                               &pnm, &pnm_len, out_cap, err, sizeof(err));
+                               &pnm, &pnm_len, out_cap, err, sizeof(err), tmpdir);
     ds4_image_first_line(err);
     uint32_t w = 0, h = 0, ch = 0;
     uint8_t *px = status == 0 ? ds4_image_parse_pnm(pnm, pnm_len, &w, &h, &ch) : NULL;
