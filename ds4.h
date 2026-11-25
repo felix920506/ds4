@@ -92,10 +92,11 @@ typedef struct {
     uint32_t prefill_chunk;
     uint32_t prefill_window;
     uint32_t activation_bits;
-    /* Worker only: the largest number of coordinator sessions this worker will
-     * hold at once.  A worker creates one session per session id it is sent and
-     * has no say in how many that is, so without a bound a coordinator with many
-     * resident slots walks it into an OOM kill. */
+    /* Worker only: the largest number of live coordinator sessions this worker
+     * will hold at once.  A worker creates one session per session id it is
+     * sent and has no say in how many that is, so without a bound a coordinator
+     * with many resident slots walks it into an OOM kill.  Freed sessions are
+     * released, so this bounds concurrency, not lifetime churn. */
     uint32_t max_sessions;
     bool replay_check;
     bool debug;

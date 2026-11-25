@@ -19,10 +19,9 @@
  * The coordinator listens and the worker dials in, so the worker must already
  * be running and serving the complementary layer slice before this starts.
  *
- * The worker holds one session per session id it is sent and does not reclaim
- * one when the coordinator frees its side, so this test needs room for twice
- * DS4_TEST_SESSION_COUNT: the batched sessions and then the control sessions.
- * Start the worker with --max-sessions 2N or more.
+ * The coordinator sends a release frame when it frees a session, so the
+ * control sessions below reuse the worker slots the batched ones vacated.
+ * --max-sessions therefore only has to cover the peak live count, N.
  *
  * Run with, on the coordinator host:
  *   DS4_TEST_MODEL=/path/to/model.gguf make test-dist-session-batch
@@ -152,7 +151,7 @@ static void wait_for_route(ds4_session *probe, int timeout_sec) {
     fprintf(stderr,
             "FAIL: no worker registered within %d s. Start one serving the\n"
             "      layers this coordinator does not, dialling this host, with\n"
-            "      --max-sessions at least twice DS4_TEST_SESSION_COUNT.\n",
+            "      --max-sessions at least DS4_TEST_SESSION_COUNT.\n",
             timeout_sec);
     exit(1);
 }
@@ -321,7 +320,7 @@ int main(void) {
                     "FAIL: control prefill session=%d: %s\n"
                     "      If this reports a worker session cap, restart the\n"
                     "      worker with --max-sessions at least %d.\n",
-                    i, err, 2 * session_count);
+                    i, err, session_count);
             return 1;
         }
         for (int step = 0; step <= DECODE_STEPS; step++) {
