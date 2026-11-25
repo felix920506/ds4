@@ -1,5 +1,6 @@
 #include "ds4_image.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -276,6 +277,116 @@ static int check_fallback(void) {
         free(big);
         if (!ok) return 0;
     }
+    {
+        /* Issue #42: exceeding ImageMagick's area limit spills the pixel
+         * cache to a temp file, and a child killed for overrunning
+         * out_cap cannot remove it.  The fallback must bound the spill,
+         * aim it at a private directory (define beats MAGICK_TEMPORARY_
+         * PATH, MAGICK_TMPDIR and TMPDIR alike, so the env overrides go)
+         * and delete that directory once the child is gone.  Fake
+         * decoder: checks the limits and defines, records where it was
+         * told to spill and what TMPDIR it got, creates a spill file,
+         * then writes past the output cap so it gets killed. */
+        char probe[64];
+        snprintf(probe, sizeof(probe), "/tmp/ds4_img_probe_%d", (int)getpid());
+        char body[1024];
+        snprintf(body, sizeof(body),
+                 "cat >/dev/null\n"
+                 "for a in \"$@\"; do case \"$a\" in registry:temporary-path=*/ds4-img-*) spill=1;; esac; done\n"
+                 "[ \"$spill\" = 1 ] || { echo 'spill is not aimed at the private dir' >&2; exit 1; }\n"
+                 "case \" $* \" in *\" -limit disk 2GiB \"*) : ;; *) echo 'spill is not bounded' >&2; exit 1 ;; esac\n"
+                 "case \" $* \" in *\" -limit area %u \"*) : ;; *) echo 'area below the pixel ceiling' >&2; exit 1 ;; esac\n"
+                 "[ -z \"${MAGICK_TEMPORARY_PATH:-}\" ] || { echo 'MAGICK_TEMPORARY_PATH reaches the child' >&2; exit 1; }\n"
+                 "[ -z \"${MAGICK_TMPDIR:-}\" ] || { echo 'MAGICK_TMPDIR reaches the child' >&2; exit 1; }\n"
+                 "echo \"${TMPDIR:-}\" > %s\n"
+                 "case \"${TMPDIR:-}\" in */ds4-img-*) : ;; *) echo 'TMPDIR is not the private dir' >&2; exit 1 ;; esac\n"
+                 ": > \"$TMPDIR/magick-spill\"; mkdir -p \"$TMPDIR/nested\"; "
+                 "head -c 220000000 /dev/zero",
+                 DS4_IMAGE_MAX_PIXELS + 1u, probe);
+        char path[64];
+        if (!write_script(path, sizeof(path), body)) return 0;
+        setenv("DS4_IMAGE_DECODER", path, 1);
+        setenv("MAGICK_TEMPORARY_PATH", "/tmp", 1);
+        setenv("MAGICK_TMPDIR", "/tmp", 1);
+        ds4_image image = {0};
+        char error[384] = {0};
+        int got = ds4_image_decode_memory(&image, png, png_len, error, sizeof(error));
+        unlink(path);
+        unsetenv("MAGICK_TEMPORARY_PATH");
+        unsetenv("MAGICK_TMPDIR");
+        ds4_image_free(&image);
+        int ok = !got && strstr(error, "exceeds the size limit") != NULL;
+        char dir[128] = {0};
+        if (ok) {
+            FILE *fp = fopen(probe, "r");
+            if (fp) {
+                if (fgets(dir, sizeof(dir), fp)) dir[strcspn(dir, "\n")] = '\0';
+                fclose(fp);
+                unlink(probe);
+                ok = dir[0] && access(dir, F_OK) != 0;
+            } else ok = 0;
+            if (!ok) fprintf(stderr, "killed decoder left %s behind\n", dir);
+        } else {
+            fprintf(stderr, "spill test: got=%d err=%s\n", got, error);
+            unlink(probe);
+        }
+        if (!ok) return 0;
+
+        /* Fail-closed setup: an unusable TMPDIR refuses the fallback
+         * rather than spawning a child whose spill nobody cleans up. */
+        char ok_body[128];
+        snprintf(ok_body, sizeof(ok_body),
+                 "printf 'P6\\n1 1\\n255\\n\\001\\002\\003'");
+        char ok_path[64];
+        if (!write_script(ok_path, sizeof(ok_path), ok_body)) return 0;
+        setenv("DS4_IMAGE_DECODER", ok_path, 1);
+        setenv("TMPDIR", "/nonexistent/ds4-test-dir", 1);
+        {
+            ds4_image image = {0};
+            char error[384] = {0};
+            int g = ds4_image_decode_memory(&image, png, png_len, error, sizeof(error));
+            ds4_image_free(&image);
+            if (g || !strstr(error, "temp directory")) {
+                fprintf(stderr, "unusable TMPDIR: got=%d err=%s\n", g, error);
+                return 0;
+            }
+        }
+        unsetenv("TMPDIR");
+        unlink(ok_path);
+
+        /* An oversized environment also refuses the fallback, before any
+         * fd or spawn object exists, and a thousand such failures leak
+         * nothing. */
+        {
+            char names[130][16], values[130][8];
+            for (int i = 0; i < 130; i++) {
+                snprintf(names[i], sizeof(names[i]), "DS4_TENV%d", i);
+                snprintf(values[i], sizeof(values[i]), "%d", i);
+                setenv(names[i], values[i], 1);
+            }
+            int open_fds = open("/dev/null", O_RDONLY);
+            close(open_fds);
+            ds4_image image = {0};
+            char error[384] = {0};
+            int g = ds4_image_decode_memory(&image, png, png_len, error, sizeof(error));
+            ds4_image_free(&image);
+            if (g || !strstr(error, "environment too large")) {
+                fprintf(stderr, "oversized environment: got=%d err=%s\n", g, error);
+                return 0;
+            }
+            for (int i = 0; i < 1000; i++) {
+                ds4_image im2 = {0};
+                ds4_image_decode_memory(&im2, png, png_len, error, sizeof(error));
+                ds4_image_free(&im2);
+            }
+            int after = open("/dev/null", O_RDONLY);
+            int leaked = after != open_fds; /* lowest free fd unchanged */
+            close(after);
+            for (int i = 0; i < 130; i++) unsetenv(names[i]);
+            if (leaked) { fprintf(stderr, "failed decodes leaked fds\n"); return 0; }
+        }
+    }
+
     setenv("DS4_IMAGE_DECODER", "/nonexistent/magick", 1);
     {
         ds4_image image = {0};
