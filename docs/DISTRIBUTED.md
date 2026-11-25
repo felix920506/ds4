@@ -231,6 +231,16 @@ token, and right after a long prefill the hot SoC runs those bursts at less
 than half speed until it has cooled. Measurements are in the
 [pipeline decode notes](../speed-bench/gfx1151-pipeline-decode.md).
 
+`--max-sessions` on a worker bounds live coordinator sessions, not the total
+number over the worker's lifetime: freeing a coordinator session releases its
+KV on every stage immediately, so a server that recycles resident slots reuses
+the same worker budget. Size it for the largest number of conversations that
+can be in flight at once. In particular, a coordinator serving
+`--batched-session N` needs `--max-sessions` at least N on every worker; the
+default worker cap is 8. The release frame is part of the pipeline protocol:
+an older worker rejects it and drops its control link, so update coordinator
+and workers together.
+
 ### Full PRO Q4
 
 For two 512 GB Mac Studios, use the split artifacts:

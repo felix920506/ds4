@@ -59,6 +59,11 @@
 #define DS4_DIST_MSG_SNAPSHOT_CHUNK 7u
 #define DS4_DIST_MSG_SNAPSHOT_DONE 8u
 #define DS4_DIST_MSG_SNAPSHOT_LOAD_BEGIN 9u
+/* Sent to every registered worker when a coordinator session is freed.  A
+ * worker otherwise only reclaimed its per-session KV when the coordinator's
+ * control link dropped, so ordinary slot churn walked it into the
+ * --max-sessions ceiling and every later session failed. */
+#define DS4_DIST_MSG_SESSION_RELEASE 10u
 #define DS4_DIST_MAX_MODEL_NAME 127u
 #define DS4_DIST_WORK_F_INPUT_HC 0x00000001u
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
@@ -226,6 +231,12 @@ typedef struct {
     uint32_t message_bytes;
 } ds4_dist_snapshot_done_fixed;
 
+typedef struct {
+    uint32_t model_id;
+    uint32_t session_hi;
+    uint32_t session_lo;
+} ds4_dist_session_release_fixed;
+
 /* =========================================================================
  * Runtime State
  * =========================================================================
@@ -270,6 +281,9 @@ typedef struct {
     uint32_t activation_bits;
     uint64_t generation;
     pthread_mutex_t mu;
+    /* Orders release frames on the workers' control streams; concurrent
+     * session frees could otherwise interleave their bytes. */
+    pthread_mutex_t control_write_mu;
     ds4_dist_worker_entry *workers;
     bool shutting_down;
     /* A worker from an older build refused the anchor flags: no session
@@ -309,7 +323,34 @@ typedef struct {
     ds4_dist_worker_session *sessions;
     uint32_t session_count;
     uint32_t max_sessions;
+    /* Session ids the coordinator has released.  A release travels on the
+     * control link while the work it followed travelled on a per-session data
+     * link, so the two streams can cross in flight.  Refusing an id in this
+     * window stops a late WORK frame from recreating a session that was just
+     * reclaimed.  Sized well above the receive prefetch depth; ids are never
+     * reused, so eviction only weakens the guard against a very late frame
+     * from a failed request. */
+    uint64_t released_ids[256];
+    uint32_t released_count;
+    uint32_t released_next;
 } ds4_dist_worker_state;
+
+static bool dist_worker_session_released(const ds4_dist_worker_state *state,
+                                         uint64_t session_id) {
+    for (uint32_t i = 0; i < state->released_count; i++) {
+        if (state->released_ids[i] == session_id) return true;
+    }
+    return false;
+}
+
+static void dist_worker_note_released(ds4_dist_worker_state *state,
+                                      uint64_t session_id) {
+    const uint32_t cap = (uint32_t)(sizeof(state->released_ids) /
+                                    sizeof(state->released_ids[0]));
+    state->released_ids[state->released_next] = session_id;
+    state->released_next = (state->released_next + 1u) % cap;
+    if (state->released_count < cap) state->released_count++;
+}
 
 typedef struct ds4_dist_worker_upstream ds4_dist_worker_upstream;
 
@@ -584,6 +625,10 @@ static int dist_worker_handle_snapshot_save(
 static int dist_worker_handle_snapshot_load(
         ds4_dist_worker_state *state,
         ds4_dist_worker_upstream *upstream,
+        uint32_t bytes);
+static int dist_worker_read_session_release(
+        ds4_dist_worker_state *state,
+        int fd,
         uint32_t bytes);
 static void dist_worker_upstream_init(
         ds4_dist_worker_upstream *upstream,
@@ -1173,12 +1218,18 @@ static int dist_set_socket_low_latency(int fd) {
  * they are where cross-node traffic and blocking time are counted.  A read
  * that waits for a RESULT frame also waits for the remote stage to compute,
  * which the worker telemetry later separates out (NET_REMOTE_EVAL_NS). */
+#ifdef MSG_NOSIGNAL
+#define DS4_DIST_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define DS4_DIST_SEND_FLAGS 0
+#endif
+
 static int dist_write_full(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
     const uint64_t t0 = ds4_metric_now_ns();
     int rc = 0;
     while (len > 0) {
-        ssize_t n = send(fd, p, len, 0);
+        ssize_t n = send(fd, p, len, DS4_DIST_SEND_FLAGS);
         if (n < 0) {
             if (errno == EINTR) continue;
             rc = -1;
@@ -1831,6 +1882,35 @@ static void dist_snapshot_done_from_wire(ds4_dist_snapshot_done_fixed *s) {
     s->request_lo = ntohl(s->request_lo);
     s->status = ntohl(s->status);
     s->message_bytes = ntohl(s->message_bytes);
+}
+
+static void dist_session_release_to_wire(ds4_dist_session_release_fixed *r) {
+    r->model_id = htonl(r->model_id);
+    r->session_hi = htonl(r->session_hi);
+    r->session_lo = htonl(r->session_lo);
+}
+
+/* One send for header and body, so a session-free cannot leave half a frame
+ * on a control stream that another release might write to next. */
+static int dist_write_session_release(
+        int fd,
+        const ds4_dist_session_release_fixed *wire) {
+    uint8_t frame[sizeof(ds4_dist_frame_header) +
+                  sizeof(ds4_dist_session_release_fixed)];
+    ds4_dist_frame_header header = {
+        htonl(DS4_DIST_MAGIC),
+        htonl(DS4_DIST_MSG_SESSION_RELEASE),
+        htonl((uint32_t)sizeof(*wire)),
+    };
+    memcpy(frame, &header, sizeof(header));
+    memcpy(frame + sizeof(header), wire, sizeof(*wire));
+    return dist_write_full(fd, frame, sizeof(frame));
+}
+
+static void dist_session_release_from_wire(ds4_dist_session_release_fixed *r) {
+    r->model_id = ntohl(r->model_id);
+    r->session_hi = ntohl(r->session_hi);
+    r->session_lo = ntohl(r->session_lo);
 }
 
 static void dist_telemetry_to_wire(ds4_dist_telemetry_fixed *t) {
@@ -4667,10 +4747,12 @@ static void *dist_coordinator_accept_main(void *arg) {
  * they share the pid, can land in the same second and the same clock tick, and
  * malloc can hand back an address a freed session just released.
  *
- * Reserve the low 16 bits for a per-process counter.  The upper bits still
+ * Reserve the low 32 bits for a per-process counter.  The upper bits still
  * separate coordinators across hosts and restarts; collisions inside one
  * coordinator become impossible rather than unlikely.  There are no atomics in
- * this file and it stays C99, so the counter sits behind a mutex.
+ * this file and it stays C99, so the counter sits behind a mutex.  A worker
+ * reclaims a released session immediately, so the counter can no longer wrap
+ * into a live id after 65,536 creations; 32 bits leaves that far out of reach.
  */
 static uint64_t dist_make_session_id(const void *ptr) {
     static pthread_mutex_t seq_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -4683,7 +4765,7 @@ static uint64_t dist_make_session_id(const void *ptr) {
     uint64_t id = ((uint64_t)(uint32_t)time(NULL) << 32) ^ (uint64_t)getpid();
     id ^= ((uint64_t)(uintptr_t)ptr << 17) ^ (uint64_t)(uintptr_t)ptr;
     id ^= (uint64_t)clock();
-    id = (id & ~UINT64_C(0xffff)) | (n & UINT64_C(0xffff));
+    id = (id & ~UINT64_C(0xffffffff)) | (n & UINT64_C(0xffffffff));
     return id ? id : 1u;
 }
 
@@ -5810,6 +5892,7 @@ int ds4_dist_coordinator_open(
     c->state.prefill_window = opt->prefill_window;
     c->state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
     pthread_mutex_init(&c->state.mu, NULL);
+    pthread_mutex_init(&c->state.control_write_mu, NULL);
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
@@ -5828,6 +5911,7 @@ int ds4_dist_coordinator_open(
     c->accept_ctx.listen_fd = listen_fd;
     if (pthread_create(&c->accept_tid, NULL, dist_coordinator_accept_main, &c->accept_ctx) != 0) {
         close(listen_fd);
+        pthread_mutex_destroy(&c->state.control_write_mu);
         pthread_mutex_destroy(&c->state.mu);
         free(c);
         if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
@@ -5889,8 +5973,94 @@ int ds4_dist_session_create(
     return 0;
 }
 
+/* Tell every registered worker to drop this session's KV.  It goes over each
+ * worker's control link rather than the session's data link: a stage may never
+ * have received a WORK frame for the session (or its data link is already
+ * gone), while every stage registered on the coordinator has a control link.
+ * A worker that never saw the id simply drops nothing.
+ *
+ * Each descriptor is dup()'d under the registry mutex, then written after it
+ * is dropped.  That keeps a slow or dead worker from stalling registration and
+ * route building on a full send buffer, without racing the accepting thread,
+ * which closes the original descriptor after removing its entry under the same
+ * mutex.  The dup keeps the socket alive for the write; the release is
+ * best-effort because a worker that missed it reclaims everything when its
+ * control link drops.
+ *
+ * This runs inside ds4_session_free(), which the server calls while holding
+ * its inference lock, so every write is bounded by a short poll.  A worker
+ * whose stream stays unwritable misses this release; its next work error or
+ * disconnect clears the stale session.  A missed release therefore costs
+ * capacity, never correctness: ids are not reused within a coordinator
+ * process, so a stale entry cannot be mistaken for a newer conversation. */
+static void dist_coordinator_release_session(
+        ds4_dist_coordinator_state *state,
+        uint64_t session_id) {
+    if (!state) return;
+    ds4_dist_session_release_fixed release = {
+        .model_id = state->model_id,
+    };
+    dist_u64_to_halves(session_id, &release.session_hi, &release.session_lo);
+    dist_session_release_to_wire(&release);
+
+    /* The one-shot coordinator multiplexes WORK and RESULT on this link and
+     * never builds a ds4_dist_session, so there is no session to release.
+     * During shutdown the links are already torn down. */
+    pthread_mutex_lock(&state->mu);
+    const bool skip = state->use_control_for_work || state->shutting_down;
+    pthread_mutex_unlock(&state->mu);
+    if (skip) return;
+
+    /* control_write_mu orders release frames against each other; state->mu
+     * protects the registry.  Nothing takes them in the other order. */
+    pthread_mutex_lock(&state->control_write_mu);
+    int *fds = NULL;
+    uint32_t fd_count = 0;
+    pthread_mutex_lock(&state->mu);
+    for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) {
+        if (it->fd < 0) continue;
+        int *grown = realloc(fds, (size_t)(fd_count + 1u) * sizeof(fds[0]));
+        if (!grown) break;
+        fds = grown;
+        int copy = dup(it->fd);
+        if (copy >= 0) fds[fd_count++] = copy;
+    }
+    pthread_mutex_unlock(&state->mu);
+
+    /* Teardown runs inside the server's inference lock, so never let a wedged
+     * worker hold it for the socket's full send timeout.  The frame is 24
+     * bytes: if no stage is writable within 100 ms, skip the release and let
+     * the disconnect path reclaim that stage's sessions. */
+    struct pollfd *pollfds = fd_count ? calloc(fd_count, sizeof(pollfds[0])) : NULL;
+    if (pollfds) {
+        for (uint32_t i = 0; i < fd_count; i++) {
+            pollfds[i].fd = fds[i];
+            pollfds[i].events = POLLOUT;
+        }
+        (void)poll(pollfds, fd_count, 100);
+    }
+    for (uint32_t i = 0; i < fd_count; i++) {
+        const bool writable = pollfds &&
+            (pollfds[i].revents & POLLOUT) != 0 &&
+            (pollfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) == 0;
+        /* A half-written frame would leave the worker's control reader one
+         * body short forever, so drop the link and let the reconnect path
+         * clear that stage's sessions instead. */
+        if (writable && dist_write_session_release(fds[i], &release) != 0) {
+            shutdown(fds[i], SHUT_RDWR);
+        }
+        close(fds[i]);
+    }
+    free(pollfds);
+    free(fds);
+    pthread_mutex_unlock(&state->control_write_mu);
+}
+
 void ds4_dist_session_free(ds4_dist_session *d) {
     if (!d) return;
+    /* Always broadcast: a session whose request failed may still have left KV
+     * on some stage, and a stage that never saw the id simply drops nothing. */
+    dist_coordinator_release_session(&d->coord->state, d->session_id);
     /* Closes this session's dup() of the first hop.  The registry's descriptor
      * belongs to the accepting client thread and is untouched here.
      */
@@ -6896,6 +7066,7 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     state.prefill_window = opt->prefill_window;
     state.activation_bits = dist_activation_bits_or_default(opt->activation_bits);
     pthread_mutex_init(&state.mu, NULL);
+    pthread_mutex_init(&state.control_write_mu, NULL);
 
     char local_end[32];
     if (opt->layers.has_output) snprintf(local_end, sizeof(local_end), "output");
@@ -6981,6 +7152,14 @@ static int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
         }
         if (type == DS4_DIST_MSG_SNAPSHOT_LOAD_BEGIN) {
             rc = dist_worker_handle_snapshot_load(state, &upstream, bytes);
+            if (rc <= 0) {
+                loop_rc = rc == 0 ? 0 : 1;
+                break;
+            }
+            continue;
+        }
+        if (type == DS4_DIST_MSG_SESSION_RELEASE) {
+            rc = dist_worker_read_session_release(state, fd, bytes);
             if (rc <= 0) {
                 loop_rc = rc == 0 ? 0 : 1;
                 break;
@@ -7970,6 +8149,11 @@ static ds4_dist_worker_session *dist_worker_get_session_locked(
     for (ds4_dist_worker_session *it = state->sessions; it; it = it->next) {
         if (it->session_id == session_id) return it;
     }
+    if (dist_worker_session_released(state, session_id)) {
+        if (errlen) snprintf(err, errlen,
+                            "distributed session was released by the coordinator");
+        return NULL;
+    }
 
     /* Refuse past the cap instead of allocating into an OOM kill.  A worker is
      * told how many sessions to hold, never asked, so this is the only place it
@@ -8016,6 +8200,8 @@ static uint32_t dist_worker_clear_sessions(ds4_dist_worker_state *state) {
     ds4_dist_worker_session *it = state->sessions;
     state->sessions = NULL;
     state->session_count = 0;
+    state->released_count = 0;
+    state->released_next = 0;
     pthread_mutex_unlock(&state->mu);
 
     while (it) {
@@ -8026,6 +8212,61 @@ static uint32_t dist_worker_clear_sessions(ds4_dist_worker_state *state) {
         n++;
     }
     return n;
+}
+
+/* Drop one session announced by the coordinator.  Called with state->mu held,
+ * the lock a data-connection thread holds for the whole WORK evaluation, so
+ * the KV cannot be freed while that thread is still inside it. */
+static int dist_worker_drop_session_locked(ds4_dist_worker_state *state,
+                                           uint64_t session_id) {
+    ds4_dist_worker_session **link = &state->sessions;
+    while (*link) {
+        ds4_dist_worker_session *entry = *link;
+        if (entry->session_id == session_id) {
+            *link = entry->next;
+            if (state->session_count != 0) state->session_count--;
+            ds4_session_free(entry->session);
+            free(entry);
+            return 1;
+        }
+        link = &entry->next;
+    }
+    return 0;
+}
+
+/* Reads one SESSION_RELEASE frame and drops the matching worker session.  No
+ * result travels back: teardown is best-effort and the control-link disconnect
+ * path is the fallback. */
+static int dist_worker_read_session_release(ds4_dist_worker_state *state,
+                                            int fd,
+                                            uint32_t bytes) {
+    if (bytes != sizeof(ds4_dist_session_release_fixed)) {
+        dist_discard_bytes(fd, bytes);
+        fprintf(stderr,
+                "ds4: distributed worker: invalid session release frame length %u\n",
+                bytes);
+        return -1;
+    }
+    ds4_dist_session_release_fixed release;
+    int rc = dist_read_full(fd, &release, sizeof(release));
+    if (rc <= 0) return rc == 0 ? 0 : -1;
+    dist_session_release_from_wire(&release);
+    const uint64_t session_id = dist_u64_from_halves(release.session_hi,
+                                                     release.session_lo);
+    if (release.model_id != state->model_id) {
+        fprintf(stderr,
+                "ds4: distributed worker: session release model id %u does not match %u\n",
+                release.model_id,
+                state->model_id);
+        return 1;
+    }
+    pthread_mutex_lock(&state->mu);
+    /* Record before freeing: a WORK frame for this id that is still queued
+     * must not create the session again. */
+    dist_worker_note_released(state, session_id);
+    (void)dist_worker_drop_session_locked(state, session_id);
+    pthread_mutex_unlock(&state->mu);
+    return 1;
 }
 
 typedef struct {
@@ -9256,6 +9497,16 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
             }
             continue;
         }
+        if (type == DS4_DIST_MSG_SESSION_RELEASE) {
+            /* Releases arrive on the control link, which never carries WORK in
+             * API coordinator mode, so they are safe to apply inline. */
+            rc = dist_worker_read_session_release(state, fd, bytes);
+            if (rc <= 0) {
+                loop_rc = rc == 0 ? 0 : 1;
+                break;
+            }
+            continue;
+        }
         rc = dist_discard_bytes(fd, bytes);
         if (rc <= 0) {
             loop_rc = rc == 0 ? 0 : 1;
@@ -9566,8 +9817,10 @@ void ds4_dist_usage(FILE *fp) {
         "  --coordinator HOST PORT\n"
         "      Coordinator TCP address for --role worker.\n"
         "  --max-sessions N\n"
-        "      Worker cap on concurrent coordinator sessions. Default: 8. Each costs its own\n"
-        "      KV and context buffers, so raise it only against measured worker headroom.\n"
+        "      Worker cap on live coordinator sessions. Default: 8. A freed session\n"
+        "      releases its KV on every stage, so this bounds concurrency, not lifetime\n"
+        "      churn. Each costs its own KV and context buffers, so raise it only\n"
+        "      against measured worker headroom.\n"
         "  --dist-prefill-chunk N\n"
         "      Coordinator prefill pipeline chunk size. Default: session cap, normally 4096.\n"
         "      Non-default values are experimental and can change logits unless validated.\n"
