@@ -63851,6 +63851,10 @@ struct ds4_session {
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
     size_t sync_image_count;
+    /* Distributed coordinator: owned copy of the last sync's images, see
+     * ds4_session_dist_images_retain(). */
+    ds4_vision_span *dist_images;
+    size_t dist_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
     float *sample_probs;
@@ -63918,6 +63922,52 @@ static bool ds4_session_tp_leader(const ds4_session *s);
 static void session_anchors_clear(ds4_session *s) {
     for (int i = 0; i < s->anchor_count; i++) free(s->anchors[i].state);
     s->anchor_count = 0;
+}
+
+static void ds4_session_dist_images_free(ds4_session *s) {
+    for (size_t i = 0; i < s->dist_image_count; i++) free(s->dist_images[i].embedding.data);
+    free(s->dist_images);
+    s->dist_images = NULL;
+    s->dist_image_count = 0;
+}
+
+/* A distributed coordinator that loses a remote stage during decode rebuilds
+ * it by replaying the transcript from token 0 through this stage's layers
+ * (dist_coordinator_rebuild_from_transcript), and layer 0 seeds image rows
+ * from the encoder output, which the caller lends only for the multimodal
+ * sync.  So the session keeps its own copy of the images of every successful
+ * sync.  Each sync replaces it and decode never produces image tokens, so
+ * any image row a replay meets belongs to one of these spans.  Without memory
+ * for the copy a replay fails on the image rows, as it would without it. */
+static void ds4_session_dist_images_retain(ds4_session *s) {
+    if (!s->distributed) return;
+    bool same = s->dist_image_count == s->sync_image_count;
+    for (size_t i = 0; same && i < s->sync_image_count; i++) {
+        const ds4_vision_embedding *a = &s->dist_images[i].embedding;
+        const ds4_vision_embedding *b = &s->sync_images[i].embedding;
+        same = s->dist_images[i].token_start == s->sync_images[i].token_start &&
+               a->token_count == b->token_count &&
+               memcmp(a->fingerprint, b->fingerprint, sizeof(a->fingerprint)) == 0;
+    }
+    if (same) return;
+    ds4_session_dist_images_free(s);
+    if (s->sync_image_count == 0) return;
+    ds4_vision_span *copy = calloc(s->sync_image_count, sizeof(copy[0]));
+    if (!copy) return;
+    for (size_t i = 0; i < s->sync_image_count; i++) {
+        const size_t bytes = (size_t)s->sync_images[i].embedding.token_count *
+                             DS4_N_EMBD * sizeof(float);
+        copy[i] = s->sync_images[i];
+        copy[i].embedding.data = malloc(bytes);
+        if (!copy[i].embedding.data) {
+            for (size_t j = 0; j < i; j++) free(copy[j].embedding.data);
+            free(copy);
+            return;
+        }
+        memcpy(copy[i].embedding.data, s->sync_images[i].embedding.data, bytes);
+    }
+    s->dist_images = copy;
+    s->dist_image_count = s->sync_image_count;
 }
 
 #ifndef DS4_NO_GPU
@@ -67022,6 +67072,8 @@ static int ds4_session_load_payload_unmetered(ds4_session *s, FILE *fp, uint64_t
         return 1;
     }
     if (s->distributed) {
+        /* The loaded timeline did not come from the last sync. */
+        ds4_session_dist_images_free(s);
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
     uint64_t remaining = payload_bytes;
@@ -78009,6 +78061,7 @@ void ds4_session_free(ds4_session *s) {
     session_anchors_clear(s);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
+    ds4_session_dist_images_free(s);
     free(s->logits);
     free(s->sample_probs);
 #ifndef DS4_NO_GPU
@@ -79096,6 +79149,28 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     ds4_session_dspark_capture_note_checkpoint(s);
 }
 
+#ifndef DS4_NO_GPU
+/* The replay began with a reset, which forgot the checkpoint's image
+ * identities; record each image again once its rows are back in the KV. */
+static bool ds4_session_dist_images_replayed(ds4_session *s, uint32_t pos0, uint32_t n_tokens) {
+    for (size_t i = 0; i < s->dist_image_count; i++) {
+        const ds4_vision_span *span = &s->dist_images[i];
+        const uint64_t end = (uint64_t)span->token_start + span->embedding.token_count;
+        if (span->token_start < pos0 || end > (uint64_t)pos0 + n_tokens) continue;
+        const size_t n = s->checkpoint_image_count;
+        if (n && s->checkpoint_images[n - 1].token_start >= span->token_start) continue;
+        ds4_vision_identity *grown = realloc(s->checkpoint_images, (n + 1) * sizeof(grown[0]));
+        if (!grown) return false;
+        grown[n].token_start = span->token_start;
+        grown[n].token_count = span->embedding.token_count;
+        memcpy(grown[n].fingerprint, span->embedding.fingerprint, sizeof(grown[n].fingerprint));
+        s->checkpoint_images = grown;
+        s->checkpoint_image_count = n + 1;
+    }
+    return true;
+}
+#endif
+
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -79522,6 +79597,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             }
         }
     }
+    /* Image rows outside a multimodal sync: a decode-time replay. */
+    const bool replay_images = g->prefill_has_visual && !input_hc &&
+                               !g->prefill_vision_spans && s->dist_image_count != 0;
+    if (replay_images) {
+        g->prefill_vision_spans = s->dist_images;
+        g->prefill_vision_span_count = s->dist_image_count;
+    }
 
     bool ok = true;
     bool missing_image_embedding = false;
@@ -79549,6 +79631,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                      &span,
                                                      0,
                                                      n_tokens);
+    }
+    if (replay_images) {
+        g->prefill_vision_spans = NULL;
+        g->prefill_vision_span_count = 0;
     }
 
     ds4_gpu_tensor *last_hc = NULL;
@@ -79642,6 +79728,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     }
 
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    if (replay_images && !ds4_session_dist_images_replayed(s, pos0, n_tokens)) {
+        if (errlen) snprintf(err, errlen, "unable to retain image prompt identity");
+        ds4_session_invalidate(s);
+        return 1;
+    }
     return 0;
 #endif
 }
@@ -80090,6 +80181,7 @@ static int ds4_session_sync_unmetered(ds4_session *s, const ds4_tokens *prompt,
         snprintf(err, errlen, "unable to retain image prompt identity");
         return 1;
     }
+    if (rc == 0) ds4_session_dist_images_retain(s);
     return rc;
 }
 
