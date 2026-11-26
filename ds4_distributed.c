@@ -6951,7 +6951,8 @@ int ds4_dist_session_dspark_cycle(
         return 1;
     }
     const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
-    const double t0 = spec_log ? dist_now_sec() : 0.0;
+    /* The gate below measures from t0; only the phase stamps are for the log. */
+    const double t0 = dist_now_sec();
     const int fd = d->plan.entry[0].fd;
     block[0] = seed;
 
