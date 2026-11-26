@@ -14192,6 +14192,7 @@ static void *decode_worker_main(void *arg) {
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
     int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
     int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
+    int *member_rc = xmalloc((size_t)s->slot_count * sizeof(*member_rc));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
@@ -14246,8 +14247,10 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        int rc = plain_count ? ds4_sessions_eval_batch(items, plain_count,
+        int rc = plain_count ? ds4_sessions_eval_batch_members(items, plain_count, member_rc,
                                          batch_err, sizeof(batch_err)) : 0;
+        /* A failed plain batch says which of its members still advanced. */
+        const bool plain_failed = rc != 0;
         for (int i = 0; i < plain_count; i++) {
             accepted[i][0] = items[i].token;
             n_accepted[i] = 1;
@@ -14255,8 +14258,10 @@ static void *decode_worker_main(void *arg) {
         if (rc == 0 && count > plain_count)
             rc = ds4_sessions_eval_batch_speculative_argmax(items + plain_count, count - plain_count,
                     accepted + plain_count, n_accepted + plain_count, batch_err, sizeof(batch_err));
-        if (rc != 0)
-            for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+        for (int i = 0; i < count; i++) {
+            if (!(plain_failed && i < plain_count)) member_rc[i] = rc;
+            if (member_rc[i] != 0) ds4_session_invalidate(items[i].session);
+        }
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
@@ -14270,12 +14275,12 @@ static void *decode_worker_main(void *arg) {
         for (int i = 0; i < count; i++) {
             server_slot *slot = members[i];
             slot->decode_in_flight = false;
-            slot->decode_rc = rc;
-            if (rc == 0) {
+            slot->decode_rc = member_rc[i];
+            if (member_rc[i] == 0) {
                 slot->decode_accepted_count = n_accepted[i];
                 memcpy(slot->decode_accepted, accepted[i], (size_t)n_accepted[i] * sizeof(int));
             }
-            if (rc != 0) {
+            if (member_rc[i] != 0) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
                          batch_err[0] ? batch_err : "batched decode failed");
             }
@@ -14288,6 +14293,7 @@ static void *decode_worker_main(void *arg) {
     free(items);
     free(accepted);
     free(n_accepted);
+    free(member_rc);
     return NULL;
 }
 

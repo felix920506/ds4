@@ -146,6 +146,7 @@ typedef struct {
     const ds4_tokens *checkpoint;
     int token;
     float *logits;
+    int rc;     /* out: 0 when this member decoded (directly or by replay) */
 } ds4_dist_decode_item;
 
 int ds4_dist_sessions_eval(

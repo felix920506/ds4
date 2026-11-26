@@ -6632,10 +6632,12 @@ int ds4_dist_sessions_eval(
         if (errlen) snprintf(err, errlen, "empty distributed decode batch");
         return 1;
     }
+    for (int i = 0; i < count; i++) items[i].rc = 1;
     if (count == 1) {
-        return ds4_dist_session_eval(items[0].dist, items[0].owner,
-                                     items[0].checkpoint, items[0].token,
-                                     items[0].logits, err, errlen);
+        items[0].rc = ds4_dist_session_eval(items[0].dist, items[0].owner,
+                                            items[0].checkpoint, items[0].token,
+                                            items[0].logits, err, errlen);
+        return items[0].rc;
     }
 
     ds4_dist_coordinator_state *state = &items[0].dist->coord->state;
@@ -6714,6 +6716,7 @@ int ds4_dist_sessions_eval(
         }
     }
 
+    for (int i = 0; i < count; i++) items[i].rc = members[i].rc != 0;
     free(hidden);
     free(members);
     if (failed) {
