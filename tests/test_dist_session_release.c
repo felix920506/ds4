@@ -6,7 +6,8 @@
  * --max-sessions budget.  This test drives the real coordinator broadcast and
  * the real worker frame handler over socketpairs, with placeholder sessions so
  * no model or GPU is needed; it also pins the widened session-id sequence,
- * and which registration a failed route forgets.
+ * which registration a failed route forgets, and when a decode batch has
+ * spent its wait for a missing stage.
  */
 #include "../ds4_distributed.c"
 
@@ -224,41 +225,79 @@ static void test_release_backpressure(uint64_t id) {
 /* A failed route forgets the workers it was built from, matched by endpoint.
  * A worker that registered after the plan was built has come back, possibly
  * already holding a session another batch member just replayed, and must be
- * left alone even at the same endpoint. */
+ * left alone even at the same endpoint.  The workers register and the plans
+ * are built through the coordinator's own functions, so the generation a
+ * registration records is the one a plan reports. */
+static void register_test_worker(ds4_dist_coordinator_state *state) {
+    ds4_dist_hello_fixed hello;
+    memset(&hello, 0, sizeof(hello));
+    hello.layer_start = 2;
+    hello.layer_end = 3;
+    hello.has_output = 1;
+    hello.n_layers = 4;
+    hello.listen_port = 9912;
+    dist_coordinator_add_worker(state, -1, "10.0.0.2", "40000", &hello, "test");
+}
+
 static void test_forget_only_older_registrations(void) {
     ds4_dist_coordinator_state state;
     memset(&state, 0, sizeof(state));
     pthread_mutex_init(&state.mu, NULL);
-    ds4_dist_worker_entry *worker = calloc(1, sizeof(*worker));
-    assert(worker);
-    worker->fd = -1;
-    snprintf(worker->peer_host, sizeof(worker->peer_host), "10.0.0.2");
-    worker->listen_port = 9912;
-    worker->layer_start = 2;
-    worker->layer_end = 3;
-    worker->has_output = 1;
-    worker->registered_generation = 5;
-    state.workers = worker;
-    state.generation = 5;
+    state.n_layers = 4;
+    state.local_end = 1;  /* the worker serves layers 2..3 and the output */
 
-    ds4_dist_route_entry route;
-    memset(&route, 0, sizeof(route));
-    route.fd = -1;
-    snprintf(route.host, sizeof(route.host), "10.0.0.2");
-    route.port = 9912;
-    route.layer_start = 2;
-    route.layer_end = 3;
-    route.flags = DS4_DIST_ROUTE_F_OUTPUT_LOGITS;
+    register_test_worker(&state);
+    assert(state.workers && state.generation == 1);
+    assert(state.workers->registered_generation == 1);
     ds4_dist_route_plan plan;
-    memset(&plan, 0, sizeof(plan));
-    plan.entry = &route;
-    plan.count = 1;
+    uint64_t plan_generation = 0;
+    char err[128] = {0};
+    assert(dist_coordinator_build_route_plan(&state, &plan, &plan_generation, NULL,
+                                             err, sizeof(err)));
+    assert(plan.count == 1 && plan_generation == 1);
 
-    dist_coordinator_forget_route_workers(&state, &plan, 4);
-    assert(state.workers == worker && state.generation == 5);
-    dist_coordinator_forget_route_workers(&state, &plan, 5);
-    assert(state.workers == NULL && state.generation == 6);
+    /* The worker dials back in at the same endpoint: the stale entry is
+     * replaced, and the new one is not the one the plan was built from. */
+    register_test_worker(&state);
+    ds4_dist_worker_entry *back = state.workers;
+    assert(back && !back->next && state.generation == 2);
+    assert(back->registered_generation == 2);
+    dist_coordinator_forget_route_workers(&state, &plan, plan_generation);
+    assert(state.workers == back && state.generation == 2);
+    dist_route_plan_free(&plan);
+
+    /* A plan built from the new registration does forget it. */
+    assert(dist_coordinator_build_route_plan(&state, &plan, &plan_generation, NULL,
+                                             err, sizeof(err)));
+    assert(plan_generation == 2);
+    dist_coordinator_forget_route_workers(&state, &plan, plan_generation);
+    assert(state.workers == NULL && state.generation == 3);
+    dist_route_plan_free(&plan);
     pthread_mutex_destroy(&state.mu);
+}
+
+/* A decode batch waits for a missing stage once: a member's failure spends
+ * that wait only if its own route wait ran out, not when it failed at once
+ * (a worker-side error, a dead socket, an interrupted wait). */
+static void test_batch_route_wait_spent(void) {
+    ds4_dist_coordinator coord;
+    memset(&coord, 0, sizeof(coord));
+    pthread_mutex_init(&coord.state.mu, NULL);
+    coord.state.n_layers = 4;
+    coord.state.local_end = 1;
+    ds4_dist_session d;
+    memset(&d, 0, sizeof(d));
+    d.coord = &coord;
+
+    const double waited = dist_now_sec() - DS4_DIST_ROUTE_WAIT_SEC;
+    assert(!dist_batch_route_wait_spent(&d, dist_now_sec()));
+    assert(dist_batch_route_wait_spent(&d, waited));
+
+    register_test_worker(&coord.state);
+    assert(!dist_batch_route_wait_spent(&d, waited));
+
+    dist_worker_entry_free(coord.state.workers);
+    pthread_mutex_destroy(&coord.state.mu);
 }
 
 int main(void) {
@@ -271,6 +310,7 @@ int main(void) {
                              UINT64_C(0xabc000000004));
     test_release_backpressure(UINT64_C(0xabc000000005));
     test_forget_only_older_registrations();
+    test_batch_route_wait_spent();
     fprintf(stderr, "test_dist_session_release PASS\n");
     return 0;
 }

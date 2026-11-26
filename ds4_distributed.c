@@ -6620,6 +6620,16 @@ static int dist_batch_recover_member(
     return rc;
 }
 
+/* Whether a batch member that failed after starting at t0 has used up the
+ * batch's wait for a missing stage: the route is still incomplete and the
+ * attempt took a whole DS4_DIST_ROUTE_WAIT_SEC, so its route wait ran out.
+ * A member that failed sooner (a worker-side error, a dead socket, an
+ * interrupted wait) has not waited, and leaves the wait to the next one. */
+static bool dist_batch_route_wait_spent(ds4_dist_session *d, double t0) {
+    return dist_now_sec() - t0 >= DS4_DIST_ROUTE_WAIT_SEC &&
+           ds4_dist_session_route_ready(d, NULL, 0) == 0;
+}
+
 /* One decode step across several coordinator sessions at once.
  *
  * A distributed decode is a local layer slice on this GPU and then a wait on
@@ -6680,15 +6690,32 @@ int ds4_dist_sessions_eval(
     char report_err[256];
     report_err[0] = '\0';
     int failed = 0;
+    /* The batch waits for a missing stage once.  After one member's route
+     * wait has run out, a later member whose route is still incomplete fails
+     * without a wait of its own, in the submit pass and in the recovery pass:
+     * it would wait as long again and fail the same way. */
+    bool route_wait_spent = false;
 
     for (int i = 0; i < count; i++) {
+        if (route_wait_spent && ds4_dist_session_route_ready(items[i].dist, NULL, 0) == 0) {
+            members[i].pos0 = (uint32_t)items[i].checkpoint->len;
+            members[i].rc = 1;
+            failed++;
+            continue;
+        }
         char member_err[256];
         member_err[0] = '\0';
+        const double t0 = dist_now_sec();
         members[i].rc = dist_batch_submit_member(state, &items[i], &members[i],
                                                  hidden, hidden_bytes,
                                                  member_err, sizeof(member_err));
-        if (members[i].rc != 0 && !failed++) {
-            snprintf(report_err, sizeof(report_err), "%s", member_err);
+        if (members[i].rc != 0) {
+            if (!failed++) snprintf(report_err, sizeof(report_err), "%s", member_err);
+            if (dist_batch_route_wait_spent(items[i].dist, t0)) {
+                /* The reason the batch cannot be salvaged. */
+                snprintf(report_err, sizeof(report_err), "%s", member_err);
+                route_wait_spent = true;
+            }
         }
     }
 
@@ -6713,18 +6740,19 @@ int ds4_dist_sessions_eval(
 
     for (int i = 0; i < count && failed; i++) {
         if (members[i].rc == 0) continue;
+        if (route_wait_spent && ds4_dist_session_route_ready(items[i].dist, NULL, 0) == 0) {
+            continue;
+        }
         char member_err[256];
         member_err[0] = '\0';
+        const double t0 = dist_now_sec();
         if (dist_batch_recover_member(state, &items[i], &members[i],
                                       member_err, sizeof(member_err)) == 0) {
             members[i].rc = 0;
             failed--;
         } else {
             snprintf(report_err, sizeof(report_err), "%s", member_err);
-            /* With the route still incomplete this recovery has just waited out
-             * DS4_DIST_ROUTE_WAIT_SEC; every later member would wait as long
-             * again and fail the same way. */
-            if (ds4_dist_session_route_ready(items[i].dist, NULL, 0) == 0) break;
+            if (dist_batch_route_wait_spent(items[i].dist, t0)) route_wait_spent = true;
         }
     }
 
