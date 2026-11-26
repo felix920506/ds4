@@ -77241,6 +77241,12 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The backend keeps the handler in process globals.  Its user state may
+     * go with this engine, and an engine opened next must not reach it from
+     * its own allocations, or from anything this close still allocates. */
+    if (e->memory_pressure.fn) ds4_gpu_set_memory_pressure_handler(NULL, NULL);
+#endif
     ds4_dist_coordinator_close(e->dist_coordinator);
     e->dist_coordinator = NULL;
     ds4_engine_tp_unbind(e);
