@@ -2,6 +2,8 @@
  * also runs speculative rollback through the real pooled-indexer kernel. */
 #include "../ds4.c"
 #include <assert.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static void test_vision_prefix(void) {
     ds4_session *s = calloc(1, sizeof(*s));
@@ -915,7 +917,57 @@ static void test_dspark_tp_split_reserve(void) {
     g_ds4_shape = saved_shape;
 }
 
+/* The capacity of a token vector doubles without signed overflow: it saturates
+ * at INT_MAX (a prompt of 2^30 tokens, 2 GiB of text, used to overflow it) and
+ * refuses to grow past that. */
+static void test_token_vec_capacity(void) {
+    assert(token_vec_grow_capacity(0) == 64);
+    assert(token_vec_grow_capacity(64) == 128);
+    assert(token_vec_grow_capacity(1 << 29) == 1 << 30);
+    assert(token_vec_grow_capacity(INT_MAX / 2) == INT_MAX - 1);
+    assert(token_vec_grow_capacity(INT_MAX / 2 + 1) == INT_MAX);
+    assert(token_vec_grow_capacity(1 << 30) == INT_MAX);
+    assert(token_vec_grow_capacity(INT_MAX - 1) == INT_MAX);
+    assert(token_vec_grow_capacity(INT_MAX) == 0);
+
+    token_vec tv = {0};
+    for (int i = 0; i < 1000; i++) token_vec_push(&tv, i);
+    assert(tv.len == 1000 && tv.cap == 1024);
+    for (int i = 0; i < 1000; i++) assert(tv.v[i] == i);
+    token_vec_free(&tv);
+
+    /* A push into a full vector of INT_MAX tokens must take the refusal, not
+     * double the capacity: the old doubling overflows there and dies with
+     * "out of memory" instead.  The refusal exits, so run it in a child. */
+    int fds[2];
+    int rc = pipe(fds);
+    assert(rc == 0);
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dup2(fds[1], STDERR_FILENO);
+        token_vec full = {.v = xmalloc(sizeof(int)), .len = INT_MAX, .cap = INT_MAX};
+        token_vec_push(&full, 1);
+        _exit(0);
+    }
+    close(fds[1]);
+    char msg[128] = "";
+    size_t got = 0;
+    ssize_t r;
+    while (got < sizeof(msg) - 1 &&
+           (r = read(fds[0], msg + got, sizeof(msg) - 1 - got)) > 0) got += (size_t)r;
+    close(fds[0]);
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    assert(waited == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+    assert(strstr(msg, "token vector too large") != NULL);
+}
+
 int main(void) {
+    test_token_vec_capacity();
     test_dspark_tp_verify_flags();
     test_dspark_tp_split_reserve();
     test_vision_prefix();
