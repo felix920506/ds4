@@ -443,6 +443,16 @@ static char *json_minify_raw_value(const char *json) {
  * it is far above what any real context window holds. */
 #define SERVER_MAX_IMAGES 4096
 
+/* The tokenizers cannot fail a request: a token vector that would pass
+ * INT_MAX entries ends the process.  Every text token consumes at least one
+ * byte of the rendered prompt, so bounding the bytes before tokenizing bounds
+ * the tokens.  2^30 bytes leaves INT_MAX - 2^30 for what joins them: the image
+ * blocks (SERVER_MAX_IMAGES of at most 16383 tokens) and the live or disk
+ * cached prefix of at most one context (2^20 tokens) that the reuse paths put
+ * in front of a suffix of this text.  A prompt that fits a 2^20-token context
+ * would need more than 1 KiB per token to reach the bound. */
+#define SERVER_MAX_PROMPT_BYTES ((size_t)1 << 30)
+
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
     uint8_t *encoded;
@@ -3671,10 +3681,19 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static bool request_prompt_text_fits(const request *r, char *err, size_t errlen) {
+    if (!r->prompt_text || strlen(r->prompt_text) <= SERVER_MAX_PROMPT_BYTES)
+        return true;
+    snprintf(err, errlen, "prompt too large; the rendered prompt may have at most %zu bytes",
+             SERVER_MAX_PROMPT_BYTES);
+    return false;
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
                                                char *err, size_t errlen) {
+    if (!request_prompt_text_fits(r, err, errlen)) return false;
     size_t count = 0;
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
@@ -5756,8 +5775,12 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     chat_msgs_push(&msgs, user_msg);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, NULL, NULL, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
+    if (!request_prompt_text_fits(r, err, errlen)) {
+        request_free(r);
+        return false;
+    }
+    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
 bad:
@@ -25634,6 +25657,40 @@ static void test_image_count_ceiling(void) {
     TEST_ASSERT(key.offsets == NULL && key.count == 0);
 }
 
+/* A rendered prompt past SERVER_MAX_PROMPT_BYTES is a 400 before anything
+ * tokenizes it (with no engine the tokenizer would crash) or encodes its
+ * images; one of exactly the bound passes. */
+static void test_prompt_byte_ceiling(void) {
+    const size_t n = SERVER_MAX_PROMPT_BYTES + 1;
+    char *text = malloc(n + 1);
+    TEST_ASSERT(text != NULL);
+    if (!text) return;
+    memset(text, 'a', n);
+    text[n] = '\0';
+    chat_msg user = {.role = "user", .content = "x"};
+    user.images.len = 1;
+    chat_msgs msgs = {.v = &user, .len = 1};
+    for (int images = 0; images < 2; images++) {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.prompt_text = text;
+        char err[256] = "";
+        TEST_ASSERT(!request_tokenize_multimodal_prompt(NULL, NULL, &r,
+                                                        images ? &msgs : NULL,
+                                                        err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "prompt too large") != NULL);
+        TEST_ASSERT(r.prompt.len == 0 && r.image_count == 0);
+        r.prompt_text = NULL;
+        request_free(&r);
+    }
+    request r = {.prompt_text = text};
+    char err[256] = "";
+    TEST_ASSERT(!request_prompt_text_fits(&r, err, sizeof(err)));
+    text[SERVER_MAX_PROMPT_BYTES] = '\0';
+    TEST_ASSERT(request_prompt_text_fits(&r, err, sizeof(err)));
+    free(text);
+}
+
 static void write_all_fd(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t w = write(fd, p, n);
@@ -26161,6 +26218,7 @@ static void ds4_server_unit_tests_run(void) {
     test_visible_image_key();
     test_kv_cache_image_identity();
     test_image_count_ceiling();
+    test_prompt_byte_ceiling();
     test_http_body_limits();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
