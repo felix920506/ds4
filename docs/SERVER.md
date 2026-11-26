@@ -126,7 +126,7 @@ data URIs. Anthropic accepts base64 image sources of the same types. Formats
 and variants the built-in PNG/JPEG decoder cannot read (16-bit or interlaced
 PNG, CMYK JPEG, and every type other than PNG and JPEG) are decoded by
 ImageMagick when it is installed; otherwise the request fails with an error
-naming the reason. See `DS4_IMAGE_DECODER` in the [README](../README.md). Remote URLs and server-side file paths are rejected.
+naming the reason. Remote URLs and server-side file paths are rejected.
 Image blocks preserve their order in the request. A request is rejected when
 its tokens, image blocks included, do not fit the context window; the only
 other limit is a ceiling of 4096 images per request, far above what any
@@ -135,6 +135,18 @@ images it never sends. The HTTP body is limited to 4 GiB, so long sessions
 that replay their full screenshot history each turn fit. The body buffer grows
 as bytes arrive, so a client that advertises a large Content-Length without
 sending the body does not reserve that memory.
+
+The ImageMagick fallback is controlled by the `DS4_IMAGE_DECODER` environment
+variable of the server process. Unset or empty, the server looks for `magick`
+(ImageMagick 7) and then `convert` (ImageMagick 6) in `PATH`. A value
+containing a `/` is used as the program path, any other value as a program name
+looked up in `PATH`, and a name that is not found leaves no fallback. The
+program has to accept ImageMagick's command line. The values `off`, `none` and
+`0` disable the fallback, leaving only the built-in PNG and JPEG decoders.
+
+Each image is also limited on its own, with or without the fallback: 64 MiB
+encoded, 16384 pixels on a side and 64 Mi (67,108,864) pixels in all. The
+fallback process is cut off after 60 seconds.
 
 ## Live KV reuse and rewind
 
@@ -152,8 +164,8 @@ rewind instead of starting over. While it generates, the server keeps a rewind
 anchor at the start of each reply and every 256 tokens inside it; an anchor is
 a copy of the small part of the state that later tokens overwrite (about
 22 MiB for Flash, whatever the context length). The session returns to the
-nearest anchor below the point where the request diverges and evaluates the
-rest:
+nearest anchor at or before the point where the request diverges and
+evaluates the rest:
 
 ```
 ds4-server: live kv rewind live=195170 prompt=200550 common=192692 anchor=192512: keeping 192512 tokens, re-evaluating 180 that still match

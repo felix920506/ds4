@@ -33,9 +33,36 @@ same time.
   loading reads the whole model, and evicted experts are read back from it.
 - **One ds4 process per machine.** Two model processes on one unified memory
   machine can exhaust memory badly enough to panic the kernel. ds4 refuses to
-  start a second instance through a lock file; the compose files share that
-  lock file through `/tmp/ds4-lock` on the host, so it also covers containers.
-  Stop the server before running a benchmark or the CLI on the same machine.
+  start a second instance through the lock file `/tmp/ds4-lock/ds4.lock`. The
+  compose files mount the host's `/tmp/ds4-lock` at the same path, so a
+  compose container and a natively started `ds4`, `ds4-server` or `ds4-bench`
+  refuse each other. A container started with plain `docker run` has its own
+  `/tmp` and is only covered when it also gets
+  `-v /tmp/ds4-lock:/tmp/ds4-lock`. The compose files also set
+  `DS4_LOCK_FILE=/tmp/ds4-lock/ds4.lock`, so an image built before the lock
+  moved there still shares it. Pointing `DS4_LOCK_FILE` anywhere but
+  `/tmp/ds4-lock/ds4.lock` takes that process out of this sharing. Stop the
+  server before running a benchmark or the CLI on the same machine.
+
+  Because `/tmp` is shared with every local user, ds4 only uses a lock
+  directory owned by root or by the user running it (and sticky if others can
+  write to it), and it never follows a symlink there. A directory named by
+  `DS4_LOCK_FILE` gets the same ownership and mode check (a group-writable
+  directory that is not sticky is refused). A root process (the
+  compose containers) only accepts a root-owned directory. The directory works
+  for root and for every user when root creates it with mode 1777, for
+  example at boot with the systemd-tmpfiles line
+  `d /tmp/ds4-lock 1777 root root -` in `/etc/tmpfiles.d/ds4.conf`. Without
+  that:
+  - if a compose container starts first, Docker creates the directory as
+    `root 0755` and the container creates the lock file; native processes can
+    lock that file afterwards, but not create it if it is removed;
+  - if a native process starts first, ds4 creates the directory owned by that
+    user, and compose containers then refuse to start (`refusing to use lock
+    directory /tmp/ds4-lock`) until it is removed or recreated as root.
+
+  When ds4 refuses the default directory or lock file, stop every ds4, then run
+  `sudo rm -r /tmp/ds4-lock` and `sudo install -d -m 1777 /tmp/ds4-lock`.
 
 ## One machine
 
@@ -100,9 +127,37 @@ What it sets:
 requests still run, but disk KV checkpoints are skipped with
 `distributed KV shards use different layouts`.
 
-The link between the stages has no authentication or encryption: keep it on
-a trusted network, or a direct cable. 2.5 GbE is enough for the throughput in
-the [README](../README.md#performance); the wire is a small part of each step.
+The stages use two kinds of TCP connection, and a firewall between the
+machines has to allow both:
+
+- Control: the worker dials the coordinator on `COORDINATOR_IP`, port
+  `DS4_DIST_PORT` (9911).
+- Data: the worker opens a second listener, on every interface, and tells the
+  coordinator its port when it registers (`data_listen=*:PORT` in the worker's
+  log). Unless the worker is given `--listen HOST PORT` the system picks the
+  port, a new one at every worker start. The coordinator opens its data
+  connections to that port, at the address the worker's control connection came
+  from. Allowing only port 9911 between the hosts therefore stops the
+  pipeline.
+
+To use a fixed data port, add `--listen` to the worker service's `command` in
+`compose.yaml`, with the worker's address on the link (the address the
+coordinator sees the control connection from) and a port:
+
+```yaml
+      - --listen
+      - 192.168.1.11
+      - "9912"
+```
+
+The data listener accepts work, snapshot and release frames from any peer that
+connects, with no handshake, and binds every interface unless `--listen` names
+one. Neither connection has authentication or encryption: keep the link on a
+trusted network, or a direct cable, and do not expose the worker's data port to
+other networks (the compose file uses host networking).
+
+2.5 GbE is enough for the throughput in the
+[README](../README.md#performance); the wire is a small part of each step.
 
 If the worker restarts, the coordinator holds requests for up to 120 seconds
 while it comes back, then replays the interrupted conversations into it. For everything

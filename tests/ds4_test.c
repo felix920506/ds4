@@ -5,9 +5,6 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include "../ds4_image.h"
-#ifdef DS4_ROCM_BUILD
-#include "../ds4_linux_memory.h"
-#endif
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
@@ -5330,21 +5327,26 @@ static bool test_logits_identical(ds4_engine *engine, ds4_session *a, ds4_sessio
 }
 
 #ifdef DS4_ROCM_BUILD
-/* Host memory still allocatable: on a unified-memory device every GPU buffer
- * is pinned host memory, and unlike the kfd counters this works in a container. */
-static uint64_t test_rocm_free_bytes(void) {
-    uint64_t bytes = 0;
-    TEST_ASSERT(ds4_linux_nonmovable_memory(&bytes));
-    return bytes;
-}
-
 /* On-demand context memory: a session whose compressed caches start at four
  * rows and grow while it decodes must produce exactly the logits of a session
  * allocated up front, through checkpoints exchanged in both directions and a
  * reset, while holding a fraction of the memory. */
 static void test_rocm_context_growth(void) {
+    /* Bit-identical logits need both sessions to run the same kernels.  A
+     * small prefill batch runs the F16 GEMM for weights the Q8->F16 cache
+     * holds at that moment and the Q8 kernels for the rest, which round
+     * differently (docs/STRIX_HALO.md: that reclaim step "changes which
+     * kernels small batches run").  The cache follows free memory, which this
+     * test drives to its budget, so two syncs of one prompt need not find the
+     * same cache.  Keep it empty: what this test checks is context memory. */
+    char *saved_no_f16 = test_save_env("DS4_CUDA_NO_Q8_F16_CACHE");
+    setenv("DS4_CUDA_NO_Q8_F16_CACHE", "1", 1);
     ds4_engine *engine = test_get_engine(false);
-    if (!engine) return;
+    if (!engine) {
+        test_restore_env("DS4_CUDA_NO_Q8_F16_CACHE", saved_no_f16);
+        return;
+    }
+    ds4_gpu_release_q8_f16_cache();
     enum { CTX = 262144, STEPS = 96 };
     const uint64_t gib = 1ull << 30;
     ds4_session *upfront = NULL, *grown = NULL;
@@ -5352,21 +5354,26 @@ static void test_rocm_context_growth(void) {
     ds4_tokens prompt = {0};
     char err[192] = {0};
 
-    const uint64_t free0 = test_rocm_free_bytes();
     setenv("DS4_ROCM_KV_UPFRONT", "1", 1);
     TEST_ASSERT(ds4_session_create(&upfront, engine, CTX) == 0);
     unsetenv("DS4_ROCM_KV_UPFRONT");
-    const uint64_t free1 = test_rocm_free_bytes();
     setenv("DS4_ROCM_KV_MIN_ROWS", "4", 1);
     TEST_ASSERT(ds4_session_create(&grown, engine, CTX) == 0);
-    const uint64_t free2 = test_rocm_free_bytes();
+    /* Sizes the engine accounts for.  Host free memory is no measure: the
+     * reclaim chain, CMA placement and other processes move it while a
+     * session is created.  The two sessions differ only in the tensors that
+     * grow on demand; the on-demand session reports what it committed of
+     * them, an up-front one reports 0 and holds the whole reservation, the
+     * estimate.  Its compressed caches and indexer scratch are 5.5 GiB. */
+    const ds4_context_memory full = ds4_context_memory_estimate_with_prefill(
+            test_model_backend(), CTX, (uint32_t)ds4_session_prefill_cap(upfront));
+    const uint64_t grown_bytes = ds4_session_context_memory_bytes(grown);
     if (!upfront || !grown) goto cleanup;
-    /* The compressed caches and indexer scratch of this context are 5.5 GiB. */
-    fprintf(stderr, "ds4-test: context growth: up-front session %.2f GiB, "
+    fprintf(stderr, "ds4-test: context growth: up-front reservation %.2f GiB, "
             "on-demand session %.2f GiB\n",
-            (double)(free0 - free1) / (double)gib, (double)(free1 - free2) / (double)gib);
-    TEST_ASSERT(free0 > free1 && free1 > free2 &&
-                free0 - free1 > free1 - free2 + 4 * gib);
+            (double)full.total_bytes / (double)gib, (double)grown_bytes / (double)gib);
+    TEST_ASSERT(ds4_session_context_memory_bytes(upfront) == 0);
+    TEST_ASSERT(grown_bytes != 0 && grown_bytes + 4 * gib < full.total_bytes);
 
     ds4_chat_begin(engine, &prompt);
     ds4_chat_append_message(engine, &prompt, "user",
@@ -5412,6 +5419,7 @@ cleanup:
     ds4_tokens_free(&prompt);
     ds4_session_free(grown);
     ds4_session_free(upfront);
+    test_restore_env("DS4_CUDA_NO_Q8_F16_CACHE", saved_no_f16);
 }
 #endif
 
@@ -5572,6 +5580,8 @@ static void test_session_anchor_rewind(void) {
             (double)(t2.tv_sec - t1.tv_sec) * 1e3 + (double)(t2.tv_nsec - t1.tv_nsec) / 1e6);
     TEST_ASSERT(ds4_session_pos(detour) == ANCHOR);
     TEST_ASSERT(ds4_session_anchor_floor(detour, CTX) == ANCHOR);
+    /* The anchor's logits came back with it: nothing is evaluated yet. */
+    TEST_ASSERT(test_logits_identical(engine, detour, straight));
 
     /* The real continuation, decoded: crosses windows of both ratios. */
     for (int i = 0; i < STEPS; i++) {

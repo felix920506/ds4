@@ -467,6 +467,8 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * usable, but a partial layer-major pass is invalidated and the next sync
  * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+/* Distributed code: true when the installed cancel callback asks to stop. */
+bool ds4_session_cancelled(ds4_session *s);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* A pipelined distributed prefill runs the coordinator's layers ahead of the
  * stages behind it, and only its last chunk returns logits.  While it is under
@@ -575,8 +577,8 @@ bool ds4_session_payload_restores_vision(const ds4_session *s);
  *   that a bounded number covers the history, densest near the frontier.
  * floor: position of the newest usable anchor at or below pos, or -1.
  * rewind: return to the anchor at exactly pos, a value floor returned.  The
- *   checkpoint keeps its first pos tokens and the images wholly inside them;
- *   logits are stale until the next token is evaluated.  False means the
+ *   checkpoint keeps its first pos tokens and the images wholly inside them,
+ *   and the logits are those the session had at pos.  False means the
  *   state could not be restored; the checkpoint is then left as it was or
  *   invalidated, and the caller rebuilds as it would without anchors. */
 bool ds4_session_anchor_save(ds4_session *s);
@@ -660,6 +662,12 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* The same; when it fails, member_rc[i] says whether item i still advanced
+ * (0, with its token and logits as after a successful batch) or failed
+ * (nonzero: invalidated, rebuild it).  Backends that cannot tell members apart
+ * fail them all. */
+int ds4_sessions_eval_batch_members(ds4_decode_item *items, int count,
+                                    int *member_rc, char *err, size_t errlen);
 /* One speculative cycle for a batch of sessions (greedy acceptance, Qwen3.8
  * with --mtp): each item feeds its token; a pending draft rides along as a
  * second row and is committed when it is the target's argmax.  accepted[i]

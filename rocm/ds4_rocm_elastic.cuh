@@ -343,7 +343,8 @@ static int cuda_elastic_resize(cuda_elastic_layer &l, uint32_t new_slots) {
         l.block = NULL;
         parked = 1;
         if (!cuda_ok(cudaMalloc(&block, (size_t)new_bytes), "elastic expert block")) {
-            /* The layer is unusable now; launches fail instead of misrouting. */
+            /* No block until its next launch (cuda_elastic_restore_block). */
+            (void)cudaGetLastError();
             cuda_elastic_clear_slots(l, 0);
             return 0;
         }
@@ -475,7 +476,8 @@ static int cuda_elastic_shrink_in_place(cuda_elastic_layer &l) {
     void *block = NULL;
     if (!cuda_ok(cudaMalloc(&block, (size_t)cuda_elastic_block_bytes(l, slots)),
                  "elastic expert block")) {
-        /* The layer is unusable now; launches fail instead of misrouting. */
+        /* No block until its next launch (cuda_elastic_restore_block). */
+        (void)cudaGetLastError();
         cuda_elastic_clear_slots(l, 0);
         return 0;
     }
@@ -492,6 +494,50 @@ static int cuda_elastic_shrink_in_place(cuda_elastic_layer &l) {
     }
     /* Slots that could not be read stay empty and load on their first miss. */
     if (!cuda_elastic_read_jobs(jobs)) cuda_elastic_clear_slots(l, slots);
+    return 1;
+}
+
+static uint64_t cuda_elastic_max_table_bytes(void);
+
+/*
+ * Both shrinks above free a layer's block before they allocate the smaller
+ * one, and leave the layer without any when that allocation fails.  Its next
+ * launch allocates a minimum block again, every slot empty: they load on their
+ * first miss, as after a failed read.  Until it exists the launch fails
+ * instead of misrouting.
+ */
+static int cuda_elastic_restore_block(cuda_elastic_layer &l) {
+    void *block = NULL;
+    if (!cuda_ok(cudaMalloc(&block, (size_t)cuda_elastic_block_bytes(l, DS4_ROCM_ELASTIC_MIN_SLOTS)),
+                 "elastic expert block")) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    cuda_elastic_clear_slots(l, DS4_ROCM_ELASTIC_MIN_SLOTS);
+    l.block = (char *)block;
+    return 1;
+}
+
+/*
+ * A shrunk layer gathers its batches in the scratch block.  Reclaim normally
+ * takes it before it stops, but a reclaim that failed part way can leave
+ * shrunk layers without one, so the first batch that needs it allocates it.
+ * The caller has synchronized the device: a smaller scratch block may be
+ * replaced.
+ */
+static int cuda_elastic_ensure_scratch(const cuda_elastic_layer &l) {
+    const uint64_t need = cuda_elastic_block_bytes(l, l.t.n_total_expert);
+    if (g_elastic_scratch && g_elastic_scratch_bytes >= need) return 1;
+    const uint64_t bytes = std::max(cuda_elastic_max_table_bytes(), need);
+    void *scratch = NULL;
+    if (!cuda_ok(cudaMalloc(&scratch, (size_t)bytes), "elastic scratch block")) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (g_elastic_scratch) (void)cudaFree(g_elastic_scratch);
+    g_elastic_scratch = (char *)scratch;
+    g_elastic_scratch_bytes = bytes;
+    g_elastic_scratch_layer = -1;
     return 1;
 }
 
@@ -661,9 +707,8 @@ static int cuda_elastic_batch(
         const char **down_w) {
     const uint64_t n_ids = (uint64_t)n_tokens * n_expert;
     std::vector<int32_t> ids((size_t)n_ids);
-    if (!g_elastic_scratch ||
-        g_elastic_scratch_bytes < cuda_elastic_block_bytes(l, l.t.n_total_expert) ||
-        !cuda_elastic_read_selected(selected, ids.data(), n_ids, l.t.n_total_expert)) {
+    if (!cuda_elastic_read_selected(selected, ids.data(), n_ids, l.t.n_total_expert) ||
+        !cuda_elastic_ensure_scratch(l)) {
         return 0;
     }
     cuda_elastic_note_batch(l, ids.data(), n_ids);
@@ -757,7 +802,7 @@ static int cuda_elastic_apply(
     cuda_elastic_trace(*l, selected, n_tokens, n_expert);
     g_elastic_clock++;
     if (g_elastic_scratch) cuda_elastic_maybe_grow();
-    if (!l->block) return -1;
+    if (!l->block && !cuda_elastic_restore_block(*l)) return -1;
     if (cuda_elastic_full(*l)) {
         /* Resident layout.  Record which experts are in use so reclaim knows
          * the cold ones: every batch (one readback per layer and chunk), but
@@ -909,10 +954,12 @@ extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
         const int ok = g_elastic_scratch ?
             cuda_elastic_resize(*victim, cuda_elastic_next_slots(*victim, -1)) :
             cuda_elastic_take_scratch(*victim) || cuda_elastic_shrink_in_place(*victim);
+        /* Measured before the failure check: a failed shrink may already have
+         * freed the victim's table and left it without a block. */
+        now = cuda_elastic_resident_bytes();
         if (!ok) break;
         shrunk = 1;
         g_elastic_stats.shrinks++;
-        now = cuda_elastic_resident_bytes();
     }
     g_elastic_grow_checked = cuda_wall_sec();
     const uint64_t freed = before > now ? before - now : 0;
@@ -920,7 +967,8 @@ extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
         uint32_t min_slots = UINT32_MAX;
         uint32_t shrunk = 0;
         for (const cuda_elastic_layer &l : g_elastic_layers) {
-            if (!l.block) continue;
+            /* A layer left without a block has 0 slots and counts as shrunk. */
+            if (l.expert_bytes == 0) continue;
             min_slots = std::min(min_slots, l.slots);
             shrunk += !cuda_elastic_full(l);
         }

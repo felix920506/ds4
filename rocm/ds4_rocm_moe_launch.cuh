@@ -1331,9 +1331,9 @@ static int routed_moe_launch(
             /* gate and up are scratch here: the tile lists and the F16
              * activations.  mid receives the weighted SwiGLU as F16. */
             const uint64_t xh_count = (uint64_t)n_tokens * expert_in_dim;
-            token_tiles_done = routed_moe_token_tiles_build(
+            ok = routed_moe_token_tiles_build(
                     &token_tiles, (uint32_t *)gate->ptr, sorted_counts, pair_count, n_total_expert);
-            if (token_tiles_done) {
+            if (ok) {
                 f32_to_f16_kernel<<<(uint32_t)((xh_count + 255u) / 256u), 256>>>(
                         (half *)up->ptr, (const float *)x->ptr, xh_count);
                 DS4_ROCM_MOE_TILE_LAUNCH(
@@ -1341,7 +1341,8 @@ static int routed_moe_launch(
                         iq2_hot_mid_h, gate_w, up_w, (const half *)up->ptr, (const float *)weights->ptr,
                         sorted_pairs, expert_in_dim, expert_mid_dim, gate_expert_bytes,
                         (uint32_t)gate_row_bytes, n_expert, clamp);
-                token_tiles_done = cuda_ok(cudaGetLastError(), "routed_moe iq2 tile gate/up launch");
+                ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 tile gate/up launch");
+                token_tiles_done = ok;
             }
         } else if (ok && use_mxfp4_token_tiles && sorted_pairs && sorted_counts) {
             /* Buffers as in the IQ2 tiles above; the down tiles below read
@@ -1420,9 +1421,14 @@ static int routed_moe_launch(
             }
         }
         if (use_rocm_mmq_gateup && !mmq_gateup_done && !token_tiles_done) {
-            /* The fallback gate/up below writes F32 mid only. */
+            /* The fallback gate/up below writes F32 mid only, and reads the
+             * Q8_K x that was skipped above for the MMQ pair. */
             use_iq2_hot_f16_mid = 0;
             iq2_hot_mid_h = NULL;
+            if (ok) {
+                q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+                ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+            }
         }
         int split_gateup_done = 0;
         if (ok && split_selected) {

@@ -1613,9 +1613,12 @@ static double now_sec(void) {
  * Phases are measured at the public API, and only the outermost call on a
  * thread records.  ds4_session_sync_multimodal() ends in ds4_session_sync(),
  * the mixed prefill/decode batch can fall back to a sync plus a decode batch,
- * the speculative entry points fall back to plain eval, and payload staging
- * runs ds4_session_save_payload(): the thread-local depth keeps those inner
- * calls silent instead of counting the same wall time twice. */
+ * and the speculative entry points fall back to plain eval: the thread-local
+ * depth keeps those inner calls silent instead of counting the same wall time
+ * twice.  KV saves are the exception for calls and bytes: a continued
+ * checkpoint or a memory-pressure kick is written from inside a sync or an
+ * eval, and is still a payload written, so only its time stays with the
+ * enclosing phase. */
 static uint64_t g_metrics[DS4_METRIC_COUNT];
 static __thread int g_metrics_depth;
 
@@ -17413,6 +17416,7 @@ struct ds4_gpu_graph;
 typedef struct {
     ds4_gpu_tensor *tensor[2]; /* scores, top-k mask */
     struct ds4_gpu_graph *users;
+    bool resizing; /* metal_graph_kv_scratch_resize is under way */
 } ds4_kv_scratch;
 
 typedef struct ds4_gpu_graph {
@@ -18211,6 +18215,8 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     g->owns_prefill_workspace = false;
 }
 
+static bool metal_graph_kv_scratch_refit(ds4_gpu_graph *g);
+
 /* Detach g from a shared indexer scratch.  Returns whether g now owns the two
  * tensors and has to free them: it never shared them, or it was the last
  * session that did. */
@@ -18222,7 +18228,14 @@ static bool metal_graph_kv_scratch_leave(ds4_gpu_graph *g) {
         if (*u != g) continue;
         *u = g->kv_scratch_next;
         g->kv_scratch_next = NULL;
-        if (pool->users) return false;
+        if (pool->users) {
+            /* g may be what grew it (a server kicks idle sessions to free
+             * memory): the others keep only what they use.  The pressure
+             * handler can free g from inside an allocation of the scratch;
+             * that resize grows it past every user's need, so skip it. */
+            if (!pool->resizing) (void)metal_graph_kv_scratch_refit(pool->users);
+            return false;
+        }
         pool->tensor[0] = pool->tensor[1] = NULL;
         return true;
     }
@@ -18834,8 +18847,9 @@ static bool metal_graph_kv_admit(const ds4_gpu_graph *g, uint32_t ctx_size) {
 
 /* Replace *slot with a tensor of new_bytes that keeps the first keep_bytes.
  * With nothing to keep the old tensor is released first, so a scratch resize
- * never needs both sizes at once.  On failure the slot still holds a tensor
- * of the old size. */
+ * never needs both sizes at once.  On failure the slot holds a tensor of the
+ * old size, or NULL when there was none or the rollback allocation failed
+ * too; refits and a joining session rebuild it. */
 static bool metal_graph_kv_resize(
         ds4_gpu_graph   *g,
         ds4_gpu_tensor **slot,
@@ -18857,9 +18871,10 @@ static bool metal_graph_kv_resize(
     }
     ds4_gpu_tensor *t = NULL;
     if (keep_bytes == 0) {
+        const bool had_old = old != NULL;
         ds4_gpu_tensor_free(old);
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
-        *slot = t ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
+        *slot = t || !had_old ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
     } else {
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
         if (t && (ds4_gpu_tensor_copy(t, 0, old, 0, keep_bytes) == 0 ||
@@ -18912,8 +18927,10 @@ static bool metal_graph_kv_reserve_rows(
 static bool metal_graph_kv_scratch_resize(ds4_gpu_graph *g, int i, uint64_t bytes) {
     ds4_gpu_tensor **slot = i ? &g->comp_mask_by_tier[0]
                               : &g->indexer_scores_by_tier[0];
+    if (g->kv_scratch) g->kv_scratch->resizing = true;
     const bool ok = metal_graph_kv_resize(g, slot, bytes, 0, false);
     if (g->kv_scratch) {
+        g->kv_scratch->resizing = false;
         g->kv_scratch->tensor[i] = *slot;
         for (ds4_gpu_graph *u = g->kv_scratch->users; u; u = u->kv_scratch_next) {
             *(i ? &u->comp_mask_by_tier[0] : &u->indexer_scores_by_tier[0]) = *slot;
@@ -18944,23 +18961,41 @@ static bool metal_graph_kv_reserve_scratch(ds4_gpu_graph *g, uint64_t need_bytes
     return true;
 }
 
-/* Give the scratch back when a session is reset: down to the minimum, or to
- * what the other sessions sharing it still use. */
-static bool metal_graph_kv_scratch_refit(ds4_gpu_graph *g) {
+/* What a refit of g's scratch keeps: the minimum, or the most that a session
+ * sharing it other than skip still uses. */
+static uint64_t metal_graph_kv_scratch_fit_bytes(const ds4_gpu_graph *g,
+                                                 const ds4_gpu_graph *skip) {
     uint64_t bytes = metal_graph_kv_scratch_bytes(g, false);
-    g->kv_scratch_need = 0;
     for (const ds4_gpu_graph *u = g->kv_scratch ? g->kv_scratch->users : NULL;
          u; u = u->kv_scratch_next) {
+        if (u == skip) continue;
         const uint64_t used = metal_graph_kv_scratch_bytes_for(u, u->kv_scratch_need);
         if (used > bytes) bytes = used;
     }
-    for (int i = 0; i < 2; i++) {
+    return bytes;
+}
+
+/* Give the scratch back when a session is reset or one sharing it is freed:
+ * down to the minimum, or to what the sessions sharing it still use.  This
+ * only shrinks, and frees before it allocates, so it needs no room.  The
+ * pressure handler is held off: it frees idle sessions, and one can be g
+ * itself (the refit on free runs on an idle survivor), a session the server
+ * is tearing down, or a user whose need is already in bytes. */
+static bool metal_graph_kv_scratch_refit(ds4_gpu_graph *g) {
+    const uint64_t bytes = metal_graph_kv_scratch_fit_bytes(g, NULL);
+#ifdef DS4_ROCM_BUILD
+    const int held = ds4_gpu_memory_pressure_hold(1);
+#endif
+    bool ok = true;
+    for (int i = 0; ok && i < 2; i++) {
         const ds4_gpu_tensor *t = i ? g->comp_mask_by_tier[0]
                                     : g->indexer_scores_by_tier[0];
-        if (bytes < ds4_gpu_tensor_bytes(t) &&
-            !metal_graph_kv_scratch_resize(g, i, bytes)) return false;
+        if (bytes < ds4_gpu_tensor_bytes(t)) ok = metal_graph_kv_scratch_resize(g, i, bytes);
     }
-    return true;
+#ifdef DS4_ROCM_BUILD
+    (void)ds4_gpu_memory_pressure_hold(held);
+#endif
+    return ok;
 }
 
 /* Make layer il ready for tokens [pos0, pos0 + n_tokens): room for the
@@ -18987,6 +19022,13 @@ static bool metal_graph_kv_reserve(
     return metal_graph_kv_reserve_scratch(g, rows * n_tokens * sizeof(float));
 }
 
+/* Whether layer il has this compressed cache: the layers this graph holds
+ * (a pipeline stage holds a slice) with a compression ratio, and for the
+ * indexer only the ratio-4 ones, as metal_graph_alloc_raw_cap allocates them. */
+static bool metal_graph_kv_layer_has_cache(const ds4_gpu_graph *g, uint32_t il, bool indexer) {
+    return g->layer_comp_cap[il] != 0 && (!indexer || ds4_layer_compress_ratio(il) == 4);
+}
+
 /* Size every compressed cache for the given valid row counts without keeping
  * its contents, and the scratch back to its minimum: a reset session holds
  * what a new one holds (n_comp == NULL), and a checkpoint about to be loaded
@@ -19003,7 +19045,10 @@ static bool metal_graph_kv_refit(
         for (int indexer = 0; indexer < 2; indexer++) {
             ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
                                              : &g->layer_attn_comp_cache[il];
-            if (!*cache) continue;
+            /* A NULL slot of a layer that has the cache is a resize that
+             * failed with its rollback: rebuild it, or prompts too short to
+             * emit a row for this layer never would. */
+            if (!metal_graph_kv_layer_has_cache(g, il, indexer != 0)) continue;
             const uint32_t *valid = indexer ? n_index_comp : n_comp;
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid ? valid[il] : 0, g->layer_comp_cap[il]);
@@ -19013,7 +19058,9 @@ static bool metal_graph_kv_refit(
                                            g->kv_managed, ds4_layer_compress_ratio(il)))) return false;
         }
     }
-    return n_comp || metal_graph_kv_scratch_refit(g);
+    if (n_comp) return true;
+    g->kv_scratch_need = 0;
+    return metal_graph_kv_scratch_refit(g);
 }
 
 /* The same for a checkpoint shard that carries only layers
@@ -19032,7 +19079,7 @@ static bool metal_graph_kv_refit_layers(
         for (int indexer = 0; indexer < 2; indexer++) {
             ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
                                              : &g->layer_attn_comp_cache[il];
-            if (!*cache) continue;
+            if (!metal_graph_kv_layer_has_cache(g, il, indexer != 0)) continue;
             const uint32_t valid = indexer ? n_index_comp[i] : n_comp[i];
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid, g->layer_comp_cap[il]);
@@ -20099,19 +20146,37 @@ static bool metal_graph_alloc_raw_cap(
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-        if (kv_scratch && kv_scratch->users) {
-            /* Later steps grow it if this session reserves more. */
-            g->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
-            g->comp_mask_by_tier[t] = kv_scratch->tensor[1];
-        } else {
-            g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
-            g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+        /* Take the shared tensors (later steps grow them if this session
+         * reserves more), and allocate the ones the pool lacks: the first
+         * session, or a NULL left by a resize that failed with its rollback,
+         * rebuilt here for the sessions using it too.  An allocation can run
+         * the memory-pressure handler on this thread, which may free pool
+         * sessions and so the pool's tensors: read the pool again after every
+         * allocation, and only then publish. */
+        ds4_gpu_tensor *scratch[2] = { NULL, NULL };
+        for (bool again = true; again; ) {
+            again = false;
+            for (int i = 0; i < 2; i++) {
+                if (scratch[i] || (kv_scratch && kv_scratch->users && kv_scratch->tensor[i])) continue;
+                scratch[i] = ds4_gpu_tensor_alloc_ptr_on(
+                        t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+                again = again || scratch[i] != NULL;
+            }
         }
+        for (int i = 0; kv_scratch && kv_scratch->users && i < 2; i++) {
+            if (!kv_scratch->tensor[i]) continue;
+            ds4_gpu_tensor_free(scratch[i]);
+            scratch[i] = kv_scratch->tensor[i];
+        }
+        g->indexer_scores_by_tier[t] = scratch[0];
+        g->comp_mask_by_tier[t] = scratch[1];
         if (kv_scratch) { /* on demand: tier 0 is the only one */
             kv_scratch->tensor[0] = g->indexer_scores_by_tier[t];
             kv_scratch->tensor[1] = g->comp_mask_by_tier[t];
+            for (ds4_gpu_graph *u = kv_scratch->users; u; u = u->kv_scratch_next) {
+                u->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
+                u->comp_mask_by_tier[t] = kv_scratch->tensor[1];
+            }
             g->kv_scratch = kv_scratch;
             g->kv_scratch_next = kv_scratch->users;
             kv_scratch->users = g;
@@ -41686,10 +41751,22 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
     return false;
 }
 
+/* Next capacity of a token vector: twice cap, saturating at INT_MAX (the type
+ * of ds4_tokens.cap), or 0 when cap is already INT_MAX.  The server accepts
+ * bodies of gigabytes and tokenizes them before checking the context size, so
+ * the count can reach INT_MAX. */
+static int token_vec_grow_capacity(int cap) {
+    if (cap == INT_MAX) return 0;
+    if (cap == 0) return 64;
+    return cap > INT_MAX / 2 ? INT_MAX : cap * 2;
+}
+
 static void token_vec_push(token_vec *tv, int token) {
     if (tv->len == tv->cap) {
-        tv->cap = tv->cap ? tv->cap * 2 : 64;
-        tv->v = xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
+        int cap = token_vec_grow_capacity(tv->cap);
+        if (cap == 0) ds4_die("token vector too large");
+        tv->v = xrealloc(tv->v, (size_t)cap * sizeof(tv->v[0]));
+        tv->cap = cap;
     }
     tv->v[tv->len++] = token;
 }
@@ -45709,31 +45786,40 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
     return rank;
 }
 
+/* Twice cap elements of elem_size bytes, or 0 when that many bytes do not
+ * fit in a size_t.  One piece holds a symbol per character, and the server
+ * accepts bodies of gigabytes, so the count can pass INT_MAX. */
+static size_t bpe_grow_capacity(size_t cap, size_t elem_size) {
+    if (cap > SIZE_MAX / 2 / elem_size) return 0;
+    return cap * 2;
+}
+
 /* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
 static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
-    int n_sym = 0;
-    int cap_sym = 32;
-    owned_str *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
+    size_t n_sym = 0;
+    size_t cap_sym = 32;
+    owned_str *sym = xcalloc(cap_sym, sizeof(sym[0]));
 
     for (uint64_t off = 0; off < encoded_len;) {
         int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
         if (off + (uint64_t)n > encoded_len) n = 1;
         if (n_sym == cap_sym) {
-            cap_sym *= 2;
-            sym = xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
+            cap_sym = bpe_grow_capacity(cap_sym, sizeof(sym[0]));
+            if (cap_sym == 0) ds4_die("allocation size overflow");
+            sym = xrealloc(sym, cap_sym * sizeof(sym[0]));
         }
         sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
         off += (uint64_t)n;
     }
 
     for (;;) {
-        int best_i = -1;
+        size_t best_i = SIZE_MAX;
         int best_rank = INT32_MAX;
 
-        for (int i = 0; i + 1 < n_sym; i++) {
+        for (size_t i = 0; i + 1 < n_sym; i++) {
             int rank = bpe_rank(vocab, &sym[i], &sym[i + 1]);
             if (rank >= 0 && rank < best_rank) {
                 best_rank = rank;
@@ -45741,7 +45827,7 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
             }
         }
 
-        if (best_i < 0) break;
+        if (best_i == SIZE_MAX) break;
 
         owned_str merged;
         merged.len = sym[best_i].len + sym[best_i + 1].len;
@@ -45753,13 +45839,13 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
         free(sym[best_i + 1].ptr);
         sym[best_i] = merged;
 
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
+        for (size_t j = best_i + 1; j + 1 < n_sym; j++) {
             sym[j] = sym[j + 1];
         }
         n_sym--;
     }
 
-    for (int i = 0; i < n_sym; i++) {
+    for (size_t i = 0; i < n_sym; i++) {
         int token = -1;
         if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
             token_vec_push(out, token);
@@ -63661,17 +63747,121 @@ static void ds4_release_instance_lock(void) {
 }
 
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
- * stale accidental second run is more dangerous than a normal CLI error. */
+ * stale accidental second run is more dangerous than a normal CLI error.
+ *
+ * The default lock lives in its own directory so that containers can share it
+ * with native processes by bind-mounting the host's /tmp/ds4-lock at the same
+ * path (see docs/DOCKER.md).  Containers usually run as root and natives as a
+ * user, so a lock file ds4 creates is made world-writable and a native process
+ * can lock a file a root container created.  Which process may create the
+ * directory first depends on who owns it: see docs/DOCKER.md for the
+ * orderings that need a root-provisioned 1777 directory.
+ *
+ * The directory is in /tmp, so another local user may have made it, or may
+ * plant entries in it.  It is only used if it is owned by root or by us, and
+ * is sticky when others can write it; the file is opened through that
+ * directory's descriptor without following symlinks, must be a regular file
+ * with one link, and only a file created by this call gets its mode changed. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
-    if (!path || !path[0]) path = "/tmp/ds4.lock";
+    char dir[PATH_MAX];
+    const char *name;
+    int dir_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    bool made_dir = false;
+    if (!path || !path[0]) {
+        path = "/tmp/ds4-lock/ds4.lock";
+        snprintf(dir, sizeof(dir), "/tmp/ds4-lock");
+        name = "ds4.lock";
+        dir_flags |= O_NOFOLLOW;
+        made_dir = mkdir(dir, 0700) == 0;
+    } else {
+        const char *slash = strrchr(path, '/');
+        name = slash ? slash + 1 : path;
+        if (!slash) snprintf(dir, sizeof(dir), ".");
+        else if (slash == path) snprintf(dir, sizeof(dir), "/");
+        else snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+        if (!name[0] || strlen(path) >= sizeof(dir)) {
+            fprintf(stderr, "ds4: invalid lock file path %s\n", path);
+            exit(2);
+        }
+#ifdef O_PATH
+        dir_flags |= O_PATH; /* only searched, so it need not be readable */
+#endif
+    }
+    /* The hints name the remedies for the default directory; DS4_LOCK_FILE
+     * may point there too (the compose files set it). */
+    const bool custom_path = strcmp(dir, "/tmp/ds4-lock") != 0;
 
-    const int fd = open(path, O_RDWR | O_CREAT, 0600);
-    if (fd < 0) {
-        fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
+    const int dfd = open(dir, dir_flags);
+    struct stat st;
+    if (dfd < 0 || fstat(dfd, &st) != 0) {
+        const int e = errno;
+        fprintf(stderr, "ds4: failed to open lock directory %s: %s%s\n", dir, strerror(e),
+                e == ELOOP || e == ENOTDIR ? " (it must be a real directory, not a symlink)" : "");
         exit(2);
     }
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    const uid_t euid = geteuid();
+    if ((st.st_uid != 0 && st.st_uid != euid) ||
+        ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)))
+    {
+        fprintf(stderr,
+                "ds4: refusing to use lock directory %s: owner uid %u, mode %04o; it must be owned by "
+                "root%s and be sticky if others can write to it.",
+                dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777),
+                euid == 0 ? "" : " or by you");
+        if (custom_path) {
+            fprintf(stderr, " Point DS4_LOCK_FILE into a directory owned by root or by you that others cannot write to");
+        } else {
+            fprintf(stderr, " With no ds4 running, remove it (sudo rm -r %s) or recreate it as root "
+                    "(sudo install -d -m 1777 %s)", dir, dir);
+        }
+        fputc('\n', stderr);
+        exit(2);
+    }
+    /* The directory is ours and still 0700, so nobody else can have entered
+     * it.  Root makes it shared; a user's directory is not used by root or by
+     * other users anyway (see above), so it stays closed to writes. */
+    if (made_dir && st.st_uid == euid && (st.st_mode & 07777) == 0700) {
+        (void)fchmod(dfd, euid == 0 ? 01777 : 0755);
+    }
+
+    /* O_NONBLOCK: a FIFO planted at the lock path must not block the open. */
+    const int file_flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
+    bool made_file = false;
+    int fd = -1;
+    for (int tries = 0; fd < 0 && tries < 3; tries++) {
+        fd = openat(dfd, name, file_flags | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            made_file = true;
+            break;
+        }
+        if (errno != EEXIST) break;
+        /* Without O_CREAT: fs.protected_regular refuses O_CREAT on another
+         * user's file in a sticky world-writable directory, even when the
+         * file itself is writable. */
+        fd = openat(dfd, name, file_flags);
+        if (fd < 0 && errno != ENOENT) break;
+    }
+    const int open_errno = errno;
+    close(dfd);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(open_errno));
+        if (open_errno == ELOOP) {
+            fprintf(stderr, "ds4: it is a symlink; refusing to follow it\n");
+        } else if (open_errno == EACCES) {
+            fprintf(stderr, "ds4: with no ds4 running, remove a leftover file you cannot open "
+                    "(sudo rm -f %s)", path);
+            if (!custom_path) fprintf(stderr, ", or let every user create it (sudo chmod 1777 %s)", dir);
+            fputc('\n', stderr);
+        }
+        exit(2);
+    }
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        fprintf(stderr, "ds4: refusing to use lock file %s: not a regular file with a single link\n", path);
+        close(fd);
+        exit(2);
+    }
+    if (made_file) (void)fchmod(fd, 0666); /* Undo the umask. */
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
@@ -63772,7 +63962,8 @@ typedef struct {
     uint64_t prefix_hash;   /* of those tokens; binds the anchor to its timeline */
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
-    uint8_t *state;         /* raw window rows and compressor state, layer by layer */
+    uint8_t *state;         /* raw window rows and compressor state, layer by layer,
+                             * then the logits of the frontier */
 } ds4_session_anchor;
 
 struct ds4_session {
@@ -63851,6 +64042,10 @@ struct ds4_session {
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
     size_t sync_image_count;
+    /* Distributed coordinator: owned copy of the last sync's images, see
+     * ds4_session_dist_images_retain(). */
+    ds4_vision_span *dist_images;
+    size_t dist_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
     float *sample_probs;
@@ -63918,6 +64113,52 @@ static bool ds4_session_tp_leader(const ds4_session *s);
 static void session_anchors_clear(ds4_session *s) {
     for (int i = 0; i < s->anchor_count; i++) free(s->anchors[i].state);
     s->anchor_count = 0;
+}
+
+static void ds4_session_dist_images_free(ds4_session *s) {
+    for (size_t i = 0; i < s->dist_image_count; i++) free(s->dist_images[i].embedding.data);
+    free(s->dist_images);
+    s->dist_images = NULL;
+    s->dist_image_count = 0;
+}
+
+/* A distributed coordinator that loses a remote stage during decode rebuilds
+ * it by replaying the transcript from token 0 through this stage's layers
+ * (dist_coordinator_rebuild_from_transcript), and layer 0 seeds image rows
+ * from the encoder output, which the caller lends only for the multimodal
+ * sync.  So the session keeps its own copy of the images of every successful
+ * sync.  Each sync replaces it and decode never produces image tokens, so
+ * any image row a replay meets belongs to one of these spans.  Without memory
+ * for the copy a replay fails on the image rows, as it would without it. */
+static void ds4_session_dist_images_retain(ds4_session *s) {
+    if (!s->distributed) return;
+    bool same = s->dist_image_count == s->sync_image_count;
+    for (size_t i = 0; same && i < s->sync_image_count; i++) {
+        const ds4_vision_embedding *a = &s->dist_images[i].embedding;
+        const ds4_vision_embedding *b = &s->sync_images[i].embedding;
+        same = s->dist_images[i].token_start == s->sync_images[i].token_start &&
+               a->token_count == b->token_count &&
+               memcmp(a->fingerprint, b->fingerprint, sizeof(a->fingerprint)) == 0;
+    }
+    if (same) return;
+    ds4_session_dist_images_free(s);
+    if (s->sync_image_count == 0) return;
+    ds4_vision_span *copy = calloc(s->sync_image_count, sizeof(copy[0]));
+    if (!copy) return;
+    for (size_t i = 0; i < s->sync_image_count; i++) {
+        const size_t bytes = (size_t)s->sync_images[i].embedding.token_count *
+                             DS4_N_EMBD * sizeof(float);
+        copy[i] = s->sync_images[i];
+        copy[i].embedding.data = malloc(bytes);
+        if (!copy[i].embedding.data) {
+            for (size_t j = 0; j < i; j++) free(copy[j].embedding.data);
+            free(copy);
+            return;
+        }
+        memcpy(copy[i].embedding.data, s->sync_images[i].embedding.data, bytes);
+    }
+    s->dist_images = copy;
+    s->dist_image_count = s->sync_image_count;
 }
 
 #ifndef DS4_NO_GPU
@@ -66264,7 +66505,7 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
     const uint64_t t0 = metrics_begin();
     const int rc = ds4_session_write_staged_payload_unmetered(payload, fp, err, errlen);
     metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
-    if (t0 && rc == 0) {
+    if (rc == 0) {
         ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
         ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, payload->bytes);
     }
@@ -66301,6 +66542,7 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_payload_file *out,
                                                char *err, size_t errlen);
+static int ds4_session_save_payload_unmetered(ds4_session *s, FILE *fp, char *err, size_t errlen);
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
@@ -66338,7 +66580,9 @@ static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_paylo
         return 1;
     }
 
-    int rc = ds4_session_save_payload(s, fp, err, errlen);
+    /* The staged copy is counted when ds4_session_write_staged_payload()
+     * writes it to its destination. */
+    int rc = ds4_session_save_payload_unmetered(s, fp, err, errlen);
     if (rc == 0 && fflush(fp) != 0) {
         payload_set_err(err, errlen, "failed to flush staged session payload");
         rc = 1;
@@ -66637,7 +66881,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     const long start = fp ? ftell(fp) : -1;
     const int rc = ds4_session_save_payload_unmetered(s, fp, err, errlen);
     metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
-    if (t0 && rc == 0) {
+    if (rc == 0) {
         const long end = ftell(fp);
         ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
         if (start >= 0 && end > start) ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, (uint64_t)(end - start));
@@ -67022,6 +67266,8 @@ static int ds4_session_load_payload_unmetered(ds4_session *s, FILE *fp, uint64_t
         return 1;
     }
     if (s->distributed) {
+        /* The loaded timeline did not come from the last sync. */
+        ds4_session_dist_images_free(s);
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
     uint64_t remaining = payload_bytes;
@@ -77241,6 +77487,12 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The backend keeps the handler in process globals.  Its user state may
+     * go with this engine, and an engine opened next must not reach it from
+     * its own allocations, or from anything this close still allocates. */
+    if (e->memory_pressure.fn) ds4_gpu_set_memory_pressure_handler(NULL, NULL);
+#endif
     ds4_dist_coordinator_close(e->dist_coordinator);
     e->dist_coordinator = NULL;
     ds4_engine_tp_unbind(e);
@@ -78009,6 +78261,7 @@ void ds4_session_free(ds4_session *s) {
     session_anchors_clear(s);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
+    ds4_session_dist_images_free(s);
     free(s->logits);
     free(s->sample_probs);
 #ifndef DS4_NO_GPU
@@ -78152,7 +78405,7 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
-static bool ds4_session_cancelled(ds4_session *s) {
+bool ds4_session_cancelled(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
 
@@ -79096,6 +79349,28 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     ds4_session_dspark_capture_note_checkpoint(s);
 }
 
+#ifndef DS4_NO_GPU
+/* The replay began with a reset, which forgot the checkpoint's image
+ * identities; record each image again once its rows are back in the KV. */
+static bool ds4_session_dist_images_replayed(ds4_session *s, uint32_t pos0, uint32_t n_tokens) {
+    for (size_t i = 0; i < s->dist_image_count; i++) {
+        const ds4_vision_span *span = &s->dist_images[i];
+        const uint64_t end = (uint64_t)span->token_start + span->embedding.token_count;
+        if (span->token_start < pos0 || end > (uint64_t)pos0 + n_tokens) continue;
+        const size_t n = s->checkpoint_image_count;
+        if (n && s->checkpoint_images[n - 1].token_start >= span->token_start) continue;
+        ds4_vision_identity *grown = realloc(s->checkpoint_images, (n + 1) * sizeof(grown[0]));
+        if (!grown) return false;
+        grown[n].token_start = span->token_start;
+        grown[n].token_count = span->embedding.token_count;
+        memcpy(grown[n].fingerprint, span->embedding.fingerprint, sizeof(grown[n].fingerprint));
+        s->checkpoint_images = grown;
+        s->checkpoint_image_count = n + 1;
+    }
+    return true;
+}
+#endif
+
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -79522,6 +79797,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             }
         }
     }
+    /* Image rows outside a multimodal sync: a decode-time replay. */
+    const bool replay_images = g->prefill_has_visual && !input_hc &&
+                               !g->prefill_vision_spans && s->dist_image_count != 0;
+    if (replay_images) {
+        g->prefill_vision_spans = s->dist_images;
+        g->prefill_vision_span_count = s->dist_image_count;
+    }
 
     bool ok = true;
     bool missing_image_embedding = false;
@@ -79549,6 +79831,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                      &span,
                                                      0,
                                                      n_tokens);
+    }
+    if (replay_images) {
+        g->prefill_vision_spans = NULL;
+        g->prefill_vision_span_count = 0;
     }
 
     ds4_gpu_tensor *last_hc = NULL;
@@ -79642,6 +79928,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     }
 
     ds4_session_slice_commit_timeline(s, tokens, n_tokens);
+    if (replay_images && !ds4_session_dist_images_replayed(s, pos0, n_tokens)) {
+        if (errlen) snprintf(err, errlen, "unable to retain image prompt identity");
+        ds4_session_invalidate(s);
+        return 1;
+    }
     return 0;
 #endif
 }
@@ -80090,6 +80381,7 @@ static int ds4_session_sync_unmetered(ds4_session *s, const ds4_tokens *prompt,
         snprintf(err, errlen, "unable to retain image prompt identity");
         return 1;
     }
+    if (rc == 0) ds4_session_dist_images_retain(s);
     return rc;
 }
 
@@ -85352,6 +85644,7 @@ static int ds4_sessions_eval_batch_speculative_argmax_unmetered(
  * coordinator engine is distributed, and ds4_sessions_eval_batch() has already
  * rejected members belonging to a different engine. */
 static int ds4_sessions_eval_batch_distributed(ds4_decode_item *items, int count,
+                                               int *member_rc,
                                                char *err, size_t errlen) {
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
@@ -85382,27 +85675,44 @@ static int ds4_sessions_eval_batch_distributed(ds4_decode_item *items, int count
         dist_items[i].logits = s->logits;
     }
     int rc = ds4_dist_sessions_eval(dist_items, count, err, errlen);
-    free(dist_items);
-    if (rc != 0) {
-        /* Members can be left at different points in the timeline, so rebuild
-         * every one rather than expose a partially committed logical batch. */
-        for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+    /* A member that failed may be anywhere in its timeline, so it is rebuilt
+     * from scratch.  The others were collected or replayed through this token
+     * and stay usable: one conversation that cannot be recovered must not end
+     * the rest of the batch. */
+    for (int i = 0; rc != 0 && i < count; i++) {
+        if (member_rc) member_rc[i] = dist_items[i].rc;
+        if (dist_items[i].rc != 0) ds4_session_invalidate(items[i].session);
     }
+    free(dist_items);
     return rc;
 }
 
 static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
+                                             int *member_rc,
                                              char *err, size_t errlen);
+
+int ds4_sessions_eval_batch_members(ds4_decode_item *items, int count,
+                                    int *member_rc, char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    /* Backends that report members one by one overwrite this. */
+    for (int i = 0; member_rc && i < count; i++) member_rc[i] = 1;
+    const int rc = ds4_sessions_eval_batch_unmetered(items, count, member_rc, err, errlen);
+    int advanced = rc == 0 ? count : 0;
+    for (int i = 0; member_rc && i < count; i++) {
+        if (rc == 0) member_rc[i] = 0;
+        else if (member_rc[i] == 0) advanced++;
+    }
+    metrics_end_decode(t0, count, advanced);
+    return rc;
+}
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
-    const uint64_t t0 = metrics_begin();
-    const int rc = ds4_sessions_eval_batch_unmetered(items, count, err, errlen);
-    metrics_end_decode(t0, count, rc == 0 ? count : 0);
-    return rc;
+    return ds4_sessions_eval_batch_members(items, count, NULL, err, errlen);
 }
 
 static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
+                                             int *member_rc,
                                              char *err, size_t errlen) {
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
@@ -85457,7 +85767,7 @@ static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
      * frame before collecting any result, instead of the serialized fallback
      * below that pays one full round trip per member. */
     if (ds4_decode_batch_has_distributed(items, count)) {
-        return ds4_sessions_eval_batch_distributed(items, count, err, errlen);
+        return ds4_sessions_eval_batch_distributed(items, count, member_rc, err, errlen);
     }
 
 #ifndef DS4_NO_GPU
@@ -91593,11 +91903,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
  * overwritten by later tokens, and each compressor holds the partial window of
  * the latest tokens instead of the one it held back then.  An anchor is a host
  * copy of exactly that perishable part of one frontier - the window of raw
- * rows before it, the compressor state, and the compressed row counts.  With
- * it the session can return to that position and evaluate a different
- * continuation, at a cost that does not grow with the context (about 22 MiB
- * for all of Flash, against a disk checkpoint that also carries every
- * compressed row).
+ * rows before it, the compressor state, and the compressed row counts - plus
+ * the logits there.  With it the session can return to that position and
+ * sample or evaluate a different continuation, at a cost that does not grow
+ * with the context (about 22 MiB for all of Flash, against a disk checkpoint
+ * that also carries every compressed row).
  *
  * Callers take anchors where they may want to come back to, such as the start
  * of a reply and at intervals inside it (ds4_session_anchor_save).  A fixed
@@ -91768,14 +92078,17 @@ bool ds4_session_anchor_save(ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_synchronize() != 0;
     ds4_session_anchor a = {.pos = pos, .prefix_hash = hash};
-    a.state = ok ? malloc((size_t)session_anchor_copy(g, (uint32_t)pos, NULL,
-                                                      ANCHOR_SIZE, &ok)) : NULL;
+    const size_t logits_bytes = (size_t)DS4_N_VOCAB * sizeof(float);
+    const uint64_t bytes = ok ? session_anchor_copy(g, (uint32_t)pos, NULL,
+                                                    ANCHOR_SIZE, &ok) : 0;
+    a.state = ok ? malloc((size_t)bytes + logits_bytes) : NULL;
     if (!a.state) return false;
     session_anchor_copy(g, (uint32_t)pos, a.state, ANCHOR_SAVE, &ok);
     if (!ok) {
         free(a.state);
         return false;
     }
+    memcpy(a.state + bytes, s->logits, logits_bytes);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         a.n_comp[il] = g->layer_n_comp[il];
         a.n_index_comp[il] = g->layer_n_index_comp[il];
@@ -91800,7 +92113,8 @@ bool ds4_session_anchor_rewind(ds4_session *s, int pos) {
     ds4_gpu_graph *g = &s->graph;
     const ds4_session_anchor *a = &s->anchors[i];
     bool ok = ds4_gpu_synchronize() != 0;
-    if (ok) session_anchor_copy(g, (uint32_t)pos, a->state, ANCHOR_RESTORE, &ok);
+    uint64_t bytes = 0;
+    if (ok) bytes = session_anchor_copy(g, (uint32_t)pos, a->state, ANCHOR_RESTORE, &ok);
     if (ok) ok = ds4_gpu_synchronize() != 0;
     if (!ok) {
         /* Some layers may already hold the anchor's rows. */
@@ -91819,9 +92133,11 @@ bool ds4_session_anchor_rewind(ds4_session *s, int pos) {
            (uint64_t)s->checkpoint_images[s->checkpoint_image_count - 1].token_start +
            s->checkpoint_images[s->checkpoint_image_count - 1].token_count > (uint64_t)pos)
         s->checkpoint_image_count--;
-    /* Drafting state describes the abandoned continuation, and the logits
-     * are those of its last token: the caller evaluates at least one token
-     * from here before sampling. */
+    /* The frontier's own logits come back with it, so the session can be
+     * sampled or saved before anything else is evaluated (a cancelled sync,
+     * a prompt that ends exactly here).  Drafting state describes the
+     * abandoned continuation. */
+    memcpy(s->logits, a->state + bytes, (size_t)DS4_N_VOCAB * sizeof(float));
     s->mtp_draft_valid = false;
     s->dist_spec_pending = false;
     g->mtp_n_raw = 0;
@@ -91895,10 +92211,21 @@ uint64_t ds4_session_context_memory_bytes(const ds4_session *s) {
                  ds4_gpu_tensor_bytes(g->layer_attn_comp_cache[il]) +
                  ds4_gpu_tensor_bytes(g->layer_index_comp_cache[il]);
     }
-    /* A shared scratch stays behind for the other sessions. */
-    const bool scratch_stays = g->kv_scratch && g->kv_scratch->users &&
-        (g->kv_scratch->users != g || g->kv_scratch_next);
-    for (int t = 0; !scratch_stays && t < DS4_MAX_GPUS; t++) {
+    /* A shared scratch stays behind for the other sessions, refit to what
+     * they use (metal_graph_kv_scratch_leave) unless it is being resized. */
+    const ds4_kv_scratch *pool = g->kv_scratch;
+    const ds4_gpu_graph *rest = !pool ? NULL :
+                                pool->users != g ? pool->users : g->kv_scratch_next;
+    /* Nothing is counted while a resize runs: leave does not refit then,
+     * and the pool still names the tensor the resize has freed. */
+    if (rest && !pool->resizing) {
+        const uint64_t fit = metal_graph_kv_scratch_fit_bytes(rest, g);
+        for (int i = 0; i < 2; i++) {
+            const uint64_t have = ds4_gpu_tensor_bytes(pool->tensor[i]);
+            if (fit < have) bytes += have - fit;
+        }
+    }
+    for (int t = 0; !rest && t < DS4_MAX_GPUS; t++) {
         bytes += ds4_gpu_tensor_bytes(g->indexer_scores_by_tier[t]) +
                  ds4_gpu_tensor_bytes(g->comp_mask_by_tier[t]);
     }

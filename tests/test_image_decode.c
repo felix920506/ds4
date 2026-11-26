@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -266,6 +267,23 @@ static int check_fallback(void) {
                             png, png_len, NULL, 0, 0, "no usable image")) return 0;
     if (!check_fake_decoder("cat >/dev/null; printf 'P6\\n4 4\\n255\\n\\001'",
                             png, png_len, NULL, 0, 0, "no usable image")) return 0;
+    {
+        /* Issue #57: a child that closes stdout and stderr and keeps
+         * running must still be cut off at the deadline, not waited for. */
+        setenv("DS4_IMAGE_EXTERNAL_TIMEOUT_MS", "1000", 1);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int ok = check_fake_decoder("cat >/dev/null; exec sleep 6 >&- 2>&-",
+                                    png, png_len, NULL, 0, 0, "timed out after 1 s");
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+        unsetenv("DS4_IMAGE_EXTERNAL_TIMEOUT_MS");
+        if (secs > 3.0) {
+            fprintf(stderr, "closed-output decoder was waited for %.1f s\n", secs);
+            ok = 0;
+        }
+        if (!ok) return 0;
+    }
     {
         /* 8 MiB of input to a child that exits at once: the write side
          * hits EPIPE, which must not kill this process with SIGPIPE. */

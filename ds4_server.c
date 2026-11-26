@@ -443,6 +443,16 @@ static char *json_minify_raw_value(const char *json) {
  * it is far above what any real context window holds. */
 #define SERVER_MAX_IMAGES 4096
 
+/* The tokenizers cannot fail a request: a token vector that would pass
+ * INT_MAX entries ends the process.  Every text token consumes at least one
+ * byte of the rendered prompt, so bounding the bytes before tokenizing bounds
+ * the tokens.  2^30 bytes leaves INT_MAX - 2^30 for what joins them: the image
+ * blocks (SERVER_MAX_IMAGES of at most 16383 tokens) and the live or disk
+ * cached prefix of at most one context (2^20 tokens) that the reuse paths put
+ * in front of a suffix of this text.  A prompt that fits a 2^20-token context
+ * would need more than 1 KiB per token to reach the bound. */
+#define SERVER_MAX_PROMPT_BYTES ((size_t)1 << 30)
+
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
     uint8_t *encoded;
@@ -3671,10 +3681,19 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static bool request_prompt_text_fits(const request *r, char *err, size_t errlen) {
+    if (!r->prompt_text || strlen(r->prompt_text) <= SERVER_MAX_PROMPT_BYTES)
+        return true;
+    snprintf(err, errlen, "prompt too large; the rendered prompt may have at most %zu bytes",
+             SERVER_MAX_PROMPT_BYTES);
+    return false;
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
                                                char *err, size_t errlen) {
+    if (!request_prompt_text_fits(r, err, errlen)) return false;
     size_t count = 0;
     for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
     if (count == 0) {
@@ -5756,8 +5775,12 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     chat_msgs_push(&msgs, user_msg);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, NULL, NULL, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
+    if (!request_prompt_text_fits(r, err, errlen)) {
+        request_free(r);
+        return false;
+    }
+    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
 bad:
@@ -10541,6 +10564,13 @@ static bool job_cancelled(void *ud) {
     return cancelled;
 }
 
+/* The engine's view of a running job: its client left, or the server is
+ * shutting down.  The distributed route wait polls it, and would otherwise
+ * hold the executor for up to 120 s after either. */
+static bool job_session_cancelled(void *ud) {
+    return g_stop_requested || job_cancelled(ud);
+}
+
 static void job_mark_cancelled(job *j) {
     if (!j) return;
     pthread_mutex_lock(&j->mu);
@@ -12352,10 +12382,9 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
-    /* The anchor must leave at least one prompt token to evaluate: logits
-     * do not survive a rewind. */
-    const int anchor = ds4_session_anchor_floor(
-        slot->session, common < req->prompt.len ? common : req->prompt.len - 1);
+    /* An anchor keeps its logits, so it may also sit at the end of the
+     * prompt: a regenerated answer rewinds to the start of the old reply. */
+    const int anchor = ds4_session_anchor_floor(slot->session, common);
     if (anchor > 0 && anchor >= live_pos - anchor &&
         ds4_session_vision_prefix_matches_at(slot->session, req->images,
                                              req->image_count, anchor))
@@ -14192,6 +14221,7 @@ static void *decode_worker_main(void *arg) {
     server_slot **members = xmalloc((size_t)s->slot_count * sizeof(*members));
     int (*accepted)[2] = xmalloc((size_t)s->slot_count * sizeof(*accepted));
     int *n_accepted = xmalloc((size_t)s->slot_count * sizeof(*n_accepted));
+    int *member_rc = xmalloc((size_t)s->slot_count * sizeof(*member_rc));
     const long coalesce_us = server_decode_coalesce_us();
     const bool log_batches = getenv("DS4_SERVER_BATCH_LOG") != NULL;
 
@@ -14246,8 +14276,10 @@ static void *decode_worker_main(void *arg) {
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
         pthread_mutex_lock(&s->inference_mu);
-        int rc = plain_count ? ds4_sessions_eval_batch(items, plain_count,
+        int rc = plain_count ? ds4_sessions_eval_batch_members(items, plain_count, member_rc,
                                          batch_err, sizeof(batch_err)) : 0;
+        /* A failed plain batch says which of its members still advanced. */
+        const bool plain_failed = rc != 0;
         for (int i = 0; i < plain_count; i++) {
             accepted[i][0] = items[i].token;
             n_accepted[i] = 1;
@@ -14255,8 +14287,10 @@ static void *decode_worker_main(void *arg) {
         if (rc == 0 && count > plain_count)
             rc = ds4_sessions_eval_batch_speculative_argmax(items + plain_count, count - plain_count,
                     accepted + plain_count, n_accepted + plain_count, batch_err, sizeof(batch_err));
-        if (rc != 0)
-            for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+        for (int i = 0; i < count; i++) {
+            if (!(plain_failed && i < plain_count)) member_rc[i] = rc;
+            if (member_rc[i] != 0) ds4_session_invalidate(items[i].session);
+        }
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
@@ -14270,12 +14304,12 @@ static void *decode_worker_main(void *arg) {
         for (int i = 0; i < count; i++) {
             server_slot *slot = members[i];
             slot->decode_in_flight = false;
-            slot->decode_rc = rc;
-            if (rc == 0) {
+            slot->decode_rc = member_rc[i];
+            if (member_rc[i] == 0) {
                 slot->decode_accepted_count = n_accepted[i];
                 memcpy(slot->decode_accepted, accepted[i], (size_t)n_accepted[i] * sizeof(int));
             }
-            if (rc != 0) {
+            if (member_rc[i] != 0) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
                          batch_err[0] ? batch_err : "batched decode failed");
             }
@@ -14288,6 +14322,7 @@ static void *decode_worker_main(void *arg) {
     free(items);
     free(accepted);
     free(n_accepted);
+    free(member_rc);
     return NULL;
 }
 
@@ -14682,16 +14717,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync_multimodal(s, slot, &prefix,
+        const int cold_sync_rc =
+            server_session_sync_multimodal(s, slot, &prefix,
                                            j->req.images, cold_images,
-                                           err, sizeof(err)) != 0) {
+                                           err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            if (cold_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
+                kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
             free(disk_cache_path);
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
@@ -14727,7 +14765,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        /* An interrupted sync (client gone, shutdown) says nothing about the
+         * file it resumed from, and leaves the session at a checkpoint the
+         * shutdown pass can still save, or invalid. */
+        if (prompt_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
         free(disk_cache_path);
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);
@@ -14945,6 +14987,10 @@ decode_again:
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            /* Same lock as the one-token decode in server_eval_tokens: the
+             * request parser encodes images under it, and on ROCm the encoder
+             * shares (and may reallocate) the GPU scratch the decode uses. */
+            server_inference_lock(s);
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
@@ -14958,6 +15004,7 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             }
+            server_inference_unlock(s);
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -15998,7 +16045,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 503,
                    "not enough memory for a session context");
     } else {
-        ds4_session_set_cancel(slot->session, job_cancelled, j);
+        ds4_session_set_cancel(slot->session, job_session_cancelled, j);
         generate_job_inner(s, slot, j);
         ds4_session_set_cancel(slot->session, NULL, NULL);
     }
@@ -18102,12 +18149,28 @@ static void test_slot_probe_memory_anchor(void) {
     j.req.prompt.v[100] = live_tok[100];
     j.req.prompt.v[170] = live_tok[170];
 
-    /* A prompt that stops exactly on an anchor still needs one token
-     * evaluated for its logits, so it uses the anchor below. */
+    /* A prompt that stops exactly on an anchor rewinds to it: the anchor
+     * brings its logits back, so there is nothing left to evaluate. */
     j.req.prompt.len = 180;
     pr = slot_probe_reuse_locked(&s, &slots[0], &j.req);
-    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 120);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 180);
     j.req.prompt.len = 230;
+
+    /* A regenerated first answer: the only anchor is the one at the end of
+     * the prompt, taken when the prompt was done. */
+    {
+        server_slot first = {0};
+        first.last_used = now;
+        first.session = ds4_session_new_test_checkpoint(live_tok, 200);
+        ds4_session_add_test_anchor(first.session, 150);
+        job o = {0};
+        for (int i = 0; i < 150; i++) ds4_tokens_push(&o.req.prompt, live_tok[i]);
+        pr = slot_probe_reuse_locked(&s, &first, &o.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 150);
+        TEST_ASSERT(job_slot_score(&s, &first, &o, -1, now) == 150);
+        ds4_tokens_free(&o.req.prompt);
+        ds4_session_free_test_checkpoint(first.session);
+    }
 
     /* An anchor that keeps less than half of the checkpoint is a shared
      * opening, not a continuation: no reuse, the slot is only a victim. */
@@ -18788,6 +18851,8 @@ static void test_slot_kick_bookkeeping_round_trip(void) {
     TEST_ASSERT(slot_kick_cost_of(&s, slot, NULL) == KICK_SAVE);
 
     ds4_session_free_test_checkpoint(slot->session);
+    live_tool_state_free(&slot->responses_live);
+    live_tool_state_free(&slot->anthropic_live);
     request_free(&cont.req);
     request_free(&bound.req);
     pthread_cond_destroy(&s.cv);
@@ -24620,11 +24685,10 @@ static char *test_kv_chain_text(int conv, size_t len, int tail) {
     return text;
 }
 
-/* Writes the checkpoint and returns its path. */
-static char *test_kv_chain_file(const char *dir, int conv, size_t len, int tail,
-                                uint8_t reason, uint32_t hits,
-                                uint64_t last_used) {
-    char *text = test_kv_chain_text(conv, len, tail);
+/* Writes a checkpoint of `text` and returns its path. */
+static char *test_kv_chain_write(const char *dir, const char *text, size_t len,
+                                 uint8_t reason, uint32_t hits,
+                                 uint64_t last_used) {
     char sha[41], name[44];
     sha1_bytes_hex(text, len, sha);
     snprintf(name, sizeof(name), "%.40s.kv", sha);
@@ -24644,6 +24708,15 @@ static char *test_kv_chain_file(const char *dir, int conv, size_t len, int tail,
         TEST_ASSERT(fwrite(text, 1, len, fp) == len);
         TEST_ASSERT(fclose(fp) == 0);
     }
+    return path;
+}
+
+/* Writes the checkpoint and returns its path. */
+static char *test_kv_chain_file(const char *dir, int conv, size_t len, int tail,
+                                uint8_t reason, uint32_t hits,
+                                uint64_t last_used) {
+    char *text = test_kv_chain_text(conv, len, tail);
+    char *path = test_kv_chain_write(dir, text, len, reason, hits, last_used);
     free(text);
     return path;
 }
@@ -24738,6 +24811,66 @@ static void test_kv_cache_eviction_drops_dead_tip(void) {
     unlink(dead); unlink(front); unlink(other);
     free(dead); free(front); free(other);
     rmdir(dir);
+}
+
+static void test_kv_cache_eviction_compares_whole_text(void) {
+    /* A frontier is redundant only under a longer checkpoint that has all of
+     * its text.  Its length is not a multiple of the signature grid, and the
+     * longer text differs from it at `diverge`: inside the bytes past the
+     * last full block, it is another conversation and the older checkpoint
+     * of a third one goes first; past its end, the frontier goes.  Once with
+     * the longer checkpoint on disk, once as the incoming store. */
+    const size_t front_len = 8292, longer_len = 8704;
+    const size_t diverges[] = {8250, 8400};
+    for (int incoming_store = 0; incoming_store < 2; incoming_store++) {
+        for (size_t d = 0; d < sizeof(diverges) / sizeof(diverges[0]); d++) {
+            char tmpl[] = "/tmp/ds4-kv-chain-whole-text-test.XXXXXX";
+            char *dir = mkdtemp(tmpl);
+            TEST_ASSERT(dir != NULL);
+            if (!dir) return;
+            uint64_t now = (uint64_t)time(NULL);
+            char *text = test_kv_chain_text(1, longer_len, 0);
+            text[diverges[d]] ^= 0x20;
+            char *front = test_kv_chain_file(dir, 1, front_len, 0,
+                                             KV_REASON_CONTINUED, 0, now - 300);
+            char *other = test_kv_chain_file(dir, 2, 8192, 0,
+                                             KV_REASON_CONTINUED, 0, now - 1800);
+            char *longer = NULL;
+            uint64_t total = test_kv_chain_bytes(front_len) + test_kv_chain_bytes(8192);
+            if (incoming_store) {
+                const uint64_t bytes = test_kv_chain_bytes(longer_len);
+                kv_disk_cache kc = {0};
+                kc.enabled = true;
+                kc.dir = xstrdup(dir);
+                kc.opt = kv_cache_default_options();
+                kc.budget_bytes = total + bytes - 1;
+                ds4_kvstore_eviction_context incoming = {
+                    .text = text,
+                    .text_len = longer_len,
+                    .model_id = 0,
+                    .quant_bits = 2,
+                    .ctx_size = 32768,
+                    .reason = KV_REASON_CONTINUED,
+                };
+                kv_cache_evict(&kc, NULL, bytes, &incoming);
+                kv_cache_close(&kc);
+            } else {
+                longer = test_kv_chain_write(dir, text, longer_len,
+                                             KV_REASON_CONTINUED, 0, now - 200);
+                total += test_kv_chain_bytes(longer_len);
+                test_kv_chain_evict(dir, total, 1);
+                TEST_ASSERT(access(longer, F_OK) == 0);
+            }
+            const bool shared = diverges[d] >= front_len;
+            TEST_ASSERT((access(front, F_OK) == 0) == !shared);
+            TEST_ASSERT((access(other, F_OK) == 0) == shared);
+
+            unlink(front); unlink(other);
+            if (longer) unlink(longer);
+            free(front); free(other); free(longer); free(text);
+            rmdir(dir);
+        }
+    }
 }
 
 static void test_kv_cache_eviction_keeps_entry_loaded_after_longer_one(void) {
@@ -25634,6 +25767,40 @@ static void test_image_count_ceiling(void) {
     TEST_ASSERT(key.offsets == NULL && key.count == 0);
 }
 
+/* A rendered prompt past SERVER_MAX_PROMPT_BYTES is a 400 before anything
+ * tokenizes it (with no engine the tokenizer would crash) or encodes its
+ * images; one of exactly the bound passes. */
+static void test_prompt_byte_ceiling(void) {
+    const size_t n = SERVER_MAX_PROMPT_BYTES + 1;
+    char *text = malloc(n + 1);
+    TEST_ASSERT(text != NULL);
+    if (!text) return;
+    memset(text, 'a', n);
+    text[n] = '\0';
+    chat_msg user = {.role = "user", .content = "x"};
+    user.images.len = 1;
+    chat_msgs msgs = {.v = &user, .len = 1};
+    for (int images = 0; images < 2; images++) {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.prompt_text = text;
+        char err[256] = "";
+        TEST_ASSERT(!request_tokenize_multimodal_prompt(NULL, NULL, &r,
+                                                        images ? &msgs : NULL,
+                                                        err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "prompt too large") != NULL);
+        TEST_ASSERT(r.prompt.len == 0 && r.image_count == 0);
+        r.prompt_text = NULL;
+        request_free(&r);
+    }
+    request r = {.prompt_text = text};
+    char err[256] = "";
+    TEST_ASSERT(!request_prompt_text_fits(&r, err, sizeof(err)));
+    text[SERVER_MAX_PROMPT_BYTES] = '\0';
+    TEST_ASSERT(request_prompt_text_fits(&r, err, sizeof(err)));
+    free(text);
+}
+
 static void write_all_fd(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t w = write(fd, p, n);
@@ -26042,8 +26209,19 @@ static void test_metrics_export(void) {
     metrics_note_kv_lookup(true);
     metrics_note_kv_lookup(false);
     metrics_note_image(false);
+    /* The engine counters belong to the process: groups that ran earlier in
+     * the same ds4_test have decoded into them, so check the rendering of
+     * what they hold, and the summary of what this test adds. */
+    uint64_t v0[DS4_METRIC_COUNT], v[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(v0);
     ds4_metric_add(DS4_METRIC_DECODE_TOKENS, 5);
     ds4_metric_add(DS4_METRIC_DECODE_NS, 1000000000ull);
+    ds4_metrics_snapshot(v);
+    const double decode_s = (double)v[DS4_METRIC_DECODE_NS] / 1e9;
+    char want_decode_s[64], want_decode_tps[64];
+    snprintf(want_decode_s, sizeof(want_decode_s), "\"decode_seconds\":%.6f,", decode_s);
+    snprintf(want_decode_tps, sizeof(want_decode_tps), "\"decode_tokens_per_second\":%.3f,",
+             (double)v[DS4_METRIC_DECODE_TOKENS] / decode_s);
 
     buf b = {0};
     metrics_render_prometheus(&s, &b);
@@ -26064,17 +26242,15 @@ static void test_metrics_export(void) {
     metrics_render_json(&s, &b);
     TEST_ASSERT(b.len > 2 && b.ptr[0] == '{' && b.ptr[b.len - 2] == '}' && b.ptr[b.len - 1] == '\n');
     TEST_ASSERT(test_count_char(b.ptr, '{') == test_count_char(b.ptr, '}'));
-    TEST_ASSERT(strstr(b.ptr, "\"decode_seconds\":1.000000,") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"decode_tokens_per_second\":5.000,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, want_decode_s) != NULL);
+    TEST_ASSERT(strstr(b.ptr, want_decode_tps) != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"time_share\":{") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"requests\":{\"chat\":1,\"completions\":0,\"responses\":0,\"messages\":1}") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"time_to_first_token_seconds\":{\"count\":1,\"avg\":1.000000,\"max\":1.000000}") != NULL);
     buf_free(&b);
 
     char line[512];
-    uint64_t v[DS4_METRIC_COUNT];
-    ds4_metrics_snapshot(v);
-    ds4_metrics_summary(v, NULL, 10.0, line, sizeof(line));
+    ds4_metrics_summary(v, v0, 10.0, line, sizeof(line));
     TEST_ASSERT(strstr(line, "decode 5 tok 1.0s 5.0 t/s") != NULL);
     TEST_ASSERT(strstr(line, "decode 10%") != NULL);
     pthread_mutex_destroy(&s.mu);
@@ -26161,6 +26337,7 @@ static void ds4_server_unit_tests_run(void) {
     test_visible_image_key();
     test_kv_cache_image_identity();
     test_image_count_ceiling();
+    test_prompt_byte_ceiling();
     test_http_body_limits();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
@@ -26340,6 +26517,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_drops_old_tip_of_same_conversation();
     test_kv_cache_eviction_keeps_fallback_under_unproven_tip();
     test_kv_cache_eviction_drops_dead_tip();
+    test_kv_cache_eviction_compares_whole_text();
     test_kv_cache_eviction_keeps_entry_loaded_after_longer_one();
     test_kv_cache_eviction_thins_waypoints_by_gap();
     test_kv_cache_eviction_is_lru_among_unrelated();
