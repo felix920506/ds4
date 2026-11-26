@@ -6698,6 +6698,11 @@ int ds4_dist_sessions_eval(
 
     for (int i = 0; i < count; i++) {
         if (route_wait_spent && ds4_dist_session_route_ready(items[i].dist, NULL, 0) == 0) {
+            /* Leave it as a failed route check does: with its old plan kept,
+             * a later recovery would forget that plan's healthy workers. */
+            dist_route_plan_free(&items[i].dist->plan);
+            items[i].dist->plan_ready = false;
+            items[i].dist->plan_generation = 0;
             members[i].pos0 = (uint32_t)items[i].checkpoint->len;
             members[i].rc = 1;
             failed++;
