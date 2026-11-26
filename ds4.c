@@ -18847,8 +18847,9 @@ static bool metal_graph_kv_admit(const ds4_gpu_graph *g, uint32_t ctx_size) {
 
 /* Replace *slot with a tensor of new_bytes that keeps the first keep_bytes.
  * With nothing to keep the old tensor is released first, so a scratch resize
- * never needs both sizes at once.  On failure the slot still holds a tensor
- * of the old size. */
+ * never needs both sizes at once.  On failure the slot holds a tensor of the
+ * old size, or NULL when there was none or the rollback allocation failed
+ * too; refits and a joining session rebuild it. */
 static bool metal_graph_kv_resize(
         ds4_gpu_graph   *g,
         ds4_gpu_tensor **slot,
@@ -18870,9 +18871,10 @@ static bool metal_graph_kv_resize(
     }
     ds4_gpu_tensor *t = NULL;
     if (keep_bytes == 0) {
+        const bool had_old = old != NULL;
         ds4_gpu_tensor_free(old);
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
-        *slot = t ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
+        *slot = t || !had_old ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
     } else {
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
         if (t && (ds4_gpu_tensor_copy(t, 0, old, 0, keep_bytes) == 0 ||
@@ -19020,6 +19022,13 @@ static bool metal_graph_kv_reserve(
     return metal_graph_kv_reserve_scratch(g, rows * n_tokens * sizeof(float));
 }
 
+/* Whether layer il has this compressed cache: the layers this graph holds
+ * (a pipeline stage holds a slice) with a compression ratio, and for the
+ * indexer only the ratio-4 ones, as metal_graph_alloc_raw_cap allocates them. */
+static bool metal_graph_kv_layer_has_cache(const ds4_gpu_graph *g, uint32_t il, bool indexer) {
+    return g->layer_comp_cap[il] != 0 && (!indexer || ds4_layer_compress_ratio(il) == 4);
+}
+
 /* Size every compressed cache for the given valid row counts without keeping
  * its contents, and the scratch back to its minimum: a reset session holds
  * what a new one holds (n_comp == NULL), and a checkpoint about to be loaded
@@ -19036,7 +19045,10 @@ static bool metal_graph_kv_refit(
         for (int indexer = 0; indexer < 2; indexer++) {
             ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
                                              : &g->layer_attn_comp_cache[il];
-            if (!*cache) continue;
+            /* A NULL slot of a layer that has the cache is a resize that
+             * failed with its rollback: rebuild it, or prompts too short to
+             * emit a row for this layer never would. */
+            if (!metal_graph_kv_layer_has_cache(g, il, indexer != 0)) continue;
             const uint32_t *valid = indexer ? n_index_comp : n_comp;
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid ? valid[il] : 0, g->layer_comp_cap[il]);
@@ -19067,7 +19079,7 @@ static bool metal_graph_kv_refit_layers(
         for (int indexer = 0; indexer < 2; indexer++) {
             ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
                                              : &g->layer_attn_comp_cache[il];
-            if (!*cache) continue;
+            if (!metal_graph_kv_layer_has_cache(g, il, indexer != 0)) continue;
             const uint32_t valid = indexer ? n_index_comp[i] : n_comp[i];
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid, g->layer_comp_cap[il]);
@@ -20134,19 +20146,37 @@ static bool metal_graph_alloc_raw_cap(
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-        if (kv_scratch && kv_scratch->users) {
-            /* Later steps grow it if this session reserves more. */
-            g->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
-            g->comp_mask_by_tier[t] = kv_scratch->tensor[1];
-        } else {
-            g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
-            g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+        /* Take the shared tensors (later steps grow them if this session
+         * reserves more), and allocate the ones the pool lacks: the first
+         * session, or a NULL left by a resize that failed with its rollback,
+         * rebuilt here for the sessions using it too.  An allocation can run
+         * the memory-pressure handler on this thread, which may free pool
+         * sessions and so the pool's tensors: read the pool again after every
+         * allocation, and only then publish. */
+        ds4_gpu_tensor *scratch[2] = { NULL, NULL };
+        for (bool again = true; again; ) {
+            again = false;
+            for (int i = 0; i < 2; i++) {
+                if (scratch[i] || (kv_scratch && kv_scratch->users && kv_scratch->tensor[i])) continue;
+                scratch[i] = ds4_gpu_tensor_alloc_ptr_on(
+                        t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+                again = again || scratch[i] != NULL;
+            }
         }
+        for (int i = 0; kv_scratch && kv_scratch->users && i < 2; i++) {
+            if (!kv_scratch->tensor[i]) continue;
+            ds4_gpu_tensor_free(scratch[i]);
+            scratch[i] = kv_scratch->tensor[i];
+        }
+        g->indexer_scores_by_tier[t] = scratch[0];
+        g->comp_mask_by_tier[t] = scratch[1];
         if (kv_scratch) { /* on demand: tier 0 is the only one */
             kv_scratch->tensor[0] = g->indexer_scores_by_tier[t];
             kv_scratch->tensor[1] = g->comp_mask_by_tier[t];
+            for (ds4_gpu_graph *u = kv_scratch->users; u; u = u->kv_scratch_next) {
+                u->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
+                u->comp_mask_by_tier[t] = kv_scratch->tensor[1];
+            }
             g->kv_scratch = kv_scratch;
             g->kv_scratch_next = kv_scratch->users;
             kv_scratch->users = g;
