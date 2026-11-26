@@ -91932,9 +91932,10 @@ uint64_t ds4_session_context_memory_bytes(const ds4_session *s) {
     const ds4_kv_scratch *pool = g->kv_scratch;
     const ds4_gpu_graph *rest = !pool ? NULL :
                                 pool->users != g ? pool->users : g->kv_scratch_next;
-    if (rest) {
-        const uint64_t fit = pool->resizing ? UINT64_MAX
-                                            : metal_graph_kv_scratch_fit_bytes(rest, g);
+    /* Nothing is counted while a resize runs: leave does not refit then,
+     * and the pool still names the tensor the resize has freed. */
+    if (rest && !pool->resizing) {
+        const uint64_t fit = metal_graph_kv_scratch_fit_bytes(rest, g);
         for (int i = 0; i < 2; i++) {
             const uint64_t have = ds4_gpu_tensor_bytes(pool->tensor[i]);
             if (fit < have) bytes += have - fit;
