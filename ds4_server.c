@@ -24645,11 +24645,10 @@ static char *test_kv_chain_text(int conv, size_t len, int tail) {
     return text;
 }
 
-/* Writes the checkpoint and returns its path. */
-static char *test_kv_chain_file(const char *dir, int conv, size_t len, int tail,
-                                uint8_t reason, uint32_t hits,
-                                uint64_t last_used) {
-    char *text = test_kv_chain_text(conv, len, tail);
+/* Writes a checkpoint of `text` and returns its path. */
+static char *test_kv_chain_write(const char *dir, const char *text, size_t len,
+                                 uint8_t reason, uint32_t hits,
+                                 uint64_t last_used) {
     char sha[41], name[44];
     sha1_bytes_hex(text, len, sha);
     snprintf(name, sizeof(name), "%.40s.kv", sha);
@@ -24669,6 +24668,15 @@ static char *test_kv_chain_file(const char *dir, int conv, size_t len, int tail,
         TEST_ASSERT(fwrite(text, 1, len, fp) == len);
         TEST_ASSERT(fclose(fp) == 0);
     }
+    return path;
+}
+
+/* Writes the checkpoint and returns its path. */
+static char *test_kv_chain_file(const char *dir, int conv, size_t len, int tail,
+                                uint8_t reason, uint32_t hits,
+                                uint64_t last_used) {
+    char *text = test_kv_chain_text(conv, len, tail);
+    char *path = test_kv_chain_write(dir, text, len, reason, hits, last_used);
     free(text);
     return path;
 }
@@ -24763,6 +24771,66 @@ static void test_kv_cache_eviction_drops_dead_tip(void) {
     unlink(dead); unlink(front); unlink(other);
     free(dead); free(front); free(other);
     rmdir(dir);
+}
+
+static void test_kv_cache_eviction_compares_whole_text(void) {
+    /* A frontier is redundant only under a longer checkpoint that has all of
+     * its text.  Its length is not a multiple of the signature grid, and the
+     * longer text differs from it at `diverge`: inside the bytes past the
+     * last full block, it is another conversation and the older checkpoint
+     * of a third one goes first; past its end, the frontier goes.  Once with
+     * the longer checkpoint on disk, once as the incoming store. */
+    const size_t front_len = 8292, longer_len = 8704;
+    const size_t diverges[] = {8250, 8400};
+    for (int incoming_store = 0; incoming_store < 2; incoming_store++) {
+        for (size_t d = 0; d < sizeof(diverges) / sizeof(diverges[0]); d++) {
+            char tmpl[] = "/tmp/ds4-kv-chain-whole-text-test.XXXXXX";
+            char *dir = mkdtemp(tmpl);
+            TEST_ASSERT(dir != NULL);
+            if (!dir) return;
+            uint64_t now = (uint64_t)time(NULL);
+            char *text = test_kv_chain_text(1, longer_len, 0);
+            text[diverges[d]] ^= 0x20;
+            char *front = test_kv_chain_file(dir, 1, front_len, 0,
+                                             KV_REASON_CONTINUED, 0, now - 300);
+            char *other = test_kv_chain_file(dir, 2, 8192, 0,
+                                             KV_REASON_CONTINUED, 0, now - 1800);
+            char *longer = NULL;
+            uint64_t total = test_kv_chain_bytes(front_len) + test_kv_chain_bytes(8192);
+            if (incoming_store) {
+                const uint64_t bytes = test_kv_chain_bytes(longer_len);
+                kv_disk_cache kc = {0};
+                kc.enabled = true;
+                kc.dir = xstrdup(dir);
+                kc.opt = kv_cache_default_options();
+                kc.budget_bytes = total + bytes - 1;
+                ds4_kvstore_eviction_context incoming = {
+                    .text = text,
+                    .text_len = longer_len,
+                    .model_id = 0,
+                    .quant_bits = 2,
+                    .ctx_size = 32768,
+                    .reason = KV_REASON_CONTINUED,
+                };
+                kv_cache_evict(&kc, NULL, bytes, &incoming);
+                kv_cache_close(&kc);
+            } else {
+                longer = test_kv_chain_write(dir, text, longer_len,
+                                             KV_REASON_CONTINUED, 0, now - 200);
+                total += test_kv_chain_bytes(longer_len);
+                test_kv_chain_evict(dir, total, 1);
+                TEST_ASSERT(access(longer, F_OK) == 0);
+            }
+            const bool shared = diverges[d] >= front_len;
+            TEST_ASSERT((access(front, F_OK) == 0) == !shared);
+            TEST_ASSERT((access(other, F_OK) == 0) == shared);
+
+            unlink(front); unlink(other);
+            if (longer) unlink(longer);
+            free(front); free(other); free(longer); free(text);
+            rmdir(dir);
+        }
+    }
 }
 
 static void test_kv_cache_eviction_keeps_entry_loaded_after_longer_one(void) {
@@ -26409,6 +26477,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_drops_old_tip_of_same_conversation();
     test_kv_cache_eviction_keeps_fallback_under_unproven_tip();
     test_kv_cache_eviction_drops_dead_tip();
+    test_kv_cache_eviction_compares_whole_text();
     test_kv_cache_eviction_keeps_entry_loaded_after_longer_one();
     test_kv_cache_eviction_thins_waypoints_by_gap();
     test_kv_cache_eviction_is_lru_among_unrelated();
