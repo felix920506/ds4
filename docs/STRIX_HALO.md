@@ -104,13 +104,14 @@ fills. `--ctx` is a reservation: the compressed KV caches and the indexer
 scratch start small and grow, so a 1M-token session costs a short prompt
 nothing. With a 1M reservation, 2K-token prefill is 466 tok/s instead of 153,
 because the Q8->F16 weight cache keeps the memory the context is not using.
-`DS4_ROCM_KV_UPFRONT=1` restores up-front allocation for comparison.
+`DS4_ROCM_KV_UPFRONT` set to any value, including `0`, restores up-front
+allocation for comparison; unset it to go back.
 
 Sessions that take turns on the GPU (the slots of `--batched-session`, the
 sessions of a pipeline worker) share one indexer scratch, sized for the
 longest of them, instead of holding one each: at 1M tokens that is 4 to 8 GiB
-per extra session. `DS4_ROCM_KV_PRIVATE_SCRATCH=1` gives each session its own
-again.
+per extra session. `DS4_ROCM_KV_PRIVATE_SCRATCH` set to any value gives each
+session its own again.
 
 When an allocation does not fit, memory is taken back in this order:
 
@@ -121,19 +122,37 @@ When an allocation does not fit, memory is taken back in this order:
    recently used of what is left, which costs about 2% of prefill speed;
    smaller batches run the Q8 kernels.
 3. Routed experts: read back from the GGUF on demand (next section). This is
-   the last resort; it costs real speed.
+   the last resort; it costs real speed. It exists only for layers whose
+   experts are IQ2_XXS (gate, up) and Q2_K (down), in a model loaded whole on
+   one machine: a Q2 model has them in every layer, a mixed Q2/Q4 model only
+   in its Q2 layers. A pipeline stage (`--layers`), an MXFP4 or Q4 model and
+   `--ssd-streaming` have none.
+
+Which steps apply depends on the setup:
+
+- A single-machine server with `--batched-session`: step 1 for its idle
+  slots, step 2, and step 3 where experts can be evicted.
+- A single-machine server without `--batched-session`: no idle slot is freed,
+  so step 2, then step 3 where experts can be evicted.
+- A pipeline stage, as in the two-machine setup above: step 2 only. The
+  coordinator never frees its distributed sessions under memory pressure, the
+  worker has no server slots, and the MXFP4 experts cannot be evicted.
 
 Free memory goes back the other way: experts first, then the F16 cache. A
 session is refused at creation only if its full reservation could not be
-committed with all three given up. Output does not depend on the first and
-third step. The second changes which kernels small batches run, as a small or
-large `--ctx` already did.
+committed with every step that applies to the setup given up. Output does not
+depend on the first and third step. The second changes which kernels small
+batches run, as a small or large `--ctx` already did.
 
 ### Elastic expert weights
 
-Resident Flash on ROCm loads each layer's routed experts as its own device
-block. `ds4_gpu_reclaim_weights()` can then evict cold experts when the context,
-a new session or the fixed weights at load need memory, and they are read back from the GGUF on demand; attention,
+A model loaded whole on one machine loads the routed experts of each layer as
+its own device block on ROCm when that layer's experts are IQ2_XXS (gate, up)
+and Q2_K (down). A Q2 model has them in every layer, a mixed Q2/Q4 model only
+in its Q2 layers. A pipeline stage (`--layers`), an MXFP4 or Q4 model and
+`--ssd-streaming` have none, and the two-machine setup above stops at the F16
+weight cache. Where they exist, `ds4_gpu_reclaim_weights()` evicts cold
+experts when the context, a new session or the fixed weights at load need memory, and they are read back from the GGUF on demand; attention,
 shared experts and all other weights always stay resident. The mechanism and
 its policy are documented in `rocm/ds4_rocm_elastic.cuh`. Results do not
 change: evicted layers run the same kernels on the same bytes.
@@ -163,9 +182,12 @@ Both are bound by SSD reads; a faster drive moves every evicted row up.
 for 10 to 40 GiB. At most 61.8 of the 72.6 GiB of routed experts can be
 evicted; every layer keeps at least 32 experts.
 
-Diagnostics: `DS4_ROCM_ELASTIC_STATS=1` prints reclaim and hit/miss counters,
-`DS4_ROCM_ELASTIC_NO_GROW=1` stops evicted layers from growing back while
+Diagnostics: `DS4_ROCM_ELASTIC_STATS` prints reclaim and hit/miss counters,
+`DS4_ROCM_ELASTIC_NO_GROW` stops evicted layers from growing back while
 memory is free, `DS4_ROCM_ELASTIC_TRACE=FILE` records every routed selection.
+`DS4_ROCM_ELASTIC_STATS`, `DS4_ROCM_ELASTIC_NO_GROW` and the two switches above
+only test whether the variable is set: `=0` or an empty value turns them on,
+so unset them to turn them off.
 
 ### Prefill precision and `--quality`
 

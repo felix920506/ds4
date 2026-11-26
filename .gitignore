@@ -86,6 +86,7 @@
 /tests/test_glm_attention_rocm
 /tests/test_linux_memory
 /tests/test_rocm_memory
+/tests/test_rocm_memory_budget
 /tests/test_qwen4_kernels
 /tests/test_metal_device_policy
 /tests/test_metal_q8_reduction
@@ -144,5 +145,6 @@ __pycache__/
 /tests/test_rocm_moe_gateup_fallback
 /tests/test_rocm_moe_mxfp4
 /tests/test_rocm_q8_f16_reuse
+/tests/test_rocm_q8_f16_evict
 /tests/test_rocm_indexer
 /tests/test_rocm_visual_attention

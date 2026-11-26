@@ -1613,9 +1613,12 @@ static double now_sec(void) {
  * Phases are measured at the public API, and only the outermost call on a
  * thread records.  ds4_session_sync_multimodal() ends in ds4_session_sync(),
  * the mixed prefill/decode batch can fall back to a sync plus a decode batch,
- * the speculative entry points fall back to plain eval, and payload staging
- * runs ds4_session_save_payload(): the thread-local depth keeps those inner
- * calls silent instead of counting the same wall time twice. */
+ * and the speculative entry points fall back to plain eval: the thread-local
+ * depth keeps those inner calls silent instead of counting the same wall time
+ * twice.  KV saves are the exception for calls and bytes: a continued
+ * checkpoint or a memory-pressure kick is written from inside a sync or an
+ * eval, and is still a payload written, so only its time stays with the
+ * enclosing phase. */
 static uint64_t g_metrics[DS4_METRIC_COUNT];
 static __thread int g_metrics_depth;
 
@@ -41686,10 +41689,22 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
     return false;
 }
 
+/* Next capacity of a token vector: twice cap, saturating at INT_MAX (the type
+ * of ds4_tokens.cap), or 0 when cap is already INT_MAX.  The server accepts
+ * bodies of gigabytes and tokenizes them before checking the context size, so
+ * the count can reach INT_MAX. */
+static int token_vec_grow_capacity(int cap) {
+    if (cap == INT_MAX) return 0;
+    if (cap == 0) return 64;
+    return cap > INT_MAX / 2 ? INT_MAX : cap * 2;
+}
+
 static void token_vec_push(token_vec *tv, int token) {
     if (tv->len == tv->cap) {
-        tv->cap = tv->cap ? tv->cap * 2 : 64;
-        tv->v = xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
+        int cap = token_vec_grow_capacity(tv->cap);
+        if (cap == 0) ds4_die("token vector too large");
+        tv->v = xrealloc(tv->v, (size_t)cap * sizeof(tv->v[0]));
+        tv->cap = cap;
     }
     tv->v[tv->len++] = token;
 }
@@ -45709,31 +45724,40 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
     return rank;
 }
 
+/* Twice cap elements of elem_size bytes, or 0 when that many bytes do not
+ * fit in a size_t.  One piece holds a symbol per character, and the server
+ * accepts bodies of gigabytes, so the count can pass INT_MAX. */
+static size_t bpe_grow_capacity(size_t cap, size_t elem_size) {
+    if (cap > SIZE_MAX / 2 / elem_size) return 0;
+    return cap * 2;
+}
+
 /* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
 static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
-    int n_sym = 0;
-    int cap_sym = 32;
-    owned_str *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
+    size_t n_sym = 0;
+    size_t cap_sym = 32;
+    owned_str *sym = xcalloc(cap_sym, sizeof(sym[0]));
 
     for (uint64_t off = 0; off < encoded_len;) {
         int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
         if (off + (uint64_t)n > encoded_len) n = 1;
         if (n_sym == cap_sym) {
-            cap_sym *= 2;
-            sym = xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
+            cap_sym = bpe_grow_capacity(cap_sym, sizeof(sym[0]));
+            if (cap_sym == 0) ds4_die("allocation size overflow");
+            sym = xrealloc(sym, cap_sym * sizeof(sym[0]));
         }
         sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
         off += (uint64_t)n;
     }
 
     for (;;) {
-        int best_i = -1;
+        size_t best_i = SIZE_MAX;
         int best_rank = INT32_MAX;
 
-        for (int i = 0; i + 1 < n_sym; i++) {
+        for (size_t i = 0; i + 1 < n_sym; i++) {
             int rank = bpe_rank(vocab, &sym[i], &sym[i + 1]);
             if (rank >= 0 && rank < best_rank) {
                 best_rank = rank;
@@ -45741,7 +45765,7 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
             }
         }
 
-        if (best_i < 0) break;
+        if (best_i == SIZE_MAX) break;
 
         owned_str merged;
         merged.len = sym[best_i].len + sym[best_i + 1].len;
@@ -45753,13 +45777,13 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
         free(sym[best_i + 1].ptr);
         sym[best_i] = merged;
 
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
+        for (size_t j = best_i + 1; j + 1 < n_sym; j++) {
             sym[j] = sym[j + 1];
         }
         n_sym--;
     }
 
-    for (int i = 0; i < n_sym; i++) {
+    for (size_t i = 0; i < n_sym; i++) {
         int token = -1;
         if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
             token_vec_push(out, token);
@@ -63661,17 +63685,121 @@ static void ds4_release_instance_lock(void) {
 }
 
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
- * stale accidental second run is more dangerous than a normal CLI error. */
+ * stale accidental second run is more dangerous than a normal CLI error.
+ *
+ * The default lock lives in its own directory so that containers can share it
+ * with native processes by bind-mounting the host's /tmp/ds4-lock at the same
+ * path (see docs/DOCKER.md).  Containers usually run as root and natives as a
+ * user, so a lock file ds4 creates is made world-writable and a native process
+ * can lock a file a root container created.  Which process may create the
+ * directory first depends on who owns it: see docs/DOCKER.md for the
+ * orderings that need a root-provisioned 1777 directory.
+ *
+ * The directory is in /tmp, so another local user may have made it, or may
+ * plant entries in it.  It is only used if it is owned by root or by us, and
+ * is sticky when others can write it; the file is opened through that
+ * directory's descriptor without following symlinks, must be a regular file
+ * with one link, and only a file created by this call gets its mode changed. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
-    if (!path || !path[0]) path = "/tmp/ds4.lock";
+    char dir[PATH_MAX];
+    const char *name;
+    int dir_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    bool made_dir = false;
+    if (!path || !path[0]) {
+        path = "/tmp/ds4-lock/ds4.lock";
+        snprintf(dir, sizeof(dir), "/tmp/ds4-lock");
+        name = "ds4.lock";
+        dir_flags |= O_NOFOLLOW;
+        made_dir = mkdir(dir, 0700) == 0;
+    } else {
+        const char *slash = strrchr(path, '/');
+        name = slash ? slash + 1 : path;
+        if (!slash) snprintf(dir, sizeof(dir), ".");
+        else if (slash == path) snprintf(dir, sizeof(dir), "/");
+        else snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+        if (!name[0] || strlen(path) >= sizeof(dir)) {
+            fprintf(stderr, "ds4: invalid lock file path %s\n", path);
+            exit(2);
+        }
+#ifdef O_PATH
+        dir_flags |= O_PATH; /* only searched, so it need not be readable */
+#endif
+    }
+    /* The hints name the remedies for the default directory; DS4_LOCK_FILE
+     * may point there too (the compose files set it). */
+    const bool custom_path = strcmp(dir, "/tmp/ds4-lock") != 0;
 
-    const int fd = open(path, O_RDWR | O_CREAT, 0600);
-    if (fd < 0) {
-        fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
+    const int dfd = open(dir, dir_flags);
+    struct stat st;
+    if (dfd < 0 || fstat(dfd, &st) != 0) {
+        const int e = errno;
+        fprintf(stderr, "ds4: failed to open lock directory %s: %s%s\n", dir, strerror(e),
+                e == ELOOP || e == ENOTDIR ? " (it must be a real directory, not a symlink)" : "");
         exit(2);
     }
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    const uid_t euid = geteuid();
+    if ((st.st_uid != 0 && st.st_uid != euid) ||
+        ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)))
+    {
+        fprintf(stderr,
+                "ds4: refusing to use lock directory %s: owner uid %u, mode %04o; it must be owned by "
+                "root%s and be sticky if others can write to it.",
+                dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777),
+                euid == 0 ? "" : " or by you");
+        if (custom_path) {
+            fprintf(stderr, " Point DS4_LOCK_FILE into a directory owned by root or by you that others cannot write to");
+        } else {
+            fprintf(stderr, " With no ds4 running, remove it (sudo rm -r %s) or recreate it as root "
+                    "(sudo install -d -m 1777 %s)", dir, dir);
+        }
+        fputc('\n', stderr);
+        exit(2);
+    }
+    /* The directory is ours and still 0700, so nobody else can have entered
+     * it.  Root makes it shared; a user's directory is not used by root or by
+     * other users anyway (see above), so it stays closed to writes. */
+    if (made_dir && st.st_uid == euid && (st.st_mode & 07777) == 0700) {
+        (void)fchmod(dfd, euid == 0 ? 01777 : 0755);
+    }
+
+    /* O_NONBLOCK: a FIFO planted at the lock path must not block the open. */
+    const int file_flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
+    bool made_file = false;
+    int fd = -1;
+    for (int tries = 0; fd < 0 && tries < 3; tries++) {
+        fd = openat(dfd, name, file_flags | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            made_file = true;
+            break;
+        }
+        if (errno != EEXIST) break;
+        /* Without O_CREAT: fs.protected_regular refuses O_CREAT on another
+         * user's file in a sticky world-writable directory, even when the
+         * file itself is writable. */
+        fd = openat(dfd, name, file_flags);
+        if (fd < 0 && errno != ENOENT) break;
+    }
+    const int open_errno = errno;
+    close(dfd);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(open_errno));
+        if (open_errno == ELOOP) {
+            fprintf(stderr, "ds4: it is a symlink; refusing to follow it\n");
+        } else if (open_errno == EACCES) {
+            fprintf(stderr, "ds4: with no ds4 running, remove a leftover file you cannot open "
+                    "(sudo rm -f %s)", path);
+            if (!custom_path) fprintf(stderr, ", or let every user create it (sudo chmod 1777 %s)", dir);
+            fputc('\n', stderr);
+        }
+        exit(2);
+    }
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        fprintf(stderr, "ds4: refusing to use lock file %s: not a regular file with a single link\n", path);
+        close(fd);
+        exit(2);
+    }
+    if (made_file) (void)fchmod(fd, 0666); /* Undo the umask. */
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
@@ -63772,7 +63900,8 @@ typedef struct {
     uint64_t prefix_hash;   /* of those tokens; binds the anchor to its timeline */
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
-    uint8_t *state;         /* raw window rows and compressor state, layer by layer */
+    uint8_t *state;         /* raw window rows and compressor state, layer by layer,
+                             * then the logits of the frontier */
 } ds4_session_anchor;
 
 struct ds4_session {
@@ -66264,7 +66393,7 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
     const uint64_t t0 = metrics_begin();
     const int rc = ds4_session_write_staged_payload_unmetered(payload, fp, err, errlen);
     metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
-    if (t0 && rc == 0) {
+    if (rc == 0) {
         ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
         ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, payload->bytes);
     }
@@ -66301,6 +66430,7 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_payload_file *out,
                                                char *err, size_t errlen);
+static int ds4_session_save_payload_unmetered(ds4_session *s, FILE *fp, char *err, size_t errlen);
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
@@ -66338,7 +66468,9 @@ static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_paylo
         return 1;
     }
 
-    int rc = ds4_session_save_payload(s, fp, err, errlen);
+    /* The staged copy is counted when ds4_session_write_staged_payload()
+     * writes it to its destination. */
+    int rc = ds4_session_save_payload_unmetered(s, fp, err, errlen);
     if (rc == 0 && fflush(fp) != 0) {
         payload_set_err(err, errlen, "failed to flush staged session payload");
         rc = 1;
@@ -66637,7 +66769,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     const long start = fp ? ftell(fp) : -1;
     const int rc = ds4_session_save_payload_unmetered(s, fp, err, errlen);
     metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
-    if (t0 && rc == 0) {
+    if (rc == 0) {
         const long end = ftell(fp);
         ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
         if (start >= 0 && end > start) ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, (uint64_t)(end - start));
@@ -77241,6 +77373,12 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The backend keeps the handler in process globals.  Its user state may
+     * go with this engine, and an engine opened next must not reach it from
+     * its own allocations, or from anything this close still allocates. */
+    if (e->memory_pressure.fn) ds4_gpu_set_memory_pressure_handler(NULL, NULL);
+#endif
     ds4_dist_coordinator_close(e->dist_coordinator);
     e->dist_coordinator = NULL;
     ds4_engine_tp_unbind(e);
@@ -91593,11 +91731,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
  * overwritten by later tokens, and each compressor holds the partial window of
  * the latest tokens instead of the one it held back then.  An anchor is a host
  * copy of exactly that perishable part of one frontier - the window of raw
- * rows before it, the compressor state, and the compressed row counts.  With
- * it the session can return to that position and evaluate a different
- * continuation, at a cost that does not grow with the context (about 22 MiB
- * for all of Flash, against a disk checkpoint that also carries every
- * compressed row).
+ * rows before it, the compressor state, and the compressed row counts - plus
+ * the logits there.  With it the session can return to that position and
+ * sample or evaluate a different continuation, at a cost that does not grow
+ * with the context (about 22 MiB for all of Flash, against a disk checkpoint
+ * that also carries every compressed row).
  *
  * Callers take anchors where they may want to come back to, such as the start
  * of a reply and at intervals inside it (ds4_session_anchor_save).  A fixed
@@ -91768,14 +91906,17 @@ bool ds4_session_anchor_save(ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_synchronize() != 0;
     ds4_session_anchor a = {.pos = pos, .prefix_hash = hash};
-    a.state = ok ? malloc((size_t)session_anchor_copy(g, (uint32_t)pos, NULL,
-                                                      ANCHOR_SIZE, &ok)) : NULL;
+    const size_t logits_bytes = (size_t)DS4_N_VOCAB * sizeof(float);
+    const uint64_t bytes = ok ? session_anchor_copy(g, (uint32_t)pos, NULL,
+                                                    ANCHOR_SIZE, &ok) : 0;
+    a.state = ok ? malloc((size_t)bytes + logits_bytes) : NULL;
     if (!a.state) return false;
     session_anchor_copy(g, (uint32_t)pos, a.state, ANCHOR_SAVE, &ok);
     if (!ok) {
         free(a.state);
         return false;
     }
+    memcpy(a.state + bytes, s->logits, logits_bytes);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         a.n_comp[il] = g->layer_n_comp[il];
         a.n_index_comp[il] = g->layer_n_index_comp[il];
@@ -91800,7 +91941,8 @@ bool ds4_session_anchor_rewind(ds4_session *s, int pos) {
     ds4_gpu_graph *g = &s->graph;
     const ds4_session_anchor *a = &s->anchors[i];
     bool ok = ds4_gpu_synchronize() != 0;
-    if (ok) session_anchor_copy(g, (uint32_t)pos, a->state, ANCHOR_RESTORE, &ok);
+    uint64_t bytes = 0;
+    if (ok) bytes = session_anchor_copy(g, (uint32_t)pos, a->state, ANCHOR_RESTORE, &ok);
     if (ok) ok = ds4_gpu_synchronize() != 0;
     if (!ok) {
         /* Some layers may already hold the anchor's rows. */
@@ -91819,9 +91961,11 @@ bool ds4_session_anchor_rewind(ds4_session *s, int pos) {
            (uint64_t)s->checkpoint_images[s->checkpoint_image_count - 1].token_start +
            s->checkpoint_images[s->checkpoint_image_count - 1].token_count > (uint64_t)pos)
         s->checkpoint_image_count--;
-    /* Drafting state describes the abandoned continuation, and the logits
-     * are those of its last token: the caller evaluates at least one token
-     * from here before sampling. */
+    /* The frontier's own logits come back with it, so the session can be
+     * sampled or saved before anything else is evaluated (a cancelled sync,
+     * a prompt that ends exactly here).  Drafting state describes the
+     * abandoned continuation. */
+    memcpy(s->logits, a->state + bytes, (size_t)DS4_N_VOCAB * sizeof(float));
     s->mtp_draft_valid = false;
     s->dist_spec_pending = false;
     g->mtp_n_raw = 0;

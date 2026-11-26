@@ -4,6 +4,7 @@
 import http.server
 import math
 import os
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -160,6 +161,34 @@ class LoggerTests(unittest.TestCase):
         self.assertEqual(ok, 0)
         self.assertTrue(err)
         self.srv = FakeServer()  # for tearDown
+
+    def test_truncated_body_is_recorded(self):
+        # The server promises 1000 bytes and drops the connection after 30:
+        # http.client.IncompleteRead is not an OSError.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        self.addCleanup(srv.close)
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                c.recv(4096)
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                          b"Content-Length: 1000\r\n\r\nds4_up 1\nds4_requests_total 5\n")
+                c.close()
+        threading.Thread(target=serve, daemon=True).start()
+        url = "http://127.0.0.1:%d/metrics" % srv.getsockname()[1]
+        self.assertFalse(ml.scrape_once(self.conn, url, timeout=5))
+        ok, err = self.conn.execute("SELECT ok, error FROM scrapes").fetchone()
+        self.assertEqual(ok, 0)
+        self.assertIn("IncompleteRead", err)
+        # The run loop keeps going instead of dying on the first bad scrape.
+        ml.run(self.conn, [url], 0.01, 5, 0, threading.Event(), max_scrapes=2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM scrapes WHERE ok = 0").fetchone()[0], 3)
 
     def test_prune_cascades(self):
         self.scrape(1000.0, decode=1, uptime=1)

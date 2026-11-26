@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "ds4_image.h"
 
 #include <errno.h>
@@ -257,6 +261,8 @@ static int ds4_oriented_rgb(
  * 7) and then `convert` (ImageMagick 6) are looked up in PATH. */
 
 #define DS4_IMAGE_EXTERNAL_TIMEOUT_MS 60000
+/* Tests shorten the deadline through this variable (milliseconds). */
+#define DS4_IMAGE_EXTERNAL_TIMEOUT_ENV "DS4_IMAGE_EXTERNAL_TIMEOUT_MS"
 #define DS4_IMAGE_EXTERNAL_HINT "install ImageMagick (magick or convert in PATH) to decode it"
 
 typedef enum {
@@ -585,7 +591,10 @@ static int ds4_image_run(const char *program, char *const argv[],
     size_t written = 0, cap = 0, err_len = 0;
     uint8_t *buf = NULL;
     bool killed = false;
-    const int64_t deadline = ds4_image_now_ms() + DS4_IMAGE_EXTERNAL_TIMEOUT_MS;
+    int64_t timeout_ms = DS4_IMAGE_EXTERNAL_TIMEOUT_MS;
+    const char *timeout_env = getenv(DS4_IMAGE_EXTERNAL_TIMEOUT_ENV);
+    if (timeout_env && atoll(timeout_env) > 0) timeout_ms = atoll(timeout_env);
+    const int64_t deadline = ds4_image_now_ms() + timeout_ms;
     if (input_len == 0) ds4_image_close(&in[1]);
     while (op[0] >= 0 || ep[0] >= 0) {
         struct pollfd pfd[3];
@@ -595,7 +604,7 @@ static int ds4_image_run(const char *program, char *const argv[],
         if (ep[0] >= 0) { ierr = nfd; pfd[nfd++] = (struct pollfd){.fd = ep[0], .events = POLLIN}; }
         int64_t left = deadline - ds4_image_now_ms();
         if (left <= 0) {
-            snprintf(err, err_cap, "timed out after %d s", DS4_IMAGE_EXTERNAL_TIMEOUT_MS / 1000);
+            snprintf(err, err_cap, "timed out after %g s", (double)timeout_ms / 1000.0);
             killed = true;
             break;
         }
@@ -657,9 +666,28 @@ static int ds4_image_run(const char *program, char *const argv[],
     ds4_image_close(&in[1]);
     ds4_image_close(&op[0]);
     ds4_image_close(&ep[0]);
-    if (killed) kill(pid, SIGKILL);
+    /* EOF on both pipes does not mean the child is gone: it can close them
+     * and keep running.  Hold it to the same deadline, then kill and reap. */
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (!killed) {
+        long nap_us = 500;
+        for (;;) {
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) break;
+            if (w < 0 && errno != EINTR) { status = 0; break; }
+            if (ds4_image_now_ms() >= deadline) {
+                snprintf(err, err_cap, "timed out after %g s", (double)timeout_ms / 1000.0);
+                killed = true;
+                break;
+            }
+            usleep((useconds_t)nap_us);
+            if (nap_us < 20000) nap_us *= 2;
+        }
+    }
+    if (killed) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
     if (tmpdir) nftw(tmpdir, ds4_image_rm_tree, 8, FTW_DEPTH | FTW_PHYS);
 
 #ifndef F_SETNOSIGPIPE

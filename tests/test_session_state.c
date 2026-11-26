@@ -2,6 +2,8 @@
  * also runs speculative rollback through the real pooled-indexer kernel. */
 #include "../ds4.c"
 #include <assert.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static void test_vision_prefix(void) {
     ds4_session *s = calloc(1, sizeof(*s));
@@ -277,6 +279,108 @@ static void test_snapshot_bytes(void) {
         fclose(fp);
     }
     ds4_session_snapshot_free(&snapshot);
+    ds4_session_free(s);
+    g_ds4_shape = saved_shape;
+    g_ds4_compress_ratios[0] = saved_ratio;
+}
+
+/* The symbol array of one BPE piece grows past INT_MAX entries without
+ * overflow (one unbroken run of letters is one piece, and a request body can
+ * hold gigabytes of them), and refuses a size that does not fit. */
+static void test_bpe_symbol_capacity(void) {
+    const size_t sym = sizeof(owned_str);
+    assert(bpe_grow_capacity(32, sym) == 64);
+    assert(bpe_grow_capacity((size_t)1 << 30, sym) == (size_t)1 << 31);
+    assert(bpe_grow_capacity((size_t)1 << 31, sym) == (size_t)1 << 32);
+    assert(bpe_grow_capacity(SIZE_MAX / 2 / sym, sym) == SIZE_MAX / 2 / sym * 2);
+    assert(bpe_grow_capacity(SIZE_MAX / 2 / sym + 1, sym) == 0);
+    assert(bpe_grow_capacity(SIZE_MAX / 2, 1) == SIZE_MAX - 1);
+    assert(bpe_grow_capacity(SIZE_MAX / 2 + 1, 1) == 0);
+
+    /* A piece longer than the first allocation, merged pairwise. */
+    ds4_vocab v = {0};
+    char bytes[256][5] = {{0}};
+    v.n_vocab = 257;
+    v.token = calloc((size_t)v.n_vocab, sizeof(*v.token));
+    assert(v.token);
+    table_init(&v.token_to_id, v.n_vocab);
+    table_init(&v.merge_rank, 1);
+    for (int i = 0; i < 256; i++) {
+        char *p = bytes[i];
+        utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)i));
+        v.token[i] = (ds4_str){bytes[i], (uint64_t)(p - bytes[i])};
+        table_put(&v.token_to_id, v.token[i], i);
+    }
+    v.token[256] = (ds4_str){"aa", 2};
+    table_put(&v.token_to_id, v.token[256], 256);
+    table_put(&v.merge_rank, (ds4_str){"a a", 3}, 0);
+    char run[101];
+    memset(run, 'a', 100);
+    run[100] = '\0';
+    token_vec out = {0};
+    bpe_emit_piece(&v, (ds4_str){run, 100}, &out);
+    assert(out.len == 50);
+    for (int i = 0; i < out.len; i++) assert(out.v[i] == 256);
+    token_vec_free(&out);
+    table_free(&v.token_to_id);
+    table_free(&v.merge_rank);
+    free(v.token);
+}
+
+static uint64_t metric_value(ds4_metric m) {
+    uint64_t v[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(v);
+    return v[m];
+}
+
+/* A KV payload counts as written once, whether it is saved at top level or
+ * from inside another phase (a continued checkpoint written during a sync, a
+ * memory-pressure kick during an eval); only the time of a nested save
+ * belongs to the phase around it. */
+static void test_kv_save_metrics(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    const uint32_t saved_ratio = g_ds4_compress_ratios[0];
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_shape.n_layer = 1;
+    g_ds4_shape.n_head_dim = 4;
+    g_ds4_shape.n_vocab = 8;
+    g_ds4_compress_ratios[0] = 0;
+    ds4_engine e = {.backend = DS4_BACKEND_CPU};
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    s->ctx_size = 8;
+    s->prefill_cap = 1;
+    s->checkpoint_valid = true;
+    s->logits = calloc(DS4_N_VOCAB, sizeof(float));
+    assert(s->logits);
+    kv_cache_init(&s->cpu_cache, 8, 0);
+    for (int i = 0; i < 3; i++) ds4_tokens_push(&s->checkpoint, i);
+    s->cpu_cache.layer[0].n_raw = 3;
+
+    char err[192] = {0};
+    for (int nested = 0; nested < 2; nested++) {
+        const uint64_t calls = metric_value(DS4_METRIC_KV_SAVE_CALLS);
+        const uint64_t bytes = metric_value(DS4_METRIC_KV_SAVE_BYTES);
+        const uint64_t save_ns = metric_value(DS4_METRIC_KV_SAVE_NS);
+        const uint64_t t0 = nested ? metrics_begin() : 0;
+        ds4_session_payload_file staged = {0};
+        assert(ds4_session_stage_payload(s, &staged, err, sizeof(err)) == 0);
+        assert(staged.bytes > 0);
+        FILE *fp = tmpfile();
+        assert(fp);
+        assert(ds4_session_write_staged_payload(&staged, fp, err, sizeof(err)) == 0);
+        assert(ds4_session_save_payload(s, fp, err, sizeof(err)) == 0);
+        assert(ftell(fp) == (long)(2 * staged.bytes));
+        if (nested) {
+            assert(metric_value(DS4_METRIC_KV_SAVE_NS) == save_ns);
+            metrics_end(t0, DS4_METRIC_PREFILL_NS);
+        }
+        assert(metric_value(DS4_METRIC_KV_SAVE_CALLS) == calls + 2);
+        assert(metric_value(DS4_METRIC_KV_SAVE_BYTES) == bytes + 2 * staged.bytes);
+        fclose(fp);
+        ds4_session_payload_file_free(&staged);
+    }
     ds4_session_free(s);
     g_ds4_shape = saved_shape;
     g_ds4_compress_ratios[0] = saved_ratio;
@@ -584,6 +688,88 @@ static void test_glm_spec_rollback(void) {
     munmap(model, MODEL_BYTES);
     g_ds4_shape = saved_shape;
 }
+
+/* A rewind to an anchor brings back the logits of that frontier, so a session
+ * sampled before it evaluates anything (a cancelled sync, a prompt that ends
+ * exactly on the anchor) answers from the anchor and not from the abandoned
+ * continuation.  A cut-down Flash shape keeps the state a few bytes. */
+static void test_anchor_rewind_logits(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    uint32_t saved_ratios[DS4_MAX_LAYER];
+    memcpy(saved_ratios, g_ds4_compress_ratios, sizeof(saved_ratios));
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_shape.n_layer = 2;
+    g_ds4_shape.n_head_dim = 4;
+    g_ds4_shape.n_indexer_head_dim = 4;
+    g_ds4_shape.n_vocab = 8;
+    g_ds4_compress_ratios[0] = 0;
+    g_ds4_compress_ratios[1] = 4;
+    assert(ds4_gpu_init());
+#ifdef __APPLE__
+    ds4_engine e = { .backend = DS4_BACKEND_METAL };
+#else
+    ds4_engine e = { .backend = DS4_BACKEND_CUDA };
+#endif
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    s->ctx_size = 64;
+    s->logits = calloc(DS4_N_VOCAB, sizeof(float));
+    assert(s->logits);
+    ds4_gpu_graph *g = &s->graph;
+    g->raw_cap = 16;
+    g->raw_window = 8;
+    const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc(g->raw_cap * row);
+        assert(g->layer_raw_cache[il]);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ratio) continue;
+        g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(layer_attn_state_bytes(ratio));
+        g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(layer_attn_state_bytes(ratio));
+        g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(layer_index_state_bytes(ratio));
+        g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(layer_index_state_bytes(ratio));
+        assert(g->layer_attn_state_kv[il] && g->layer_attn_state_score[il] &&
+               g->layer_index_state_kv[il] && g->layer_index_state_score[il]);
+    }
+    enum { P = 6, Q = 10 };
+    for (int i = 0; i < P; i++) ds4_tokens_push(&s->checkpoint, 1 + i);
+    s->checkpoint_valid = true;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) s->logits[i] = i == 1 ? 10.0f : -1.0f;
+    assert(ds4_gpu_tensor_fill_f32(g->layer_attn_state_kv[1], 105.0f, 4));
+    assert(ds4_session_anchor_save(s));
+    assert(ds4_session_anchor_floor(s, P) == P);
+
+    /* The abandoned reply: more tokens, a new compressor state and logits. */
+    for (int i = P; i < Q; i++) ds4_tokens_push(&s->checkpoint, 7);
+    assert(ds4_gpu_tensor_fill_f32(g->layer_attn_state_kv[1], 209.0f, 4));
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) s->logits[i] = i == 6 ? 10.0f : -1.0f;
+    assert(ds4_session_argmax(s) == 6);
+
+    assert(ds4_session_anchor_rewind(s, P));
+    assert(ds4_session_pos(s) == P && s->checkpoint_valid);
+    float state = 0;
+    assert(ds4_gpu_tensor_read(g->layer_attn_state_kv[1], 0, &state, sizeof(state)));
+    assert(state == 105.0f);
+    assert(ds4_session_argmax(s) == 1);
+    uint64_t rng = 1;
+    assert(ds4_session_sample(s, 0, 0, 1, 0, &rng) == 1);
+
+    session_anchors_clear(s);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_raw_cache[il]);
+        ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->layer_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->layer_index_state_kv[il]);
+        ds4_gpu_tensor_free(g->layer_index_state_score[il]);
+    }
+    ds4_tokens_free(&s->checkpoint);
+    free(s->logits);
+    free(s);
+    ds4_gpu_cleanup();
+    memcpy(g_ds4_compress_ratios, saved_ratios, sizeof(saved_ratios));
+    g_ds4_shape = saved_shape;
+}
 #endif
 
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -813,7 +999,57 @@ static void test_dspark_tp_split_reserve(void) {
     g_ds4_shape = saved_shape;
 }
 
+/* The capacity of a token vector doubles without signed overflow: it saturates
+ * at INT_MAX (a prompt of 2^30 tokens, 2 GiB of text, used to overflow it) and
+ * refuses to grow past that. */
+static void test_token_vec_capacity(void) {
+    assert(token_vec_grow_capacity(0) == 64);
+    assert(token_vec_grow_capacity(64) == 128);
+    assert(token_vec_grow_capacity(1 << 29) == 1 << 30);
+    assert(token_vec_grow_capacity(INT_MAX / 2) == INT_MAX - 1);
+    assert(token_vec_grow_capacity(INT_MAX / 2 + 1) == INT_MAX);
+    assert(token_vec_grow_capacity(1 << 30) == INT_MAX);
+    assert(token_vec_grow_capacity(INT_MAX - 1) == INT_MAX);
+    assert(token_vec_grow_capacity(INT_MAX) == 0);
+
+    token_vec tv = {0};
+    for (int i = 0; i < 1000; i++) token_vec_push(&tv, i);
+    assert(tv.len == 1000 && tv.cap == 1024);
+    for (int i = 0; i < 1000; i++) assert(tv.v[i] == i);
+    token_vec_free(&tv);
+
+    /* A push into a full vector of INT_MAX tokens must take the refusal, not
+     * double the capacity: the old doubling overflows there and dies with
+     * "out of memory" instead.  The refusal exits, so run it in a child. */
+    int fds[2];
+    int rc = pipe(fds);
+    assert(rc == 0);
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        dup2(fds[1], STDERR_FILENO);
+        token_vec full = {.v = xmalloc(sizeof(int)), .len = INT_MAX, .cap = INT_MAX};
+        token_vec_push(&full, 1);
+        _exit(0);
+    }
+    close(fds[1]);
+    char msg[128] = "";
+    size_t got = 0;
+    ssize_t r;
+    while (got < sizeof(msg) - 1 &&
+           (r = read(fds[0], msg + got, sizeof(msg) - 1 - got)) > 0) got += (size_t)r;
+    close(fds[0]);
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    assert(waited == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+    assert(strstr(msg, "token vector too large") != NULL);
+}
+
 int main(void) {
+    test_token_vec_capacity();
     test_dspark_tp_verify_flags();
     test_dspark_tp_split_reserve();
     test_vision_prefix();
@@ -822,6 +1058,8 @@ int main(void) {
     test_session_memory();
     test_payload_tokens();
     test_snapshot_bytes();
+    test_bpe_symbol_capacity();
+    test_kv_save_metrics();
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();
@@ -830,6 +1068,7 @@ int main(void) {
     test_glm_mixed_ssd_prefill();
 #endif
     test_glm_spec_rollback();
+    test_anchor_rewind_logits();
 #endif
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     test_spark_dspark_policy();
