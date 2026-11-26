@@ -6124,6 +6124,13 @@ static uint64_t cuda_memory_os_reserve_bytes(void) {
     return ds4_rocm_uses_host_ram() ? DS4_ROCM_OS_RESERVE_BYTES : 0;
 }
 
+/* With the F16 cache gone nothing else keeps room for the temporaries of a
+ * kernel launch, which cannot reclaim (their caller holds weight pointers)
+ * and fail the request instead. */
+static uint64_t cuda_memory_transient_reserve_bytes(void) {
+    return ds4_rocm_uses_host_ram() ? 1ull << 30 : 0;
+}
+
 extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom) {
     size_t free_b = 0;
     size_t total_b = 0;
@@ -6131,12 +6138,8 @@ extern "C" uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_head
         (void)cudaGetLastError();
         return bytes;
     }
-    /* With the F16 cache gone nothing else keeps room for the temporaries of
-     * a kernel launch, which cannot reclaim (their caller holds weight
-     * pointers) and fail the request instead. */
     const uint64_t evictable = cuda_q8_f16_evictable_bytes();
-    const uint64_t transient = evictable == 0 && ds4_rocm_uses_host_ram()
-        ? 1ull << 30 : 0;
+    const uint64_t transient = evictable == 0 ? cuda_memory_transient_reserve_bytes() : 0;
     const uint64_t need = bytes + (keep_cache_headroom && evictable != 0
         ? cuda_q8_f16_cache_reserve_bytes(total_b)
         : cuda_memory_os_reserve_bytes() + transient);
@@ -6150,7 +6153,10 @@ extern "C" uint64_t ds4_gpu_memory_ceiling(int movable) {
         (void)cudaGetLastError();
         return 0;
     }
-    const uint64_t reserve = cuda_memory_os_reserve_bytes();
+    /* Every cache evicted is the state in which the shortfall of a growth
+     * step also keeps the transient headroom. */
+    const uint64_t reserve = cuda_memory_os_reserve_bytes() +
+                             cuda_memory_transient_reserve_bytes();
     /* CMA is the rest of the same host budget on unified-memory devices;
      * reserve once from both ordinary free memory and CMA. */
     const uint64_t usable = (uint64_t)free_b +

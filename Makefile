@@ -1181,6 +1181,14 @@ test-linux-memory: tests/test_linux_memory
 test-rocm-memory: tests/test_rocm_memory
 	./tests/test_rocm_memory
 
+tests/test_rocm_memory_budget: tests/test_rocm_memory_budget.cu ds4_gpu.h ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -o $@ tests/test_rocm_memory_budget.cu -x none \
+		ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_LDLIBS)
+
+.PHONY: test-rocm-memory-budget
+test-rocm-memory-budget: tests/test_rocm_memory_budget
+	./tests/test_rocm_memory_budget
+
 tests/test_glm_attention.o: tests/test_glm_attention.c ds4.h ds4_gpu.h ds4_linux_memory.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
@@ -1748,7 +1756,7 @@ clean:
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe
 	rm -f tests/test_quality_api
-	rm -f tests/test_linux_memory tests/test_rocm_memory
+	rm -f tests/test_linux_memory tests/test_rocm_memory tests/test_rocm_memory_budget
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm tests/test_cuda_tokentile
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_metal_device_policy
