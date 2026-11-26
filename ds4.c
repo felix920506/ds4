@@ -41686,10 +41686,22 @@ static bool table_get(const str_i32_table *t, const char *ptr, uint64_t len, int
     return false;
 }
 
+/* Next capacity of a token vector: twice cap, saturating at INT_MAX (the type
+ * of ds4_tokens.cap), or 0 when cap is already INT_MAX.  The server accepts
+ * bodies of gigabytes and tokenizes them before checking the context size, so
+ * the count can reach INT_MAX. */
+static int token_vec_grow_capacity(int cap) {
+    if (cap == INT_MAX) return 0;
+    if (cap == 0) return 64;
+    return cap > INT_MAX / 2 ? INT_MAX : cap * 2;
+}
+
 static void token_vec_push(token_vec *tv, int token) {
     if (tv->len == tv->cap) {
-        tv->cap = tv->cap ? tv->cap * 2 : 64;
-        tv->v = xrealloc(tv->v, (size_t)tv->cap * sizeof(tv->v[0]));
+        int cap = token_vec_grow_capacity(tv->cap);
+        if (cap == 0) ds4_die("token vector too large");
+        tv->v = xrealloc(tv->v, (size_t)cap * sizeof(tv->v[0]));
+        tv->cap = cap;
     }
     tv->v[tv->len++] = token;
 }

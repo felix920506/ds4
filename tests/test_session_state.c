@@ -813,7 +813,28 @@ static void test_dspark_tp_split_reserve(void) {
     g_ds4_shape = saved_shape;
 }
 
+/* The capacity of a token vector doubles without signed overflow: it saturates
+ * at INT_MAX (a prompt of 2^30 tokens, 2 GiB of text, used to overflow it) and
+ * refuses to grow past that. */
+static void test_token_vec_capacity(void) {
+    assert(token_vec_grow_capacity(0) == 64);
+    assert(token_vec_grow_capacity(64) == 128);
+    assert(token_vec_grow_capacity(1 << 29) == 1 << 30);
+    assert(token_vec_grow_capacity(INT_MAX / 2) == INT_MAX - 1);
+    assert(token_vec_grow_capacity(INT_MAX / 2 + 1) == INT_MAX);
+    assert(token_vec_grow_capacity(1 << 30) == INT_MAX);
+    assert(token_vec_grow_capacity(INT_MAX - 1) == INT_MAX);
+    assert(token_vec_grow_capacity(INT_MAX) == 0);
+
+    token_vec tv = {0};
+    for (int i = 0; i < 1000; i++) token_vec_push(&tv, i);
+    assert(tv.len == 1000 && tv.cap == 1024);
+    for (int i = 0; i < 1000; i++) assert(tv.v[i] == i);
+    token_vec_free(&tv);
+}
+
 int main(void) {
+    test_token_vec_capacity();
     test_dspark_tp_verify_flags();
     test_dspark_tp_split_reserve();
     test_vision_prefix();

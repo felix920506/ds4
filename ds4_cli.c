@@ -1364,8 +1364,12 @@ static void tokens_insert(ds4_tokens *dst, int pos, const ds4_tokens *src) {
     if (!src || src->len <= 0) return;
     if (pos < 0) pos = 0;
     if (pos > dst->len) pos = dst->len;
+    if (src->len > INT_MAX - dst->len) {
+        fprintf(stderr, "ds4: token vector too large\n");
+        exit(1);
+    }
     while (dst->len + src->len > dst->cap) {
-        dst->cap = dst->cap ? dst->cap * 2 : 64;
+        dst->cap = !dst->cap ? 64 : dst->cap > INT_MAX / 2 ? INT_MAX : dst->cap * 2;
         int *next = realloc(dst->v, (size_t)dst->cap * sizeof(dst->v[0]));
         if (!next) {
             perror("ds4: realloc");
