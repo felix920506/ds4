@@ -18834,8 +18834,9 @@ static bool metal_graph_kv_admit(const ds4_gpu_graph *g, uint32_t ctx_size) {
 
 /* Replace *slot with a tensor of new_bytes that keeps the first keep_bytes.
  * With nothing to keep the old tensor is released first, so a scratch resize
- * never needs both sizes at once.  On failure the slot still holds a tensor
- * of the old size. */
+ * never needs both sizes at once.  On failure the slot holds a tensor of the
+ * old size, or NULL when there was none or the rollback allocation failed
+ * too; refits and a joining session rebuild it. */
 static bool metal_graph_kv_resize(
         ds4_gpu_graph   *g,
         ds4_gpu_tensor **slot,
@@ -18857,9 +18858,10 @@ static bool metal_graph_kv_resize(
     }
     ds4_gpu_tensor *t = NULL;
     if (keep_bytes == 0) {
+        const bool had_old = old != NULL;
         ds4_gpu_tensor_free(old);
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
-        *slot = t || !old ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
+        *slot = t || !had_old ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
     } else {
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
         if (t && (ds4_gpu_tensor_copy(t, 0, old, 0, keep_bytes) == 0 ||
@@ -20109,21 +20111,30 @@ static bool metal_graph_alloc_raw_cap(
         }
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
-        if (kv_scratch && kv_scratch->users) {
-            /* Later steps grow it if this session reserves more. */
-            g->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
-            g->comp_mask_by_tier[t] = kv_scratch->tensor[1];
+        /* Take the shared tensors (later steps grow them if this session
+         * reserves more), and allocate the ones the pool lacks: the first
+         * session, or a NULL left by a resize that failed with its rollback,
+         * rebuilt here for the sessions using it too.  An allocation can run
+         * the memory-pressure handler on this thread, which may free pool
+         * sessions and so the pool's tensors: read the pool again after every
+         * allocation, and only then publish. */
+        ds4_gpu_tensor *scratch[2] = { NULL, NULL };
+        for (bool again = true; again; ) {
+            again = false;
+            for (int i = 0; i < 2; i++) {
+                if (scratch[i] || (kv_scratch && kv_scratch->users && kv_scratch->tensor[i])) continue;
+                scratch[i] = ds4_gpu_tensor_alloc_ptr_on(
+                        t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+                again = again || scratch[i] != NULL;
+            }
         }
-        /* A shared tensor is NULL after a resize that failed with its
-         * rollback: rebuild it here, for the sessions using it too. */
-        if (!g->indexer_scores_by_tier[t]) {
-            g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+        for (int i = 0; kv_scratch && kv_scratch->users && i < 2; i++) {
+            if (!kv_scratch->tensor[i]) continue;
+            ds4_gpu_tensor_free(scratch[i]);
+            scratch[i] = kv_scratch->tensor[i];
         }
-        if (!g->comp_mask_by_tier[t]) {
-            g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
-                    t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
-        }
+        g->indexer_scores_by_tier[t] = scratch[0];
+        g->comp_mask_by_tier[t] = scratch[1];
         if (kv_scratch) { /* on demand: tier 0 is the only one */
             kv_scratch->tensor[0] = g->indexer_scores_by_tier[t];
             kv_scratch->tensor[1] = g->comp_mask_by_tier[t];
