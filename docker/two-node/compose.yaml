@@ -11,9 +11,15 @@
 #   docker compose up -d
 #
 # Start order does not matter: the worker retries until the coordinator is up.
-# Both containers use the host network: the stages talk over TCP port 9911
-# and the activations are large.  The link has no authentication or
-# encryption, so keep it on a trusted network.
+# Both containers use the host network, and the activations are large.  The
+# stages use two kinds of TCP connection: the worker dials the coordinator on
+# port 9911 (control), and the coordinator dials the worker's data listener,
+# which the worker opens on every interface and, unless it is given
+# --listen HOST PORT, on a new ephemeral port at each start.  Allow the
+# coordinator to reach the worker on that port as well as 9911, or pin it:
+# see the comment in the worker service and docs/DOCKER.md.  Neither
+# connection has authentication or encryption, so keep both on a trusted
+# network.
 #
 # Run at most one ds4 process per machine: two model processes on one unified
 # memory node can exhaust memory badly enough to panic the kernel.
@@ -94,6 +100,8 @@ services:
       - --coordinator
       - ${COORDINATOR_IP:?set COORDINATOR_IP in .env}
       - "${DS4_DIST_PORT:-9911}"
+      # To pin the data listener (default: every interface, a new ephemeral
+      # port per start), add: --listen <this machine's address on the link> 9912
       - --ctx
       - "${DS4_CTX:-1000000}"
       - --prefill-chunk
