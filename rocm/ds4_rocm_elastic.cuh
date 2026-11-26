@@ -909,10 +909,12 @@ extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
         const int ok = g_elastic_scratch ?
             cuda_elastic_resize(*victim, cuda_elastic_next_slots(*victim, -1)) :
             cuda_elastic_take_scratch(*victim) || cuda_elastic_shrink_in_place(*victim);
+        /* Measured before the failure check: a failed shrink may already have
+         * freed the victim's table and left it without a block. */
+        now = cuda_elastic_resident_bytes();
         if (!ok) break;
         shrunk = 1;
         g_elastic_stats.shrinks++;
-        now = cuda_elastic_resident_bytes();
     }
     g_elastic_grow_checked = cuda_wall_sec();
     const uint64_t freed = before > now ? before - now : 0;
@@ -920,7 +922,8 @@ extern "C" uint64_t ds4_gpu_reclaim_weights(uint64_t need_bytes) {
         uint32_t min_slots = UINT32_MAX;
         uint32_t shrunk = 0;
         for (const cuda_elastic_layer &l : g_elastic_layers) {
-            if (!l.block) continue;
+            /* A layer left without a block has 0 slots and counts as shrunk. */
+            if (l.expert_bytes == 0) continue;
             min_slots = std::min(min_slots, l.slots);
             shrunk += !cuda_elastic_full(l);
         }
