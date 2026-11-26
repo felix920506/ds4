@@ -325,6 +325,65 @@ static void test_bpe_symbol_capacity(void) {
     free(v.token);
 }
 
+static uint64_t metric_value(ds4_metric m) {
+    uint64_t v[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(v);
+    return v[m];
+}
+
+/* A KV payload counts as written once, whether it is saved at top level or
+ * from inside another phase (a continued checkpoint written during a sync, a
+ * memory-pressure kick during an eval); only the time of a nested save
+ * belongs to the phase around it. */
+static void test_kv_save_metrics(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    const uint32_t saved_ratio = g_ds4_compress_ratios[0];
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_shape.n_layer = 1;
+    g_ds4_shape.n_head_dim = 4;
+    g_ds4_shape.n_vocab = 8;
+    g_ds4_compress_ratios[0] = 0;
+    ds4_engine e = {.backend = DS4_BACKEND_CPU};
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    s->ctx_size = 8;
+    s->prefill_cap = 1;
+    s->checkpoint_valid = true;
+    s->logits = calloc(DS4_N_VOCAB, sizeof(float));
+    assert(s->logits);
+    kv_cache_init(&s->cpu_cache, 8, 0);
+    for (int i = 0; i < 3; i++) ds4_tokens_push(&s->checkpoint, i);
+    s->cpu_cache.layer[0].n_raw = 3;
+
+    char err[192] = {0};
+    for (int nested = 0; nested < 2; nested++) {
+        const uint64_t calls = metric_value(DS4_METRIC_KV_SAVE_CALLS);
+        const uint64_t bytes = metric_value(DS4_METRIC_KV_SAVE_BYTES);
+        const uint64_t save_ns = metric_value(DS4_METRIC_KV_SAVE_NS);
+        const uint64_t t0 = nested ? metrics_begin() : 0;
+        ds4_session_payload_file staged = {0};
+        assert(ds4_session_stage_payload(s, &staged, err, sizeof(err)) == 0);
+        assert(staged.bytes > 0);
+        FILE *fp = tmpfile();
+        assert(fp);
+        assert(ds4_session_write_staged_payload(&staged, fp, err, sizeof(err)) == 0);
+        assert(ds4_session_save_payload(s, fp, err, sizeof(err)) == 0);
+        assert(ftell(fp) == (long)(2 * staged.bytes));
+        if (nested) {
+            assert(metric_value(DS4_METRIC_KV_SAVE_NS) == save_ns);
+            metrics_end(t0, DS4_METRIC_PREFILL_NS);
+        }
+        assert(metric_value(DS4_METRIC_KV_SAVE_CALLS) == calls + 2);
+        assert(metric_value(DS4_METRIC_KV_SAVE_BYTES) == bytes + 2 * staged.bytes);
+        fclose(fp);
+        ds4_session_payload_file_free(&staged);
+    }
+    ds4_session_free(s);
+    g_ds4_shape = saved_shape;
+    g_ds4_compress_ratios[0] = saved_ratio;
+}
+
 static void test_text_observations(void) {
     ds4_engine e = {0};
     ds4_vocab *v = &e.vocab;
@@ -866,6 +925,7 @@ int main(void) {
     test_payload_tokens();
     test_snapshot_bytes();
     test_bpe_symbol_capacity();
+    test_kv_save_metrics();
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_glm_attention_budget();

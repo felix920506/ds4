@@ -40,6 +40,7 @@ image is configured.
 from __future__ import annotations
 
 import argparse
+import http.client
 import logging
 import math
 import os
@@ -298,7 +299,7 @@ def scrape_once(conn: sqlite3.Connection, url: str, timeout: float) -> bool:
         exp = parse_exposition(text)
         if not exp.samples:
             raise ValueError("response contained no samples")
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
         duration = time.monotonic() - t0
         reason = getattr(e, "reason", None) or e
         record_failure(conn, url, ts, duration, str(reason))

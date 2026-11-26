@@ -18788,6 +18788,8 @@ static void test_slot_kick_bookkeeping_round_trip(void) {
     TEST_ASSERT(slot_kick_cost_of(&s, slot, NULL) == KICK_SAVE);
 
     ds4_session_free_test_checkpoint(slot->session);
+    live_tool_state_free(&slot->responses_live);
+    live_tool_state_free(&slot->anthropic_live);
     request_free(&cont.req);
     request_free(&bound.req);
     pthread_cond_destroy(&s.cv);
@@ -26042,8 +26044,19 @@ static void test_metrics_export(void) {
     metrics_note_kv_lookup(true);
     metrics_note_kv_lookup(false);
     metrics_note_image(false);
+    /* The engine counters belong to the process: groups that ran earlier in
+     * the same ds4_test have decoded into them, so check the rendering of
+     * what they hold, and the summary of what this test adds. */
+    uint64_t v0[DS4_METRIC_COUNT], v[DS4_METRIC_COUNT];
+    ds4_metrics_snapshot(v0);
     ds4_metric_add(DS4_METRIC_DECODE_TOKENS, 5);
     ds4_metric_add(DS4_METRIC_DECODE_NS, 1000000000ull);
+    ds4_metrics_snapshot(v);
+    const double decode_s = (double)v[DS4_METRIC_DECODE_NS] / 1e9;
+    char want_decode_s[64], want_decode_tps[64];
+    snprintf(want_decode_s, sizeof(want_decode_s), "\"decode_seconds\":%.6f,", decode_s);
+    snprintf(want_decode_tps, sizeof(want_decode_tps), "\"decode_tokens_per_second\":%.3f,",
+             (double)v[DS4_METRIC_DECODE_TOKENS] / decode_s);
 
     buf b = {0};
     metrics_render_prometheus(&s, &b);
@@ -26064,17 +26077,15 @@ static void test_metrics_export(void) {
     metrics_render_json(&s, &b);
     TEST_ASSERT(b.len > 2 && b.ptr[0] == '{' && b.ptr[b.len - 2] == '}' && b.ptr[b.len - 1] == '\n');
     TEST_ASSERT(test_count_char(b.ptr, '{') == test_count_char(b.ptr, '}'));
-    TEST_ASSERT(strstr(b.ptr, "\"decode_seconds\":1.000000,") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"decode_tokens_per_second\":5.000,") != NULL);
+    TEST_ASSERT(strstr(b.ptr, want_decode_s) != NULL);
+    TEST_ASSERT(strstr(b.ptr, want_decode_tps) != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"time_share\":{") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"requests\":{\"chat\":1,\"completions\":0,\"responses\":0,\"messages\":1}") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"time_to_first_token_seconds\":{\"count\":1,\"avg\":1.000000,\"max\":1.000000}") != NULL);
     buf_free(&b);
 
     char line[512];
-    uint64_t v[DS4_METRIC_COUNT];
-    ds4_metrics_snapshot(v);
-    ds4_metrics_summary(v, NULL, 10.0, line, sizeof(line));
+    ds4_metrics_summary(v, v0, 10.0, line, sizeof(line));
     TEST_ASSERT(strstr(line, "decode 5 tok 1.0s 5.0 t/s") != NULL);
     TEST_ASSERT(strstr(line, "decode 10%") != NULL);
     pthread_mutex_destroy(&s.mu);

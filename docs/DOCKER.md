@@ -100,9 +100,37 @@ What it sets:
 requests still run, but disk KV checkpoints are skipped with
 `distributed KV shards use different layouts`.
 
-The link between the stages has no authentication or encryption: keep it on
-a trusted network, or a direct cable. 2.5 GbE is enough for the throughput in
-the [README](../README.md#performance); the wire is a small part of each step.
+The stages use two kinds of TCP connection, and a firewall between the
+machines has to allow both:
+
+- Control: the worker dials the coordinator on `COORDINATOR_IP`, port
+  `DS4_DIST_PORT` (9911).
+- Data: the worker opens a second listener, on every interface, and tells the
+  coordinator its port when it registers (`data_listen=*:PORT` in the worker's
+  log). Unless the worker is given `--listen HOST PORT` the system picks the
+  port, a new one at every worker start. The coordinator opens its data
+  connections to that port, at the address the worker's control connection came
+  from. Allowing only port 9911 between the hosts therefore stops the
+  pipeline.
+
+To use a fixed data port, add `--listen` to the worker service's `command` in
+`compose.yaml`, with the worker's address on the link (the address the
+coordinator sees the control connection from) and a port:
+
+```yaml
+      - --listen
+      - 192.168.1.11
+      - "9912"
+```
+
+The data listener accepts work, snapshot and release frames from any peer that
+connects, with no handshake, and binds every interface unless `--listen` names
+one. Neither connection has authentication or encryption: keep the link on a
+trusted network, or a direct cable, and do not expose the worker's data port to
+other networks (the compose file uses host networking).
+
+2.5 GbE is enough for the throughput in the
+[README](../README.md#performance); the wire is a small part of each step.
 
 If the worker restarts, the coordinator holds requests for up to 120 seconds
 while it comes back, then replays the interrupted conversations into it. For everything

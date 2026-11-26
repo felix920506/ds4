@@ -2,7 +2,8 @@
 # root and push it to GitHub Container Registry as ghcr.io/<owner>/<repo>.
 #
 # Tags: `dev-rocm` and `dev-rocm-<short sha>` for main, plus `rocm-<version>`
-# for v* tags.  Pull requests build without pushing.
+# for v* tags.  Pull requests build without pushing.  Nothing is built or
+# pushed unless the `test` job passes.
 name: docker-rocm
 
 on:
@@ -23,7 +24,24 @@ env:
   NATIVE_CPU_FLAG: -march=znver4
 
 jobs:
+  # Model-free checks (`make test-cpu`).  The runner has no gfx1151 GPU and no
+  # model, so this does not replace `make test-rocm` on real hardware; it stops
+  # a commit that compiles but fails the unit tests from being published.
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and run the model-free tests
+        run: make test-cpu -j"$(nproc)"
+
   build:
+    needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
