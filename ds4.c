@@ -20113,15 +20113,24 @@ static bool metal_graph_alloc_raw_cap(
             /* Later steps grow it if this session reserves more. */
             g->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
             g->comp_mask_by_tier[t] = kv_scratch->tensor[1];
-        } else {
+        }
+        /* A shared tensor is NULL after a resize that failed with its
+         * rollback: rebuild it here, for the sessions using it too. */
+        if (!g->indexer_scores_by_tier[t]) {
             g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
                     t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
+        }
+        if (!g->comp_mask_by_tier[t]) {
             g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
                     t, metal_graph_kv_scratch_bytes(g, g->kv_on_demand == NULL));
         }
         if (kv_scratch) { /* on demand: tier 0 is the only one */
             kv_scratch->tensor[0] = g->indexer_scores_by_tier[t];
             kv_scratch->tensor[1] = g->comp_mask_by_tier[t];
+            for (ds4_gpu_graph *u = kv_scratch->users; u; u = u->kv_scratch_next) {
+                u->indexer_scores_by_tier[t] = kv_scratch->tensor[0];
+                u->comp_mask_by_tier[t] = kv_scratch->tensor[1];
+            }
             g->kv_scratch = kv_scratch;
             g->kv_scratch_next = kv_scratch->users;
             kv_scratch->users = g;
