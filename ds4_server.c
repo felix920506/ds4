@@ -12375,10 +12375,9 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
-    /* The anchor must leave at least one prompt token to evaluate: logits
-     * do not survive a rewind. */
-    const int anchor = ds4_session_anchor_floor(
-        slot->session, common < req->prompt.len ? common : req->prompt.len - 1);
+    /* An anchor keeps its logits, so it may also sit at the end of the
+     * prompt: a regenerated answer rewinds to the start of the old reply. */
+    const int anchor = ds4_session_anchor_floor(slot->session, common);
     if (anchor > 0 && anchor >= live_pos - anchor &&
         ds4_session_vision_prefix_matches_at(slot->session, req->images,
                                              req->image_count, anchor))
@@ -18125,12 +18124,28 @@ static void test_slot_probe_memory_anchor(void) {
     j.req.prompt.v[100] = live_tok[100];
     j.req.prompt.v[170] = live_tok[170];
 
-    /* A prompt that stops exactly on an anchor still needs one token
-     * evaluated for its logits, so it uses the anchor below. */
+    /* A prompt that stops exactly on an anchor rewinds to it: the anchor
+     * brings its logits back, so there is nothing left to evaluate. */
     j.req.prompt.len = 180;
     pr = slot_probe_reuse_locked(&s, &slots[0], &j.req);
-    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 120);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 180);
     j.req.prompt.len = 230;
+
+    /* A regenerated first answer: the only anchor is the one at the end of
+     * the prompt, taken when the prompt was done. */
+    {
+        server_slot first = {0};
+        first.last_used = now;
+        first.session = ds4_session_new_test_checkpoint(live_tok, 200);
+        ds4_session_add_test_anchor(first.session, 150);
+        job o = {0};
+        for (int i = 0; i < 150; i++) ds4_tokens_push(&o.req.prompt, live_tok[i]);
+        pr = slot_probe_reuse_locked(&s, &first, &o.req);
+        TEST_ASSERT(pr.kind == REUSE_MEMORY_ANCHOR && pr.reuse_tokens == 150);
+        TEST_ASSERT(job_slot_score(&s, &first, &o, -1, now) == 150);
+        ds4_tokens_free(&o.req.prompt);
+        ds4_session_free_test_checkpoint(first.session);
+    }
 
     /* An anchor that keeps less than half of the checkpoint is a shared
      * opening, not a continuation: no reuse, the slot is only a victim. */

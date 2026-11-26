@@ -164,8 +164,8 @@ rewind instead of starting over. While it generates, the server keeps a rewind
 anchor at the start of each reply and every 256 tokens inside it; an anchor is
 a copy of the small part of the state that later tokens overwrite (about
 22 MiB for Flash, whatever the context length). The session returns to the
-nearest anchor below the point where the request diverges and evaluates the
-rest:
+nearest anchor at or before the point where the request diverges and
+evaluates the rest:
 
 ```
 ds4-server: live kv rewind live=195170 prompt=200550 common=192692 anchor=192512: keeping 192512 tokens, re-evaluating 180 that still match
