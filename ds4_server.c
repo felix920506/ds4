@@ -18788,6 +18788,8 @@ static void test_slot_kick_bookkeeping_round_trip(void) {
     TEST_ASSERT(slot_kick_cost_of(&s, slot, NULL) == KICK_SAVE);
 
     ds4_session_free_test_checkpoint(slot->session);
+    live_tool_state_free(&slot->responses_live);
+    live_tool_state_free(&slot->anthropic_live);
     request_free(&cont.req);
     request_free(&bound.req);
     pthread_cond_destroy(&s.cv);
