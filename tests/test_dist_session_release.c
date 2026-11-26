@@ -256,6 +256,64 @@ static void test_route_wait_interrupt(void) {
     pthread_mutex_destroy(&state.mu);
 }
 
+/* A worker that registers during the same poll sleep in which the request is
+ * cancelled must not win: the caller would go on to a full replay for a
+ * client that has left. */
+static ds4_dist_coordinator_state *late_state;
+static ds4_dist_worker_entry late_worker;
+static int late_polls;
+static bool register_then_cancel(void *ud) {
+    (void)ud;
+    if (++late_polls == 1) {
+        pthread_mutex_lock(&late_state->mu);
+        late_state->workers = &late_worker;
+        late_state->generation++;
+        pthread_mutex_unlock(&late_state->mu);
+        return false;
+    }
+    return true;
+}
+
+static void test_route_wait_cancel_beats_registration(void) {
+    int link[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, link) == 0);
+    ds4_dist_coordinator_state state;
+    memset(&state, 0, sizeof(state));
+    pthread_mutex_init(&state.mu, NULL);
+    state.n_layers = 4;
+    state.local_end = 1;
+    /* The first hop is a dup() of the control link: no connect needed. */
+    state.use_control_for_work = true;
+    memset(&late_worker, 0, sizeof(late_worker));
+    late_worker.fd = link[0];
+    late_worker.layer_start = 2;
+    late_worker.layer_end = 3;
+    late_worker.has_output = 1;
+    snprintf(late_worker.peer_host, sizeof(late_worker.peer_host), "127.0.0.1");
+    late_worker.listen_port = 9;
+    late_state = &state;
+
+    ds4_dist_route_plan plan;
+    uint64_t generation = 99;
+    char err[128] = {0};
+    assert(dist_coordinator_ensure_route(&state, &plan, &generation, register_then_cancel,
+                                         NULL, true, err, sizeof(err)) ==
+           DS4_SESSION_SYNC_INTERRUPTED);
+    assert(late_polls == 2);
+    assert(plan.count == 0 && plan.entry == NULL);
+    assert(generation == 0);
+    assert(strstr(err, "interrupted") != NULL);
+
+    /* Without a cancel the same registry gives a route. */
+    assert(dist_coordinator_ensure_route(&state, &plan, &generation, NULL, NULL, true,
+                                         err, sizeof(err)) == 0);
+    assert(plan.count == 1 && plan.entry[0].fd >= 0);
+    dist_route_plan_free(&plan);
+    pthread_mutex_destroy(&state.mu);
+    close(link[0]);
+    close(link[1]);
+}
+
 int main(void) {
     const uint64_t first = dist_make_session_id(NULL);
     test_session_id_sequence(first);
@@ -266,6 +324,7 @@ int main(void) {
                              UINT64_C(0xabc000000004));
     test_release_backpressure(UINT64_C(0xabc000000005));
     test_route_wait_interrupt();
+    test_route_wait_cancel_beats_registration();
     fprintf(stderr, "test_dist_session_release PASS\n");
     return 0;
 }

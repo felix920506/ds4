@@ -14689,16 +14689,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync_multimodal(s, slot, &prefix,
+        const int cold_sync_rc =
+            server_session_sync_multimodal(s, slot, &prefix,
                                            j->req.images, cold_images,
-                                           err, sizeof(err)) != 0) {
+                                           err, sizeof(err));
+        if (cold_sync_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            if (cold_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
+                kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
             free(disk_cache_path);
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
@@ -14734,7 +14737,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        /* An interrupted sync (client gone, shutdown) says nothing about the
+         * file it resumed from, and leaves the session at a checkpoint the
+         * shutdown pass can still save, or invalid. */
+        if (prompt_sync_rc != DS4_SESSION_SYNC_INTERRUPTED)
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
         free(disk_cache_path);
         if (job_cancelled(j)) {
             request_live_state_clear(s, slot);

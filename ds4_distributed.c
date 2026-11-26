@@ -2336,7 +2336,7 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
     }
     uint32_t i = 0;
     for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) workers[i++] = it;
-    qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
+    if (n > 1) qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
 
     const uint32_t last = state->n_layers - 1u;
     bool complete = state->local_start == 0;
@@ -2561,7 +2561,7 @@ static bool dist_coordinator_build_route_plan(
     }
     uint32_t i = 0;
     for (ds4_dist_worker_entry *it = state->workers; it; it = it->next) workers[i++] = it;
-    qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
+    if (n > 1) qsort(workers, n, sizeof(workers[0]), dist_worker_route_cmp);
 
     const uint32_t last = state->n_layers - 1u;
     if (state->local_start != 0) {
@@ -2699,11 +2699,15 @@ static int dist_coordinator_ensure_route(
     bool waited = false;
     for (;;) {
         bool layer_missing = false;
+        bool cancelled = false;
         if (dist_coordinator_build_route_plan(state, plan, generation,
                                               &layer_missing, err, errlen)) {
-            break;
-        }
-        if (!layer_missing || !wait || dist_now_sec() - t0 >= DS4_DIST_ROUTE_WAIT_SEC) {
+            /* A cancel that came during the last sleep wins over a worker
+             * that registered in the same sleep. */
+            if (!waited || !cancel || !(cancelled = cancel(cancel_ud))) break;
+            dist_route_plan_free(plan);
+            if (generation) *generation = 0;
+        } else if (!layer_missing || !wait || dist_now_sec() - t0 >= DS4_DIST_ROUTE_WAIT_SEC) {
             if (waited) {
                 fprintf(stderr,
                         "ds4: distributed coordinator: no complete route after %.0f s: %s\n",
@@ -2711,7 +2715,7 @@ static int dist_coordinator_ensure_route(
             }
             return 1;
         }
-        if (cancel && cancel(cancel_ud)) {
+        if (cancelled || (cancel && cancel(cancel_ud))) {
             if (waited) {
                 fprintf(stderr,
                         "ds4: distributed coordinator: request interrupted after %.1f s "
@@ -3428,17 +3432,23 @@ static int dist_coordinator_rebuild_from_transcript(
                      "ds4: distributed coordinator: replaying %d tokens after distributed %s\n",
                      transcript->len,
                      forget_route ? "route failure" : "KV mismatch");
+    /* The route wait's result is passed on, so an interrupted wait stays
+     * DS4_SESSION_SYNC_INTERRUPTED; every caller tests for nonzero. */
     if (forget_route) {
         dist_coordinator_forget_route_workers(state, plan);
         dist_route_plan_free(plan);
         uint64_t generation = 0;
-        if (dist_coordinator_ensure_route(state, plan, &generation, dist_owner_cancelled,
-                                          session, true, err, errlen) != 0) return 1;
+        const int route_rc = dist_coordinator_ensure_route(state, plan, &generation,
+                                                           dist_owner_cancelled, session,
+                                                           true, err, errlen);
+        if (route_rc != 0) return route_rc;
         if (plan_generation) *plan_generation = generation;
     } else if (plan->count == 0) {
         uint64_t generation = 0;
-        if (dist_coordinator_ensure_route(state, plan, &generation, dist_owner_cancelled,
-                                          session, true, err, errlen) != 0) return 1;
+        const int route_rc = dist_coordinator_ensure_route(state, plan, &generation,
+                                                           dist_owner_cancelled, session,
+                                                           true, err, errlen);
+        if (route_rc != 0) return route_rc;
         if (plan_generation) *plan_generation = generation;
     }
     if (dist_coordinator_prefill_prompt(state,
@@ -6270,6 +6280,10 @@ int ds4_dist_session_sync(
     const int route_rc = dist_session_ensure_route(d, owner, true, err, errlen);
     if (route_rc != 0) return route_rc;
 
+    /* A failed rebuild below invalidates the owner: its local slice has
+     * already committed the span onto the timeline, without the logits that
+     * belong to it, and an identical retry would do no work and sample the
+     * old ones.  The next sync replays the whole prompt instead. */
     if (checkpoint &&
         checkpoint->len >= 0 &&
         checkpoint->len <= prompt->len &&
@@ -6300,7 +6314,8 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
-                if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
+                const int rebuild_rc =
+                    dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                              owner,
                                                              &d->plan,
                                                              prompt,
@@ -6310,10 +6325,12 @@ int ds4_dist_session_sync(
                                                              &d->plan_generation,
                                                              prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
                                                              err,
-                                                             errlen) != 0) {
+                                                             errlen);
+                if (rebuild_rc != 0) {
                     d->plan_ready = false;
                     d->plan_generation = 0;
-                    return 1;
+                    ds4_session_invalidate(owner);
+                    return rebuild_rc;
                 }
                 d->plan_ready = true;
             }
@@ -6341,7 +6358,8 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
-                if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
+                const int rebuild_rc =
+                    dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                              owner,
                                                              &d->plan,
                                                              prompt,
@@ -6351,10 +6369,12 @@ int ds4_dist_session_sync(
                                                              &d->plan_generation,
                                                              eval_rc != DS4_DIST_RECV_REMOTE_ERROR,
                                                              err,
-                                                             errlen) != 0) {
+                                                             errlen);
+                if (rebuild_rc != 0) {
                     d->plan_ready = false;
                     d->plan_generation = 0;
-                    return 1;
+                    ds4_session_invalidate(owner);
+                    return rebuild_rc;
                 }
                 d->plan_ready = true;
                 return 0;
@@ -6377,7 +6397,8 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
-        if (dist_coordinator_rebuild_from_transcript(&d->coord->state,
+        const int rebuild_rc =
+            dist_coordinator_rebuild_from_transcript(&d->coord->state,
                                                      owner,
                                                      &d->plan,
                                                      prompt,
@@ -6387,10 +6408,12 @@ int ds4_dist_session_sync(
                                                      &d->plan_generation,
                                                      prefill_rc != DS4_DIST_RECV_REMOTE_ERROR,
                                                      err,
-                                                     errlen) != 0) {
+                                                     errlen);
+        if (rebuild_rc != 0) {
             d->plan_ready = false;
             d->plan_generation = 0;
-            return 1;
+            ds4_session_invalidate(owner);
+            return rebuild_rc;
         }
         d->plan_ready = true;
     }
@@ -6815,6 +6838,8 @@ int ds4_dist_session_eval(
                                                      errlen) != 0) {
             d->plan_ready = false;
             d->plan_generation = 0;
+            /* The local slice committed the token; its logits never came. */
+            ds4_session_invalidate(owner);
             ds4_tokens_free(&transcript);
             return 1;
         }
