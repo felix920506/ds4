@@ -17416,6 +17416,7 @@ struct ds4_gpu_graph;
 typedef struct {
     ds4_gpu_tensor *tensor[2]; /* scores, top-k mask */
     struct ds4_gpu_graph *users;
+    bool resizing; /* metal_graph_kv_scratch_resize is under way */
 } ds4_kv_scratch;
 
 typedef struct ds4_gpu_graph {
@@ -18214,6 +18215,8 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     g->owns_prefill_workspace = false;
 }
 
+static bool metal_graph_kv_scratch_refit(ds4_gpu_graph *g);
+
 /* Detach g from a shared indexer scratch.  Returns whether g now owns the two
  * tensors and has to free them: it never shared them, or it was the last
  * session that did. */
@@ -18225,7 +18228,14 @@ static bool metal_graph_kv_scratch_leave(ds4_gpu_graph *g) {
         if (*u != g) continue;
         *u = g->kv_scratch_next;
         g->kv_scratch_next = NULL;
-        if (pool->users) return false;
+        if (pool->users) {
+            /* g may be what grew it (a server kicks idle sessions to free
+             * memory): the others keep only what they use.  The pressure
+             * handler can free g from inside an allocation of the scratch;
+             * that resize grows it past every user's need, so skip it. */
+            if (!pool->resizing) (void)metal_graph_kv_scratch_refit(pool->users);
+            return false;
+        }
         pool->tensor[0] = pool->tensor[1] = NULL;
         return true;
     }
@@ -18915,8 +18925,10 @@ static bool metal_graph_kv_reserve_rows(
 static bool metal_graph_kv_scratch_resize(ds4_gpu_graph *g, int i, uint64_t bytes) {
     ds4_gpu_tensor **slot = i ? &g->comp_mask_by_tier[0]
                               : &g->indexer_scores_by_tier[0];
+    if (g->kv_scratch) g->kv_scratch->resizing = true;
     const bool ok = metal_graph_kv_resize(g, slot, bytes, 0, false);
     if (g->kv_scratch) {
+        g->kv_scratch->resizing = false;
         g->kv_scratch->tensor[i] = *slot;
         for (ds4_gpu_graph *u = g->kv_scratch->users; u; u = u->kv_scratch_next) {
             *(i ? &u->comp_mask_by_tier[0] : &u->indexer_scores_by_tier[0]) = *slot;
@@ -18947,23 +18959,41 @@ static bool metal_graph_kv_reserve_scratch(ds4_gpu_graph *g, uint64_t need_bytes
     return true;
 }
 
-/* Give the scratch back when a session is reset: down to the minimum, or to
- * what the other sessions sharing it still use. */
-static bool metal_graph_kv_scratch_refit(ds4_gpu_graph *g) {
+/* What a refit of g's scratch keeps: the minimum, or the most that a session
+ * sharing it other than skip still uses. */
+static uint64_t metal_graph_kv_scratch_fit_bytes(const ds4_gpu_graph *g,
+                                                 const ds4_gpu_graph *skip) {
     uint64_t bytes = metal_graph_kv_scratch_bytes(g, false);
-    g->kv_scratch_need = 0;
     for (const ds4_gpu_graph *u = g->kv_scratch ? g->kv_scratch->users : NULL;
          u; u = u->kv_scratch_next) {
+        if (u == skip) continue;
         const uint64_t used = metal_graph_kv_scratch_bytes_for(u, u->kv_scratch_need);
         if (used > bytes) bytes = used;
     }
-    for (int i = 0; i < 2; i++) {
+    return bytes;
+}
+
+/* Give the scratch back when a session is reset or one sharing it is freed:
+ * down to the minimum, or to what the sessions sharing it still use.  This
+ * only shrinks, and frees before it allocates, so it needs no room.  The
+ * pressure handler is held off: it frees idle sessions, and one can be g
+ * itself (the refit on free runs on an idle survivor), a session the server
+ * is tearing down, or a user whose need is already in bytes. */
+static bool metal_graph_kv_scratch_refit(ds4_gpu_graph *g) {
+    const uint64_t bytes = metal_graph_kv_scratch_fit_bytes(g, NULL);
+#ifdef DS4_ROCM_BUILD
+    const int held = ds4_gpu_memory_pressure_hold(1);
+#endif
+    bool ok = true;
+    for (int i = 0; ok && i < 2; i++) {
         const ds4_gpu_tensor *t = i ? g->comp_mask_by_tier[0]
                                     : g->indexer_scores_by_tier[0];
-        if (bytes < ds4_gpu_tensor_bytes(t) &&
-            !metal_graph_kv_scratch_resize(g, i, bytes)) return false;
+        if (bytes < ds4_gpu_tensor_bytes(t)) ok = metal_graph_kv_scratch_resize(g, i, bytes);
     }
-    return true;
+#ifdef DS4_ROCM_BUILD
+    (void)ds4_gpu_memory_pressure_hold(held);
+#endif
+    return ok;
 }
 
 /* Make layer il ready for tokens [pos0, pos0 + n_tokens): room for the
@@ -19016,7 +19046,9 @@ static bool metal_graph_kv_refit(
                                            g->kv_managed, ds4_layer_compress_ratio(il)))) return false;
         }
     }
-    return n_comp || metal_graph_kv_scratch_refit(g);
+    if (n_comp) return true;
+    g->kv_scratch_need = 0;
+    return metal_graph_kv_scratch_refit(g);
 }
 
 /* The same for a checkpoint shard that carries only layers
@@ -92039,10 +92071,21 @@ uint64_t ds4_session_context_memory_bytes(const ds4_session *s) {
                  ds4_gpu_tensor_bytes(g->layer_attn_comp_cache[il]) +
                  ds4_gpu_tensor_bytes(g->layer_index_comp_cache[il]);
     }
-    /* A shared scratch stays behind for the other sessions. */
-    const bool scratch_stays = g->kv_scratch && g->kv_scratch->users &&
-        (g->kv_scratch->users != g || g->kv_scratch_next);
-    for (int t = 0; !scratch_stays && t < DS4_MAX_GPUS; t++) {
+    /* A shared scratch stays behind for the other sessions, refit to what
+     * they use (metal_graph_kv_scratch_leave) unless it is being resized. */
+    const ds4_kv_scratch *pool = g->kv_scratch;
+    const ds4_gpu_graph *rest = !pool ? NULL :
+                                pool->users != g ? pool->users : g->kv_scratch_next;
+    /* Nothing is counted while a resize runs: leave does not refit then,
+     * and the pool still names the tensor the resize has freed. */
+    if (rest && !pool->resizing) {
+        const uint64_t fit = metal_graph_kv_scratch_fit_bytes(rest, g);
+        for (int i = 0; i < 2; i++) {
+            const uint64_t have = ds4_gpu_tensor_bytes(pool->tensor[i]);
+            if (fit < have) bytes += have - fit;
+        }
+    }
+    for (int t = 0; !rest && t < DS4_MAX_GPUS; t++) {
         bytes += ds4_gpu_tensor_bytes(g->indexer_scores_by_tier[t]) +
                  ds4_gpu_tensor_bytes(g->comp_mask_by_tier[t]);
     }
