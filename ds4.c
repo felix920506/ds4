@@ -63772,7 +63772,8 @@ typedef struct {
     uint64_t prefix_hash;   /* of those tokens; binds the anchor to its timeline */
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
-    uint8_t *state;         /* raw window rows and compressor state, layer by layer */
+    uint8_t *state;         /* raw window rows and compressor state, layer by layer,
+                             * then the logits of the frontier */
 } ds4_session_anchor;
 
 struct ds4_session {
@@ -91593,11 +91594,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
  * overwritten by later tokens, and each compressor holds the partial window of
  * the latest tokens instead of the one it held back then.  An anchor is a host
  * copy of exactly that perishable part of one frontier - the window of raw
- * rows before it, the compressor state, and the compressed row counts.  With
- * it the session can return to that position and evaluate a different
- * continuation, at a cost that does not grow with the context (about 22 MiB
- * for all of Flash, against a disk checkpoint that also carries every
- * compressed row).
+ * rows before it, the compressor state, and the compressed row counts - plus
+ * the logits there.  With it the session can return to that position and
+ * sample or evaluate a different continuation, at a cost that does not grow
+ * with the context (about 22 MiB for all of Flash, against a disk checkpoint
+ * that also carries every compressed row).
  *
  * Callers take anchors where they may want to come back to, such as the start
  * of a reply and at intervals inside it (ds4_session_anchor_save).  A fixed
@@ -91768,14 +91769,17 @@ bool ds4_session_anchor_save(ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_synchronize() != 0;
     ds4_session_anchor a = {.pos = pos, .prefix_hash = hash};
-    a.state = ok ? malloc((size_t)session_anchor_copy(g, (uint32_t)pos, NULL,
-                                                      ANCHOR_SIZE, &ok)) : NULL;
+    const size_t logits_bytes = (size_t)DS4_N_VOCAB * sizeof(float);
+    const uint64_t bytes = ok ? session_anchor_copy(g, (uint32_t)pos, NULL,
+                                                    ANCHOR_SIZE, &ok) : 0;
+    a.state = ok ? malloc((size_t)bytes + logits_bytes) : NULL;
     if (!a.state) return false;
     session_anchor_copy(g, (uint32_t)pos, a.state, ANCHOR_SAVE, &ok);
     if (!ok) {
         free(a.state);
         return false;
     }
+    memcpy(a.state + bytes, s->logits, logits_bytes);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         a.n_comp[il] = g->layer_n_comp[il];
         a.n_index_comp[il] = g->layer_n_index_comp[il];
@@ -91800,7 +91804,8 @@ bool ds4_session_anchor_rewind(ds4_session *s, int pos) {
     ds4_gpu_graph *g = &s->graph;
     const ds4_session_anchor *a = &s->anchors[i];
     bool ok = ds4_gpu_synchronize() != 0;
-    if (ok) session_anchor_copy(g, (uint32_t)pos, a->state, ANCHOR_RESTORE, &ok);
+    uint64_t bytes = 0;
+    if (ok) bytes = session_anchor_copy(g, (uint32_t)pos, a->state, ANCHOR_RESTORE, &ok);
     if (ok) ok = ds4_gpu_synchronize() != 0;
     if (!ok) {
         /* Some layers may already hold the anchor's rows. */
@@ -91819,9 +91824,11 @@ bool ds4_session_anchor_rewind(ds4_session *s, int pos) {
            (uint64_t)s->checkpoint_images[s->checkpoint_image_count - 1].token_start +
            s->checkpoint_images[s->checkpoint_image_count - 1].token_count > (uint64_t)pos)
         s->checkpoint_image_count--;
-    /* Drafting state describes the abandoned continuation, and the logits
-     * are those of its last token: the caller evaluates at least one token
-     * from here before sampling. */
+    /* The frontier's own logits come back with it, so the session can be
+     * sampled or saved before anything else is evaluated (a cancelled sync,
+     * a prompt that ends exactly here).  Drafting state describes the
+     * abandoned continuation. */
+    memcpy(s->logits, a->state + bytes, (size_t)DS4_N_VOCAB * sizeof(float));
     s->mtp_draft_valid = false;
     s->dist_spec_pending = false;
     g->mtp_n_raw = 0;
