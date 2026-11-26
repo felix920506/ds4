@@ -121,18 +121,26 @@ When an allocation does not fit, memory is taken back in this order:
    recently used of what is left, which costs about 2% of prefill speed;
    smaller batches run the Q8 kernels.
 3. Routed experts: read back from the GGUF on demand (next section). This is
-   the last resort; it costs real speed.
+   the last resort; it costs real speed. It exists only for a Q2 model
+   (IQ2_XXS and Q2_K experts) loaded whole on one machine. A pipeline stage
+   (`--layers`) or a model with another expert layout, such as MXFP4, has no
+   evictable experts, and its chain ends at step 2.
 
 Free memory goes back the other way: experts first, then the F16 cache. A
 session is refused at creation only if its full reservation could not be
-committed with all three given up. Output does not depend on the first and
-third step. The second changes which kernels small batches run, as a small or
-large `--ctx` already did.
+committed with every step that applies given up: all three on a single-machine
+Q2 model, only the first two on a pipeline stage. Output does not depend on
+the first and third step. The second changes which kernels small batches run,
+as a small or large `--ctx` already did.
 
 ### Elastic expert weights
 
-Resident Flash on ROCm loads each layer's routed experts as its own device
-block. `ds4_gpu_reclaim_weights()` can then evict cold experts when the context,
+A resident Q2 model (IQ2_XXS gate and up experts, Q2_K down) loaded whole on
+one machine loads each layer's routed experts as its own device block on ROCm.
+A pipeline stage (`--layers`), a model with another expert layout such as
+MXFP4, and `--ssd-streaming` do not: they have no evictable experts, and the
+two-machine setup above stops at the F16 weight cache.
+`ds4_gpu_reclaim_weights()` can then evict cold experts when the context,
 a new session or the fixed weights at load need memory, and they are read back from the GGUF on demand; attention,
 shared experts and all other weights always stay resident. The mechanism and
 its policy are documented in `rocm/ds4_rocm_elastic.cuh`. Results do not
