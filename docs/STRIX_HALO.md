@@ -121,27 +121,37 @@ When an allocation does not fit, memory is taken back in this order:
    recently used of what is left, which costs about 2% of prefill speed;
    smaller batches run the Q8 kernels.
 3. Routed experts: read back from the GGUF on demand (next section). This is
-   the last resort; it costs real speed. It exists only for a Q2 model
-   (IQ2_XXS and Q2_K experts) loaded whole on one machine. A pipeline stage
-   (`--layers`) or a model with another expert layout, such as MXFP4, has no
-   evictable experts, and its chain ends at step 2.
+   the last resort; it costs real speed. It exists only for layers whose
+   experts are IQ2_XXS (gate, up) and Q2_K (down), in a model loaded whole on
+   one machine: a Q2 model has them in every layer, a mixed Q2/Q4 model only
+   in its Q2 layers. A pipeline stage (`--layers`), an MXFP4 or Q4 model and
+   `--ssd-streaming` have none.
+
+Which steps apply depends on the setup:
+
+- A single-machine server with `--batched-session`: step 1 for its idle
+  slots, step 2, and step 3 where experts can be evicted.
+- A single-machine server without `--batched-session`: no idle slot is freed,
+  so step 2, then step 3 where experts can be evicted.
+- A pipeline stage, as in the two-machine setup above: step 2 only. The
+  coordinator never frees its distributed sessions under memory pressure, the
+  worker has no server slots, and the MXFP4 experts cannot be evicted.
 
 Free memory goes back the other way: experts first, then the F16 cache. A
 session is refused at creation only if its full reservation could not be
-committed with every step that applies given up: all three on a single-machine
-Q2 model, only the first two on a pipeline stage. Output does not depend on
-the first and third step. The second changes which kernels small batches run,
-as a small or large `--ctx` already did.
+committed with every step that applies to the setup given up. Output does not
+depend on the first and third step. The second changes which kernels small
+batches run, as a small or large `--ctx` already did.
 
 ### Elastic expert weights
 
-A resident Q2 model (IQ2_XXS gate and up experts, Q2_K down) loaded whole on
-one machine loads each layer's routed experts as its own device block on ROCm.
-A pipeline stage (`--layers`), a model with another expert layout such as
-MXFP4, and `--ssd-streaming` do not: they have no evictable experts, and the
-two-machine setup above stops at the F16 weight cache.
-`ds4_gpu_reclaim_weights()` can then evict cold experts when the context,
-a new session or the fixed weights at load need memory, and they are read back from the GGUF on demand; attention,
+A model loaded whole on one machine loads the routed experts of each layer as
+its own device block on ROCm when that layer's experts are IQ2_XXS (gate, up)
+and Q2_K (down). A Q2 model has them in every layer, a mixed Q2/Q4 model only
+in its Q2 layers. A pipeline stage (`--layers`), an MXFP4 or Q4 model and
+`--ssd-streaming` have none, and the two-machine setup above stops at the F16
+weight cache. Where they exist, `ds4_gpu_reclaim_weights()` evicts cold
+experts when the context, a new session or the fixed weights at load need memory, and they are read back from the GGUF on demand; attention,
 shared experts and all other weights always stay resident. The mechanism and
 its policy are documented in `rocm/ds4_rocm_elastic.cuh`. Results do not
 change: evicted layers run the same kernels on the same bytes.
