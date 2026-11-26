@@ -28,6 +28,10 @@ x-ds4: &ds4
     - /dev/dri
   group_add:
     - video
+  environment:
+    # Also the default of this image, but a pinned or older image still
+    # defaults to the container-private /tmp/ds4.lock.
+    DS4_LOCK_FILE: /tmp/ds4-lock/ds4.lock
   stop_grace_period: 30s
 
 services:

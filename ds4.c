@@ -63666,8 +63666,10 @@ static void ds4_release_instance_lock(void) {
  * The default lock lives in its own directory so that containers can share it
  * with native processes by bind-mounting the host's /tmp/ds4-lock at the same
  * path (see docs/DOCKER.md).  Containers usually run as root and natives as a
- * user, so a lock file ds4 creates is made world-writable: whichever process
- * comes first, the other can still lock it.
+ * user, so a lock file ds4 creates is made world-writable and a native process
+ * can lock a file a root container created.  Which process may create the
+ * directory first depends on who owns it: see docs/DOCKER.md for the
+ * orderings that need a root-provisioned 1777 directory.
  *
  * The directory is in /tmp, so another local user may have made it, or may
  * plant entries in it.  It is only used if it is owned by root or by us, and
@@ -63679,7 +63681,7 @@ static void ds4_acquire_instance_lock(void) {
     char dir[PATH_MAX];
     const char *name;
     int dir_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
-    bool made_dir = false;
+    bool made_dir = false, custom_path = false;
     if (!path || !path[0]) {
         path = "/tmp/ds4-lock/ds4.lock";
         snprintf(dir, sizeof(dir), "/tmp/ds4-lock");
@@ -63687,6 +63689,7 @@ static void ds4_acquire_instance_lock(void) {
         dir_flags |= O_NOFOLLOW;
         made_dir = mkdir(dir, 0700) == 0;
     } else {
+        custom_path = true;
         const char *slash = strrchr(path, '/');
         name = slash ? slash + 1 : path;
         if (!slash) snprintf(dir, sizeof(dir), ".");
@@ -63696,6 +63699,9 @@ static void ds4_acquire_instance_lock(void) {
             fprintf(stderr, "ds4: invalid lock file path %s\n", path);
             exit(2);
         }
+#ifdef O_PATH
+        dir_flags |= O_PATH; /* only searched, so it need not be readable */
+#endif
     }
 
     const int dfd = open(dir, dir_flags);
@@ -63712,10 +63718,16 @@ static void ds4_acquire_instance_lock(void) {
     {
         fprintf(stderr,
                 "ds4: refusing to use lock directory %s: owner uid %u, mode %04o; it must be owned by "
-                "root%s and be sticky if others can write to it. With no ds4 running, remove it "
-                "(sudo rm -r %s) or recreate it as root (sudo install -d -m 1777 %s)\n",
+                "root%s and be sticky if others can write to it.",
                 dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777),
-                euid == 0 ? "" : " or by you", dir, dir);
+                euid == 0 ? "" : " or by you");
+        if (custom_path) {
+            fprintf(stderr, " Point DS4_LOCK_FILE into a directory that others cannot write to");
+        } else {
+            fprintf(stderr, " With no ds4 running, remove it (sudo rm -r %s) or recreate it as root "
+                    "(sudo install -d -m 1777 %s)", dir, dir);
+        }
+        fputc('\n', stderr);
         exit(2);
     }
     /* The directory is ours and still 0700, so nobody else can have entered
@@ -63750,7 +63762,9 @@ static void ds4_acquire_instance_lock(void) {
             fprintf(stderr, "ds4: it is a symlink; refusing to follow it\n");
         } else if (open_errno == EACCES) {
             fprintf(stderr, "ds4: with no ds4 running, remove a leftover file you cannot open "
-                    "(sudo rm -f %s), or let every user create it (sudo chmod 1777 %s)\n", path, dir);
+                    "(sudo rm -f %s)", path);
+            if (!custom_path) fprintf(stderr, ", or let every user create it (sudo chmod 1777 %s)", dir);
+            fputc('\n', stderr);
         }
         exit(2);
     }

@@ -38,13 +38,17 @@ same time.
   compose container and a natively started `ds4`, `ds4-server` or `ds4-bench`
   refuse each other. A container started with plain `docker run` has its own
   `/tmp` and is only covered when it also gets
-  `-v /tmp/ds4-lock:/tmp/ds4-lock`. Setting `DS4_LOCK_FILE` moves the lock
-  elsewhere and takes that process out of this sharing. Stop the server before
-  running a benchmark or the CLI on the same machine.
+  `-v /tmp/ds4-lock:/tmp/ds4-lock`. The compose files also set
+  `DS4_LOCK_FILE=/tmp/ds4-lock/ds4.lock`, so an image built before the lock
+  moved there still shares it. Pointing `DS4_LOCK_FILE` anywhere but
+  `/tmp/ds4-lock/ds4.lock` takes that process out of this sharing. Stop the
+  server before running a benchmark or the CLI on the same machine.
 
   Because `/tmp` is shared with every local user, ds4 only uses a lock
   directory owned by root or by the user running it (and sticky if others can
-  write to it), and it never follows a symlink there. A root process (the
+  write to it), and it never follows a symlink there. A directory named by
+  `DS4_LOCK_FILE` gets the same ownership and mode check (a group-writable
+  directory that is not sticky is refused). A root process (the
   compose containers) only accepts a root-owned directory. The directory works
   for root and for every user when root creates it with mode 1777, for
   example at boot with the systemd-tmpfiles line
@@ -57,7 +61,7 @@ same time.
     user, and compose containers then refuse to start (`refusing to use lock
     directory /tmp/ds4-lock`) until it is removed or recreated as root.
 
-  When ds4 refuses a directory or a lock file, stop every ds4, then run
+  When ds4 refuses the default directory or lock file, stop every ds4, then run
   `sudo rm -r /tmp/ds4-lock` and `sudo install -d -m 1777 /tmp/ds4-lock`.
 
 ## One machine
