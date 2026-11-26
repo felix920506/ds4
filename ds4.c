@@ -1613,9 +1613,12 @@ static double now_sec(void) {
  * Phases are measured at the public API, and only the outermost call on a
  * thread records.  ds4_session_sync_multimodal() ends in ds4_session_sync(),
  * the mixed prefill/decode batch can fall back to a sync plus a decode batch,
- * the speculative entry points fall back to plain eval, and payload staging
- * runs ds4_session_save_payload(): the thread-local depth keeps those inner
- * calls silent instead of counting the same wall time twice. */
+ * and the speculative entry points fall back to plain eval: the thread-local
+ * depth keeps those inner calls silent instead of counting the same wall time
+ * twice.  KV saves are the exception for calls and bytes: a continued
+ * checkpoint or a memory-pressure kick is written from inside a sync or an
+ * eval, and is still a payload written, so only its time stays with the
+ * enclosing phase. */
 static uint64_t g_metrics[DS4_METRIC_COUNT];
 static __thread int g_metrics_depth;
 
@@ -66264,7 +66267,7 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
     const uint64_t t0 = metrics_begin();
     const int rc = ds4_session_write_staged_payload_unmetered(payload, fp, err, errlen);
     metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
-    if (t0 && rc == 0) {
+    if (rc == 0) {
         ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
         ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, payload->bytes);
     }
@@ -66301,6 +66304,7 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_payload_file *out,
                                                char *err, size_t errlen);
+static int ds4_session_save_payload_unmetered(ds4_session *s, FILE *fp, char *err, size_t errlen);
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
@@ -66338,7 +66342,9 @@ static int ds4_session_stage_payload_unmetered(ds4_session *s, ds4_session_paylo
         return 1;
     }
 
-    int rc = ds4_session_save_payload(s, fp, err, errlen);
+    /* The staged copy is counted when ds4_session_write_staged_payload()
+     * writes it to its destination. */
+    int rc = ds4_session_save_payload_unmetered(s, fp, err, errlen);
     if (rc == 0 && fflush(fp) != 0) {
         payload_set_err(err, errlen, "failed to flush staged session payload");
         rc = 1;
@@ -66637,7 +66643,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     const long start = fp ? ftell(fp) : -1;
     const int rc = ds4_session_save_payload_unmetered(s, fp, err, errlen);
     metrics_end(t0, DS4_METRIC_KV_SAVE_NS);
-    if (t0 && rc == 0) {
+    if (rc == 0) {
         const long end = ftell(fp);
         ds4_metric_add(DS4_METRIC_KV_SAVE_CALLS, 1);
         if (start >= 0 && end > start) ds4_metric_add(DS4_METRIC_KV_SAVE_BYTES, (uint64_t)(end - start));
