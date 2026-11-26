@@ -4771,9 +4771,19 @@ static uint64_t cuda_q8_f16_range_bytes(const cuda_q8_f16_range &r) {
     return r.in_dim * r.out_dim * sizeof(__half);
 }
 
+/* What whole-entry eviction can free without going below the floor.  Entries
+ * differ in size, so an excess smaller than every remaining entry stays; it
+ * must not count, or callers keep the cache reserve for memory that never
+ * comes back. */
 static uint64_t cuda_q8_f16_evictable_bytes(void) {
-    return g_q8_f16_bytes > DS4_ROCM_Q8_F16_KEEP_BYTES
-        ? g_q8_f16_bytes - DS4_ROCM_Q8_F16_KEEP_BYTES : 0;
+    if (g_q8_f16_bytes <= DS4_ROCM_Q8_F16_KEEP_BYTES) return 0;
+    const uint64_t excess = g_q8_f16_bytes - DS4_ROCM_Q8_F16_KEEP_BYTES;
+    uint64_t left = excess;
+    for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
+        const uint64_t bytes = cuda_q8_f16_range_bytes(r);
+        if (bytes <= left) left -= bytes;
+    }
+    return excess - left;
 }
 
 /* Reclaim step: give expanded weights back to a growing context.  They are
@@ -4789,14 +4799,16 @@ static uint64_t cuda_q8_f16_cache_evict(uint64_t need_bytes) {
               [](const cuda_q8_f16_range &a, const cuda_q8_f16_range &b) {
                   return a.last_use > b.last_use;
               });
+    /* An entry too large for the room above the floor is skipped, not the
+     * end of the scan: a smaller, newer one may still fit. */
     uint64_t freed = 0;
-    while (freed < need_bytes && !g_q8_f16_ranges.empty()) {
-        const cuda_q8_f16_range &r = g_q8_f16_ranges.back();
+    for (size_t i = g_q8_f16_ranges.size(); i-- > 0 && freed < need_bytes;) {
+        const cuda_q8_f16_range &r = g_q8_f16_ranges[i];
         const uint64_t bytes = cuda_q8_f16_range_bytes(r);
-        if (g_q8_f16_bytes - freed < DS4_ROCM_Q8_F16_KEEP_BYTES + bytes) break;
+        if (g_q8_f16_bytes - freed < DS4_ROCM_Q8_F16_KEEP_BYTES + bytes) continue;
         freed += bytes;
         (void)cudaFree(r.device_ptr);
-        g_q8_f16_ranges.pop_back();
+        g_q8_f16_ranges.erase(g_q8_f16_ranges.begin() + (ptrdiff_t)i);
     }
     g_q8_f16_by_offset.clear();
     for (size_t i = 0; i < g_q8_f16_ranges.size(); i++) {

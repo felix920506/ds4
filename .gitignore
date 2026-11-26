@@ -143,5 +143,6 @@ __pycache__/
 /tests/test_rocm_moe_down
 /tests/test_rocm_moe_mxfp4
 /tests/test_rocm_q8_f16_reuse
+/tests/test_rocm_q8_f16_evict
 /tests/test_rocm_indexer
 /tests/test_rocm_visual_attention
