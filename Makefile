@@ -498,6 +498,14 @@ tests/test_rocm_moe_down: tests/test_rocm_moe_down.cu ds4_gpu.h ds4_rocm.o ds4_r
 test-rocm-moe-down: tests/test_rocm_moe_down
 	./tests/test_rocm_moe_down
 
+tests/test_rocm_moe_gateup_fallback: tests/test_rocm_moe_gateup_fallback.cu ds4_gpu.h ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -I. -o $@ tests/test_rocm_moe_gateup_fallback.cu -x none \
+		ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_LDLIBS)
+
+.PHONY: test-rocm-moe-gateup-fallback
+test-rocm-moe-gateup-fallback: tests/test_rocm_moe_gateup_fallback
+	./tests/test_rocm_moe_gateup_fallback
+
 tests/test_rocm_moe_mxfp4: tests/test_rocm_moe_mxfp4.cu ds4_gpu.h ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -I. -o $@ tests/test_rocm_moe_mxfp4.cu -x none \
 		ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_LDLIBS)
@@ -1774,7 +1782,7 @@ clean:
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp tests/test_cuda_tp_link
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/rocm_prefill_variant_bench tests/test_rocm_head_norm tests/test_rocm_moe_down tests/test_rocm_moe_mxfp4 tests/test_rocm_q8_f16_reuse tests/test_rocm_q8_f16_evict tests/test_rocm_indexer tests/test_rocm_visual_attention speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_dist_session_batch tests/test_dist_session_release tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/rocm_prefill_variant_bench tests/test_rocm_head_norm tests/test_rocm_moe_down tests/test_rocm_moe_gateup_fallback tests/test_rocm_moe_mxfp4 tests/test_rocm_q8_f16_reuse tests/test_rocm_q8_f16_evict tests/test_rocm_indexer tests/test_rocm_visual_attention speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_dist_session_batch tests/test_dist_session_release tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_image_decode
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
 	rm -f speed-bench/session_concurrency_bench speed-bench/vision_encode_bench

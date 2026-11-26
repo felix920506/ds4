@@ -142,6 +142,7 @@ __pycache__/
 /speed-bench/rocm_prefill_variant_bench
 
 /tests/test_rocm_moe_down
+/tests/test_rocm_moe_gateup_fallback
 /tests/test_rocm_moe_mxfp4
 /tests/test_rocm_q8_f16_reuse
 /tests/test_rocm_q8_f16_evict
