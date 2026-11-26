@@ -75,7 +75,8 @@ services:
       - --kv-disk-space-mb
       - "${DS4_KV_DISK_MB:-32768}"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${DS4_PORT:-8000}/v1/models"]
+      # The server listens on exactly DS4_BIND; 0.0.0.0 (all addresses) is probed on loopback.
+      test: ["CMD-SHELL", "h=${DS4_BIND:-127.0.0.1}; [ \"$$h\" = 0.0.0.0 ] && h=127.0.0.1; curl -fsS http://$$h:${DS4_PORT:-8000}/v1/models"]
       interval: 30s
       timeout: 5s
       start_period: 15m
