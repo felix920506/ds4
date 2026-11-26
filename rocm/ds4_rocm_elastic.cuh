@@ -344,6 +344,7 @@ static int cuda_elastic_resize(cuda_elastic_layer &l, uint32_t new_slots) {
         parked = 1;
         if (!cuda_ok(cudaMalloc(&block, (size_t)new_bytes), "elastic expert block")) {
             /* No block until its next launch (cuda_elastic_restore_block). */
+            (void)cudaGetLastError();
             cuda_elastic_clear_slots(l, 0);
             return 0;
         }
@@ -476,6 +477,7 @@ static int cuda_elastic_shrink_in_place(cuda_elastic_layer &l) {
     if (!cuda_ok(cudaMalloc(&block, (size_t)cuda_elastic_block_bytes(l, slots)),
                  "elastic expert block")) {
         /* No block until its next launch (cuda_elastic_restore_block). */
+        (void)cudaGetLastError();
         cuda_elastic_clear_slots(l, 0);
         return 0;
     }
@@ -501,27 +503,41 @@ static uint64_t cuda_elastic_max_table_bytes(void);
  * Both shrinks above free a layer's block before they allocate the smaller
  * one, and leave the layer without any when that allocation fails.  Its next
  * launch allocates a minimum block again, every slot empty: they load on their
- * first miss, as after a failed read.  A shrunk layer gathers its batches in
- * the scratch block, which the failed reclaim may not have taken yet.  Until
- * both exist the launch fails instead of misrouting.
+ * first miss, as after a failed read.  Until it exists the launch fails
+ * instead of misrouting.
  */
 static int cuda_elastic_restore_block(cuda_elastic_layer &l) {
-    if (!g_elastic_scratch) {
-        const uint64_t bytes = std::max(cuda_elastic_max_table_bytes(),
-                                        cuda_elastic_block_bytes(l, l.t.n_total_expert));
-        void *scratch = NULL;
-        if (!cuda_ok(cudaMalloc(&scratch, (size_t)bytes), "elastic scratch block")) return 0;
-        g_elastic_scratch = (char *)scratch;
-        g_elastic_scratch_bytes = bytes;
-        g_elastic_scratch_layer = -1;
-    }
     void *block = NULL;
     if (!cuda_ok(cudaMalloc(&block, (size_t)cuda_elastic_block_bytes(l, DS4_ROCM_ELASTIC_MIN_SLOTS)),
                  "elastic expert block")) {
+        (void)cudaGetLastError();
         return 0;
     }
     cuda_elastic_clear_slots(l, DS4_ROCM_ELASTIC_MIN_SLOTS);
     l.block = (char *)block;
+    return 1;
+}
+
+/*
+ * A shrunk layer gathers its batches in the scratch block.  Reclaim normally
+ * takes it before it stops, but a reclaim that failed part way can leave
+ * shrunk layers without one, so the first batch that needs it allocates it.
+ * The caller has synchronized the device: a smaller scratch block may be
+ * replaced.
+ */
+static int cuda_elastic_ensure_scratch(const cuda_elastic_layer &l) {
+    const uint64_t need = cuda_elastic_block_bytes(l, l.t.n_total_expert);
+    if (g_elastic_scratch && g_elastic_scratch_bytes >= need) return 1;
+    const uint64_t bytes = std::max(cuda_elastic_max_table_bytes(), need);
+    void *scratch = NULL;
+    if (!cuda_ok(cudaMalloc(&scratch, (size_t)bytes), "elastic scratch block")) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (g_elastic_scratch) (void)cudaFree(g_elastic_scratch);
+    g_elastic_scratch = (char *)scratch;
+    g_elastic_scratch_bytes = bytes;
+    g_elastic_scratch_layer = -1;
     return 1;
 }
 
@@ -691,9 +707,8 @@ static int cuda_elastic_batch(
         const char **down_w) {
     const uint64_t n_ids = (uint64_t)n_tokens * n_expert;
     std::vector<int32_t> ids((size_t)n_ids);
-    if (!g_elastic_scratch ||
-        g_elastic_scratch_bytes < cuda_elastic_block_bytes(l, l.t.n_total_expert) ||
-        !cuda_elastic_read_selected(selected, ids.data(), n_ids, l.t.n_total_expert)) {
+    if (!cuda_elastic_read_selected(selected, ids.data(), n_ids, l.t.n_total_expert) ||
+        !cuda_elastic_ensure_scratch(l)) {
         return 0;
     }
     cuda_elastic_note_batch(l, ids.data(), n_ids);
