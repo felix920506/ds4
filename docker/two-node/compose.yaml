@@ -28,8 +28,6 @@ x-ds4: &ds4
     - /dev/dri
   group_add:
     - video
-  environment:
-    DS4_LOCK_FILE: /run/ds4-lock/ds4.lock
   stop_grace_period: 30s
 
 services:
@@ -39,7 +37,7 @@ services:
     volumes:
       - ${DS4_MODELS:-../../gguf}:/models:ro
       - ds4-kv:/kv
-      - /tmp/ds4-lock:/run/ds4-lock
+      - /tmp/ds4-lock:/tmp/ds4-lock # instance lock, shared with the host
     # The image's entrypoint is /opt/ds4/ds4-server.
     command:
       - -m
@@ -81,7 +79,7 @@ services:
     entrypoint: ["/opt/ds4/ds4"]
     volumes:
       - ${DS4_MODELS:-../../gguf}:/models:ro
-      - /tmp/ds4-lock:/run/ds4-lock
+      - /tmp/ds4-lock:/tmp/ds4-lock # instance lock, shared with the host
     command:
       - -m
       - /models/${DS4_MODEL:-DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf}

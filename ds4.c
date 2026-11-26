@@ -63661,17 +63661,30 @@ static void ds4_release_instance_lock(void) {
 }
 
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
- * stale accidental second run is more dangerous than a normal CLI error. */
+ * stale accidental second run is more dangerous than a normal CLI error.
+ *
+ * The default lock lives in its own directory so that containers can share it
+ * with native processes by bind-mounting the host's /tmp/ds4-lock at the same
+ * path (see docs/DOCKER.md).  Containers usually run as root and natives as a
+ * user, so the directory is sticky and world-writable and the file is
+ * world-writable: whichever process comes first, the other can still lock it. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
-    if (!path || !path[0]) path = "/tmp/ds4.lock";
+    if (!path || !path[0]) {
+        path = "/tmp/ds4-lock/ds4.lock";
+        if (mkdir("/tmp/ds4-lock", 0777) == 0) (void)chmod("/tmp/ds4-lock", 01777);
+    }
 
-    const int fd = open(path, O_RDWR | O_CREAT, 0600);
+    int fd = open(path, O_RDWR | O_CREAT, 0666);
+    /* fs.protected_regular refuses O_CREAT on another user's file in a sticky
+     * world-writable directory, even when the file itself is writable. */
+    if (fd < 0 && errno == EACCES) fd = open(path, O_RDWR);
     if (fd < 0) {
         fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
         exit(2);
     }
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    (void)fchmod(fd, 0666); /* Undo the umask; fails harmlessly if not ours. */
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {

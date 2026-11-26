@@ -33,9 +33,14 @@ same time.
   loading reads the whole model, and evicted experts are read back from it.
 - **One ds4 process per machine.** Two model processes on one unified memory
   machine can exhaust memory badly enough to panic the kernel. ds4 refuses to
-  start a second instance through a lock file; the compose files share that
-  lock file through `/tmp/ds4-lock` on the host, so it also covers containers.
-  Stop the server before running a benchmark or the CLI on the same machine.
+  start a second instance through the lock file `/tmp/ds4-lock/ds4.lock`. The
+  compose files mount the host's `/tmp/ds4-lock` at the same path, so a
+  compose container and a natively started `ds4`, `ds4-server` or `ds4-bench`
+  refuse each other. A container started with plain `docker run` has its own
+  `/tmp` and is only covered when it also gets
+  `-v /tmp/ds4-lock:/tmp/ds4-lock`. Setting `DS4_LOCK_FILE` moves the lock
+  elsewhere and takes that process out of this sharing. Stop the server before
+  running a benchmark or the CLI on the same machine.
 
 ## One machine
 

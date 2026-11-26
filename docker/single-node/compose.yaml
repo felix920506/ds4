@@ -27,11 +27,11 @@ services:
     volumes:
       - ${DS4_MODELS:-../../gguf}:/models:ro
       - ds4-kv:/kv
-      # Shared by every ds4 container on this host, so ds4's instance lock
-      # also refuses a second container (e.g. a `docker compose run` bench).
-      - /tmp/ds4-lock:/run/ds4-lock
-    environment:
-      DS4_LOCK_FILE: /run/ds4-lock/ds4.lock
+      # ds4's instance lock is /tmp/ds4-lock/ds4.lock.  Mounting the host's
+      # directory at the same path makes this container and every other ds4
+      # on the host (native, or a container with the same mount) refuse
+      # each other.
+      - /tmp/ds4-lock:/tmp/ds4-lock
     stop_grace_period: 30s
     # The image's entrypoint is /opt/ds4/ds4-server.
     command:
