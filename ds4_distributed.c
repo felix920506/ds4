@@ -271,6 +271,7 @@ typedef struct ds4_dist_worker_entry {
     uint32_t ctx_size;
     uint32_t n_layers;
     uint32_t listen_port;
+    uint64_t registered_generation;  /* registry generation this entry created */
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
@@ -2243,6 +2244,7 @@ static void dist_coordinator_add_worker(
     entry->next = state->workers;
     state->workers = entry;
     state->generation++;
+    entry->registered_generation = state->generation;
     pthread_mutex_unlock(&state->mu);
 
     char layer_end[32];
@@ -2431,16 +2433,23 @@ static bool dist_route_entry_matches_worker(
            route_has_output == (worker->has_output != 0);
 }
 
+/* plan_generation is the registry generation the plan was built at, or 0 when
+ * unknown.  A worker that registered after it is not the one that failed,
+ * even at the same endpoint (a fixed --listen port, or a worker that only
+ * lost its control link): it is a stage that has come back, maybe already
+ * serving a session that another failed batch member has just replayed. */
 static void dist_coordinator_forget_route_workers(
         ds4_dist_coordinator_state *state,
-        const ds4_dist_route_plan *plan) {
+        const ds4_dist_route_plan *plan,
+        uint64_t plan_generation) {
     bool removed_any = false;
     pthread_mutex_lock(&state->mu);
     for (uint32_t i = 0; i < plan->count; i++) {
         ds4_dist_worker_entry **link = &state->workers;
         while (*link) {
             ds4_dist_worker_entry *entry = *link;
-            if (!dist_route_entry_matches_worker(&plan->entry[i], entry)) {
+            if ((plan_generation && entry->registered_generation > plan_generation) ||
+                !dist_route_entry_matches_worker(&plan->entry[i], entry)) {
                 link = &entry->next;
                 continue;
             }
@@ -3435,7 +3444,8 @@ static int dist_coordinator_rebuild_from_transcript(
     /* The route wait's result is passed on, so an interrupted wait stays
      * DS4_SESSION_SYNC_INTERRUPTED; every caller tests for nonzero. */
     if (forget_route) {
-        dist_coordinator_forget_route_workers(state, plan);
+        dist_coordinator_forget_route_workers(state, plan,
+                                              plan_generation ? *plan_generation : 0);
         dist_route_plan_free(plan);
         uint64_t generation = 0;
         const int route_rc = dist_coordinator_ensure_route(state, plan, &generation,
@@ -6668,6 +6678,16 @@ static int dist_batch_recover_member(
     return rc;
 }
 
+/* Whether a batch member that failed after starting at t0 has used up the
+ * batch's wait for a missing stage: the route is still incomplete and the
+ * attempt took a whole DS4_DIST_ROUTE_WAIT_SEC, so its route wait ran out.
+ * A member that failed sooner (a worker-side error, a dead socket, an
+ * interrupted wait) has not waited, and leaves the wait to the next one. */
+static bool dist_batch_route_wait_spent(ds4_dist_session *d, double t0) {
+    return dist_now_sec() - t0 >= DS4_DIST_ROUTE_WAIT_SEC &&
+           ds4_dist_session_route_ready(d, NULL, 0) == 0;
+}
+
 /* One decode step across several coordinator sessions at once.
  *
  * A distributed decode is a local layer slice on this GPU and then a wait on
@@ -6730,15 +6750,37 @@ int ds4_dist_sessions_eval(
     char report_err[256];
     report_err[0] = '\0';
     int failed = 0;
+    /* The batch waits for a missing stage once.  After one member's route
+     * wait has run out, a later member whose route is still incomplete fails
+     * without a wait of its own, in the submit pass and in the recovery pass:
+     * it would wait as long again and fail the same way. */
+    bool route_wait_spent = false;
 
     for (int i = 0; i < count; i++) {
+        if (route_wait_spent && ds4_dist_session_route_ready(items[i].dist, NULL, 0) == 0) {
+            /* Leave it as a failed route check does: with its old plan kept,
+             * a later recovery would forget that plan's healthy workers. */
+            dist_route_plan_free(&items[i].dist->plan);
+            items[i].dist->plan_ready = false;
+            items[i].dist->plan_generation = 0;
+            members[i].pos0 = (uint32_t)items[i].checkpoint->len;
+            members[i].rc = 1;
+            failed++;
+            continue;
+        }
         char member_err[256];
         member_err[0] = '\0';
+        const double t0 = dist_now_sec();
         members[i].rc = dist_batch_submit_member(state, &items[i], &members[i],
                                                  hidden, hidden_bytes,
                                                  member_err, sizeof(member_err));
-        if (members[i].rc != 0 && !failed++) {
-            snprintf(report_err, sizeof(report_err), "%s", member_err);
+        if (members[i].rc != 0) {
+            if (!failed++) snprintf(report_err, sizeof(report_err), "%s", member_err);
+            if (dist_batch_route_wait_spent(items[i].dist, t0)) {
+                /* The reason the batch cannot be salvaged. */
+                snprintf(report_err, sizeof(report_err), "%s", member_err);
+                route_wait_spent = true;
+            }
         }
     }
 
@@ -6763,14 +6805,19 @@ int ds4_dist_sessions_eval(
 
     for (int i = 0; i < count && failed; i++) {
         if (members[i].rc == 0) continue;
+        if (route_wait_spent && ds4_dist_session_route_ready(items[i].dist, NULL, 0) == 0) {
+            continue;
+        }
         char member_err[256];
         member_err[0] = '\0';
+        const double t0 = dist_now_sec();
         if (dist_batch_recover_member(state, &items[i], &members[i],
                                       member_err, sizeof(member_err)) == 0) {
             members[i].rc = 0;
             failed--;
         } else {
             snprintf(report_err, sizeof(report_err), "%s", member_err);
+            if (dist_batch_route_wait_spent(items[i].dist, t0)) route_wait_spent = true;
         }
     }
 
