@@ -5343,8 +5343,21 @@ static uint64_t test_rocm_free_bytes(void) {
  * allocated up front, through checkpoints exchanged in both directions and a
  * reset, while holding a fraction of the memory. */
 static void test_rocm_context_growth(void) {
+    /* Bit-identical logits need both sessions to run the same kernels.  A
+     * small prefill batch runs the F16 GEMM for weights the Q8->F16 cache
+     * holds at that moment and the Q8 kernels for the rest, which round
+     * differently (docs/STRIX_HALO.md: that reclaim step "changes which
+     * kernels small batches run").  The cache follows free memory, which this
+     * test drives to its budget, so two syncs of one prompt need not find the
+     * same cache.  Keep it empty: what this test checks is context memory. */
+    char *saved_no_f16 = test_save_env("DS4_CUDA_NO_Q8_F16_CACHE");
+    setenv("DS4_CUDA_NO_Q8_F16_CACHE", "1", 1);
     ds4_engine *engine = test_get_engine(false);
-    if (!engine) return;
+    if (!engine) {
+        test_restore_env("DS4_CUDA_NO_Q8_F16_CACHE", saved_no_f16);
+        return;
+    }
+    ds4_gpu_release_q8_f16_cache();
     enum { CTX = 262144, STEPS = 96 };
     const uint64_t gib = 1ull << 30;
     ds4_session *upfront = NULL, *grown = NULL;
@@ -5412,6 +5425,7 @@ cleanup:
     ds4_tokens_free(&prompt);
     ds4_session_free(grown);
     ds4_session_free(upfront);
+    test_restore_env("DS4_CUDA_NO_Q8_F16_CACHE", saved_no_f16);
 }
 #endif
 
