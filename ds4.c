@@ -85644,6 +85644,7 @@ static int ds4_sessions_eval_batch_speculative_argmax_unmetered(
  * coordinator engine is distributed, and ds4_sessions_eval_batch() has already
  * rejected members belonging to a different engine. */
 static int ds4_sessions_eval_batch_distributed(ds4_decode_item *items, int count,
+                                               int *member_rc,
                                                char *err, size_t errlen) {
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
@@ -85674,27 +85675,44 @@ static int ds4_sessions_eval_batch_distributed(ds4_decode_item *items, int count
         dist_items[i].logits = s->logits;
     }
     int rc = ds4_dist_sessions_eval(dist_items, count, err, errlen);
-    free(dist_items);
-    if (rc != 0) {
-        /* Members can be left at different points in the timeline, so rebuild
-         * every one rather than expose a partially committed logical batch. */
-        for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
+    /* A member that failed may be anywhere in its timeline, so it is rebuilt
+     * from scratch.  The others were collected or replayed through this token
+     * and stay usable: one conversation that cannot be recovered must not end
+     * the rest of the batch. */
+    for (int i = 0; rc != 0 && i < count; i++) {
+        if (member_rc) member_rc[i] = dist_items[i].rc;
+        if (dist_items[i].rc != 0) ds4_session_invalidate(items[i].session);
     }
+    free(dist_items);
     return rc;
 }
 
 static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
+                                             int *member_rc,
                                              char *err, size_t errlen);
+
+int ds4_sessions_eval_batch_members(ds4_decode_item *items, int count,
+                                    int *member_rc, char *err, size_t errlen) {
+    const uint64_t t0 = metrics_begin();
+    /* Backends that report members one by one overwrite this. */
+    for (int i = 0; member_rc && i < count; i++) member_rc[i] = 1;
+    const int rc = ds4_sessions_eval_batch_unmetered(items, count, member_rc, err, errlen);
+    int advanced = rc == 0 ? count : 0;
+    for (int i = 0; member_rc && i < count; i++) {
+        if (rc == 0) member_rc[i] = 0;
+        else if (member_rc[i] == 0) advanced++;
+    }
+    metrics_end_decode(t0, count, advanced);
+    return rc;
+}
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
-    const uint64_t t0 = metrics_begin();
-    const int rc = ds4_sessions_eval_batch_unmetered(items, count, err, errlen);
-    metrics_end_decode(t0, count, rc == 0 ? count : 0);
-    return rc;
+    return ds4_sessions_eval_batch_members(items, count, NULL, err, errlen);
 }
 
 static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
+                                             int *member_rc,
                                              char *err, size_t errlen) {
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
@@ -85749,7 +85767,7 @@ static int ds4_sessions_eval_batch_unmetered(ds4_decode_item *items, int count,
      * frame before collecting any result, instead of the serialized fallback
      * below that pays one full round trip per member. */
     if (ds4_decode_batch_has_distributed(items, count)) {
-        return ds4_sessions_eval_batch_distributed(items, count, err, errlen);
+        return ds4_sessions_eval_batch_distributed(items, count, member_rc, err, errlen);
     }
 
 #ifndef DS4_NO_GPU

@@ -660,6 +660,12 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* The same; when it fails, member_rc[i] says whether item i still advanced
+ * (0, with its token and logits as after a successful batch) or failed
+ * (nonzero: invalidated, rebuild it).  Backends that cannot tell members apart
+ * fail them all. */
+int ds4_sessions_eval_batch_members(ds4_decode_item *items, int count,
+                                    int *member_rc, char *err, size_t errlen);
 /* One speculative cycle for a batch of sessions (greedy acceptance, Qwen3.8
  * with --mtp): each item feeds its token; a pending draft rides along as a
  * second row and is committed when it is the target's argmax.  accepted[i]
