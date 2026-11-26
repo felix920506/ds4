@@ -271,6 +271,7 @@ typedef struct ds4_dist_worker_entry {
     uint32_t ctx_size;
     uint32_t n_layers;
     uint32_t listen_port;
+    uint64_t registered_generation;  /* registry generation this entry created */
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
@@ -2243,6 +2244,7 @@ static void dist_coordinator_add_worker(
     entry->next = state->workers;
     state->workers = entry;
     state->generation++;
+    entry->registered_generation = state->generation;
     pthread_mutex_unlock(&state->mu);
 
     char layer_end[32];
@@ -2431,16 +2433,23 @@ static bool dist_route_entry_matches_worker(
            route_has_output == (worker->has_output != 0);
 }
 
+/* plan_generation is the registry generation the plan was built at, or 0 when
+ * unknown.  A worker that registered after it is not the one that failed,
+ * even at the same endpoint (a fixed --listen port, or a worker that only
+ * lost its control link): it is a stage that has come back, maybe already
+ * serving a session that another failed batch member has just replayed. */
 static void dist_coordinator_forget_route_workers(
         ds4_dist_coordinator_state *state,
-        const ds4_dist_route_plan *plan) {
+        const ds4_dist_route_plan *plan,
+        uint64_t plan_generation) {
     bool removed_any = false;
     pthread_mutex_lock(&state->mu);
     for (uint32_t i = 0; i < plan->count; i++) {
         ds4_dist_worker_entry **link = &state->workers;
         while (*link) {
             ds4_dist_worker_entry *entry = *link;
-            if (!dist_route_entry_matches_worker(&plan->entry[i], entry)) {
+            if ((plan_generation && entry->registered_generation > plan_generation) ||
+                !dist_route_entry_matches_worker(&plan->entry[i], entry)) {
                 link = &entry->next;
                 continue;
             }
@@ -3406,7 +3415,8 @@ static int dist_coordinator_rebuild_from_transcript(
                      transcript->len,
                      forget_route ? "route failure" : "KV mismatch");
     if (forget_route) {
-        dist_coordinator_forget_route_workers(state, plan);
+        dist_coordinator_forget_route_workers(state, plan,
+                                              plan_generation ? *plan_generation : 0);
         dist_route_plan_free(plan);
         uint64_t generation = 0;
         if (!dist_coordinator_ensure_route(state, plan, &generation, err, errlen)) return 1;
@@ -6711,6 +6721,10 @@ int ds4_dist_sessions_eval(
             failed--;
         } else {
             snprintf(report_err, sizeof(report_err), "%s", member_err);
+            /* With the route still incomplete this recovery has just waited out
+             * DS4_DIST_ROUTE_WAIT_SEC; every later member would wait as long
+             * again and fail the same way. */
+            if (ds4_dist_session_route_ready(items[i].dist, NULL, 0) == 0) break;
         }
     }
 

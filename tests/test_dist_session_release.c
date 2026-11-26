@@ -5,7 +5,8 @@
  * release frame is what lets ordinary session churn reuse a worker's
  * --max-sessions budget.  This test drives the real coordinator broadcast and
  * the real worker frame handler over socketpairs, with placeholder sessions so
- * no model or GPU is needed; it also pins the widened session-id sequence.
+ * no model or GPU is needed; it also pins the widened session-id sequence,
+ * and which registration a failed route forgets.
  */
 #include "../ds4_distributed.c"
 
@@ -220,6 +221,46 @@ static void test_release_backpressure(uint64_t id) {
     close(pair[1]);
 }
 
+/* A failed route forgets the workers it was built from, matched by endpoint.
+ * A worker that registered after the plan was built has come back, possibly
+ * already holding a session another batch member just replayed, and must be
+ * left alone even at the same endpoint. */
+static void test_forget_only_older_registrations(void) {
+    ds4_dist_coordinator_state state;
+    memset(&state, 0, sizeof(state));
+    pthread_mutex_init(&state.mu, NULL);
+    ds4_dist_worker_entry *worker = calloc(1, sizeof(*worker));
+    assert(worker);
+    worker->fd = -1;
+    snprintf(worker->peer_host, sizeof(worker->peer_host), "10.0.0.2");
+    worker->listen_port = 9912;
+    worker->layer_start = 2;
+    worker->layer_end = 3;
+    worker->has_output = 1;
+    worker->registered_generation = 5;
+    state.workers = worker;
+    state.generation = 5;
+
+    ds4_dist_route_entry route;
+    memset(&route, 0, sizeof(route));
+    route.fd = -1;
+    snprintf(route.host, sizeof(route.host), "10.0.0.2");
+    route.port = 9912;
+    route.layer_start = 2;
+    route.layer_end = 3;
+    route.flags = DS4_DIST_ROUTE_F_OUTPUT_LOGITS;
+    ds4_dist_route_plan plan;
+    memset(&plan, 0, sizeof(plan));
+    plan.entry = &route;
+    plan.count = 1;
+
+    dist_coordinator_forget_route_workers(&state, &plan, 4);
+    assert(state.workers == worker && state.generation == 5);
+    dist_coordinator_forget_route_workers(&state, &plan, 5);
+    assert(state.workers == NULL && state.generation == 6);
+    pthread_mutex_destroy(&state.mu);
+}
+
 int main(void) {
     const uint64_t first = dist_make_session_id(NULL);
     test_session_id_sequence(first);
@@ -229,6 +270,7 @@ int main(void) {
     test_worker_control_loop(dist_worker_read_loop_prefetch,
                              UINT64_C(0xabc000000004));
     test_release_backpressure(UINT64_C(0xabc000000005));
+    test_forget_only_older_registrations();
     fprintf(stderr, "test_dist_session_release PASS\n");
     return 0;
 }
