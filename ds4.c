@@ -18859,7 +18859,7 @@ static bool metal_graph_kv_resize(
     if (keep_bytes == 0) {
         ds4_gpu_tensor_free(old);
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
-        *slot = t ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
+        *slot = t || !old ? t : metal_graph_alloc_kv_cache_tensor(managed, old_bytes);
     } else {
         t = metal_graph_alloc_kv_cache_tensor(managed, new_bytes);
         if (t && (ds4_gpu_tensor_copy(t, 0, old, 0, keep_bytes) == 0 ||
@@ -18987,6 +18987,13 @@ static bool metal_graph_kv_reserve(
     return metal_graph_kv_reserve_scratch(g, rows * n_tokens * sizeof(float));
 }
 
+/* Whether layer il has this compressed cache: the layers this graph holds
+ * (a pipeline stage holds a slice) with a compression ratio, and for the
+ * indexer only the ratio-4 ones, as metal_graph_alloc_raw_cap allocates them. */
+static bool metal_graph_kv_layer_has_cache(const ds4_gpu_graph *g, uint32_t il, bool indexer) {
+    return g->layer_comp_cap[il] != 0 && (!indexer || ds4_layer_compress_ratio(il) == 4);
+}
+
 /* Size every compressed cache for the given valid row counts without keeping
  * its contents, and the scratch back to its minimum: a reset session holds
  * what a new one holds (n_comp == NULL), and a checkpoint about to be loaded
@@ -19003,7 +19010,10 @@ static bool metal_graph_kv_refit(
         for (int indexer = 0; indexer < 2; indexer++) {
             ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
                                              : &g->layer_attn_comp_cache[il];
-            if (!*cache) continue;
+            /* A NULL slot of a layer that has the cache is a resize that
+             * failed with its rollback: rebuild it, or prompts too short to
+             * emit a row for this layer never would. */
+            if (!metal_graph_kv_layer_has_cache(g, il, indexer != 0)) continue;
             const uint32_t *valid = indexer ? n_index_comp : n_comp;
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid ? valid[il] : 0, g->layer_comp_cap[il]);
@@ -19032,7 +19042,7 @@ static bool metal_graph_kv_refit_layers(
         for (int indexer = 0; indexer < 2; indexer++) {
             ds4_gpu_tensor **cache = indexer ? &g->layer_index_comp_cache[il]
                                              : &g->layer_attn_comp_cache[il];
-            if (!*cache) continue;
+            if (!metal_graph_kv_layer_has_cache(g, il, indexer != 0)) continue;
             const uint32_t valid = indexer ? n_index_comp[i] : n_comp[i];
             const uint64_t bytes = metal_graph_comp_cache_row_bytes(indexer != 0) *
                 metal_graph_kv_rows_for(0, valid, g->layer_comp_cap[il]);
