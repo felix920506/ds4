@@ -463,6 +463,32 @@ test-rocm:
 	./tests/test_prompt_prefix
 	./tests/test_dist_session_release
 
+# Model-free checks for a runner with no GPU and no model: they gate publishing the
+# Docker image (.github/workflows/docker-rocm.yml).  Built for the CPU backend with
+# a generic -march, so it does not need nvcc or hipcc.
+CPU_TEST_CFLAGS = -O1 -g -ffast-math -fno-finite-math-only -D_GNU_SOURCE -DDS4_NO_GPU -Wall -Wextra -std=c99
+.PHONY: test-cpu
+test-cpu:
+	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
+		test-session-state test-linux-memory test-engram test-web-recovery \
+		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
+		tests/test_dist_session_release tests/test_deepseek4_vision_image tests/test_image_decode \
+		ds4 ds4-server ds4-bench ds4-agent \
+		CORE_OBJS="$(CPU_CORE_OBJS)" CFLAGS="$(CPU_TEST_CFLAGS)" \
+		DS4_LINK="$(CC) $(CPU_TEST_CFLAGS)" DS4_LINK_LIBS="$(LDLIBS)"
+	./ds4_test --server
+	./ds4-eval --validate-cases
+	./ds4-eval --self-test-extractors
+	./ds4_agent_test
+	./tests/test_layer_pack
+	./tests/test_engine_mgpu_placement
+	./tests/test_gpu_args
+	./tests/test_gpu_args_cli.sh
+	./tests/test_prompt_prefix
+	./tests/test_dist_session_release
+	./tests/test_deepseek4_vision_image
+	./tests/test_image_decode
+
 tests/test_rocm_moe_down: tests/test_rocm_moe_down.cu ds4_gpu.h ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -I. -o $@ tests/test_rocm_moe_down.cu -x none \
 		ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_image.o $(ROCM_MMQ_OBJS) $(ROCM_LDLIBS)
