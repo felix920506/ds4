@@ -63666,25 +63666,100 @@ static void ds4_release_instance_lock(void) {
  * The default lock lives in its own directory so that containers can share it
  * with native processes by bind-mounting the host's /tmp/ds4-lock at the same
  * path (see docs/DOCKER.md).  Containers usually run as root and natives as a
- * user, so the directory is sticky and world-writable and the file is
- * world-writable: whichever process comes first, the other can still lock it. */
+ * user, so a lock file ds4 creates is made world-writable: whichever process
+ * comes first, the other can still lock it.
+ *
+ * The directory is in /tmp, so another local user may have made it, or may
+ * plant entries in it.  It is only used if it is owned by root or by us, and
+ * is sticky when others can write it; the file is opened through that
+ * directory's descriptor without following symlinks, must be a regular file
+ * with one link, and only a file created by this call gets its mode changed. */
 static void ds4_acquire_instance_lock(void) {
     const char *path = getenv("DS4_LOCK_FILE");
+    char dir[PATH_MAX];
+    const char *name;
+    int dir_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+    bool made_dir = false;
     if (!path || !path[0]) {
         path = "/tmp/ds4-lock/ds4.lock";
-        if (mkdir("/tmp/ds4-lock", 0777) == 0) (void)chmod("/tmp/ds4-lock", 01777);
+        snprintf(dir, sizeof(dir), "/tmp/ds4-lock");
+        name = "ds4.lock";
+        dir_flags |= O_NOFOLLOW;
+        made_dir = mkdir(dir, 0700) == 0;
+    } else {
+        const char *slash = strrchr(path, '/');
+        name = slash ? slash + 1 : path;
+        if (!slash) snprintf(dir, sizeof(dir), ".");
+        else if (slash == path) snprintf(dir, sizeof(dir), "/");
+        else snprintf(dir, sizeof(dir), "%.*s", (int)(slash - path), path);
+        if (!name[0] || strlen(path) >= sizeof(dir)) {
+            fprintf(stderr, "ds4: invalid lock file path %s\n", path);
+            exit(2);
+        }
     }
 
-    int fd = open(path, O_RDWR | O_CREAT, 0666);
-    /* fs.protected_regular refuses O_CREAT on another user's file in a sticky
-     * world-writable directory, even when the file itself is writable. */
-    if (fd < 0 && errno == EACCES) fd = open(path, O_RDWR);
-    if (fd < 0) {
-        fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(errno));
+    const int dfd = open(dir, dir_flags);
+    struct stat st;
+    if (dfd < 0 || fstat(dfd, &st) != 0) {
+        const int e = errno;
+        fprintf(stderr, "ds4: failed to open lock directory %s: %s%s\n", dir, strerror(e),
+                e == ELOOP || e == ENOTDIR ? " (it must be a real directory, not a symlink)" : "");
         exit(2);
     }
-    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
-    (void)fchmod(fd, 0666); /* Undo the umask; fails harmlessly if not ours. */
+    const uid_t euid = geteuid();
+    if ((st.st_uid != 0 && st.st_uid != euid) ||
+        ((st.st_mode & (S_IWGRP | S_IWOTH)) && !(st.st_mode & S_ISVTX)))
+    {
+        fprintf(stderr,
+                "ds4: refusing to use lock directory %s: owner uid %u, mode %04o; it must be owned by "
+                "root%s and be sticky if others can write to it. With no ds4 running, remove it "
+                "(sudo rm -r %s) or recreate it as root (sudo install -d -m 1777 %s)\n",
+                dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777),
+                euid == 0 ? "" : " or by you", dir, dir);
+        exit(2);
+    }
+    /* The directory is ours and still 0700, so nobody else can have entered
+     * it.  Root makes it shared; a user's directory is not used by root or by
+     * other users anyway (see above), so it stays closed to writes. */
+    if (made_dir && st.st_uid == euid && (st.st_mode & 07777) == 0700) {
+        (void)fchmod(dfd, euid == 0 ? 01777 : 0755);
+    }
+
+    /* O_NONBLOCK: a FIFO planted at the lock path must not block the open. */
+    const int file_flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
+    bool made_file = false;
+    int fd = -1;
+    for (int tries = 0; fd < 0 && tries < 3; tries++) {
+        fd = openat(dfd, name, file_flags | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            made_file = true;
+            break;
+        }
+        if (errno != EEXIST) break;
+        /* Without O_CREAT: fs.protected_regular refuses O_CREAT on another
+         * user's file in a sticky world-writable directory, even when the
+         * file itself is writable. */
+        fd = openat(dfd, name, file_flags);
+        if (fd < 0 && errno != ENOENT) break;
+    }
+    const int open_errno = errno;
+    close(dfd);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: failed to open lock file %s: %s\n", path, strerror(open_errno));
+        if (open_errno == ELOOP) {
+            fprintf(stderr, "ds4: it is a symlink; refusing to follow it\n");
+        } else if (open_errno == EACCES) {
+            fprintf(stderr, "ds4: with no ds4 running, remove a leftover file you cannot open "
+                    "(sudo rm -f %s), or let every user create it (sudo chmod 1777 %s)\n", path, dir);
+        }
+        exit(2);
+    }
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        fprintf(stderr, "ds4: refusing to use lock file %s: not a regular file with a single link\n", path);
+        close(fd);
+        exit(2);
+    }
+    if (made_file) (void)fchmod(fd, 0666); /* Undo the umask. */
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {

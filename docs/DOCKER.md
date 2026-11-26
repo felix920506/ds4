@@ -42,6 +42,24 @@ same time.
   elsewhere and takes that process out of this sharing. Stop the server before
   running a benchmark or the CLI on the same machine.
 
+  Because `/tmp` is shared with every local user, ds4 only uses a lock
+  directory owned by root or by the user running it (and sticky if others can
+  write to it), and it never follows a symlink there. A root process (the
+  compose containers) only accepts a root-owned directory. The directory works
+  for root and for every user when root creates it with mode 1777, for
+  example at boot with the systemd-tmpfiles line
+  `d /tmp/ds4-lock 1777 root root -` in `/etc/tmpfiles.d/ds4.conf`. Without
+  that:
+  - if a compose container starts first, Docker creates the directory as
+    `root 0755` and the container creates the lock file; native processes can
+    lock that file afterwards, but not create it if it is removed;
+  - if a native process starts first, ds4 creates the directory owned by that
+    user, and compose containers then refuse to start (`refusing to use lock
+    directory /tmp/ds4-lock`) until it is removed or recreated as root.
+
+  When ds4 refuses a directory or a lock file, stop every ds4, then run
+  `sudo rm -r /tmp/ds4-lock` and `sudo install -d -m 1777 /tmp/ds4-lock`.
+
 ## One machine
 
 [`docker/single-node/compose.yaml`](../docker/single-node/compose.yaml)
