@@ -14967,6 +14967,10 @@ decode_again:
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            /* Same lock as the one-token decode in server_eval_tokens: the
+             * request parser encodes images under it, and on ROCm the encoder
+             * shares (and may reallocate) the GPU scratch the decode uses. */
+            server_inference_lock(s);
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
@@ -14980,6 +14984,7 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             }
+            server_inference_unlock(s);
             if (ntok < 0) {
                 finish = "error";
                 break;
