@@ -575,8 +575,8 @@ bool ds4_session_payload_restores_vision(const ds4_session *s);
  *   that a bounded number covers the history, densest near the frontier.
  * floor: position of the newest usable anchor at or below pos, or -1.
  * rewind: return to the anchor at exactly pos, a value floor returned.  The
- *   checkpoint keeps its first pos tokens and the images wholly inside them;
- *   logits are stale until the next token is evaluated.  False means the
+ *   checkpoint keeps its first pos tokens and the images wholly inside them,
+ *   and the logits are those the session had at pos.  False means the
  *   state could not be restored; the checkpoint is then left as it was or
  *   invalidated, and the caller rebuilds as it would without anchors. */
 bool ds4_session_anchor_save(ds4_session *s);

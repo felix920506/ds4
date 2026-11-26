@@ -5580,6 +5580,8 @@ static void test_session_anchor_rewind(void) {
             (double)(t2.tv_sec - t1.tv_sec) * 1e3 + (double)(t2.tv_nsec - t1.tv_nsec) / 1e6);
     TEST_ASSERT(ds4_session_pos(detour) == ANCHOR);
     TEST_ASSERT(ds4_session_anchor_floor(detour, CTX) == ANCHOR);
+    /* The anchor's logits came back with it: nothing is evaluated yet. */
+    TEST_ASSERT(test_logits_identical(engine, detour, straight));
 
     /* The real continuation, decoded: crosses windows of both ratios. */
     for (int i = 0; i < STEPS; i++) {

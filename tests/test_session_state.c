@@ -688,6 +688,88 @@ static void test_glm_spec_rollback(void) {
     munmap(model, MODEL_BYTES);
     g_ds4_shape = saved_shape;
 }
+
+/* A rewind to an anchor brings back the logits of that frontier, so a session
+ * sampled before it evaluates anything (a cancelled sync, a prompt that ends
+ * exactly on the anchor) answers from the anchor and not from the abandoned
+ * continuation.  A cut-down Flash shape keeps the state a few bytes. */
+static void test_anchor_rewind_logits(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    uint32_t saved_ratios[DS4_MAX_LAYER];
+    memcpy(saved_ratios, g_ds4_compress_ratios, sizeof(saved_ratios));
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_shape.n_layer = 2;
+    g_ds4_shape.n_head_dim = 4;
+    g_ds4_shape.n_indexer_head_dim = 4;
+    g_ds4_shape.n_vocab = 8;
+    g_ds4_compress_ratios[0] = 0;
+    g_ds4_compress_ratios[1] = 4;
+    assert(ds4_gpu_init());
+#ifdef __APPLE__
+    ds4_engine e = { .backend = DS4_BACKEND_METAL };
+#else
+    ds4_engine e = { .backend = DS4_BACKEND_CUDA };
+#endif
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    s->ctx_size = 64;
+    s->logits = calloc(DS4_N_VOCAB, sizeof(float));
+    assert(s->logits);
+    ds4_gpu_graph *g = &s->graph;
+    g->raw_cap = 16;
+    g->raw_window = 8;
+    const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g->layer_raw_cache[il] = ds4_gpu_tensor_alloc(g->raw_cap * row);
+        assert(g->layer_raw_cache[il]);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ratio) continue;
+        g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(layer_attn_state_bytes(ratio));
+        g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(layer_attn_state_bytes(ratio));
+        g->layer_index_state_kv[il] = ds4_gpu_tensor_alloc(layer_index_state_bytes(ratio));
+        g->layer_index_state_score[il] = ds4_gpu_tensor_alloc(layer_index_state_bytes(ratio));
+        assert(g->layer_attn_state_kv[il] && g->layer_attn_state_score[il] &&
+               g->layer_index_state_kv[il] && g->layer_index_state_score[il]);
+    }
+    enum { P = 6, Q = 10 };
+    for (int i = 0; i < P; i++) ds4_tokens_push(&s->checkpoint, 1 + i);
+    s->checkpoint_valid = true;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) s->logits[i] = i == 1 ? 10.0f : -1.0f;
+    assert(ds4_gpu_tensor_fill_f32(g->layer_attn_state_kv[1], 105.0f, 4));
+    assert(ds4_session_anchor_save(s));
+    assert(ds4_session_anchor_floor(s, P) == P);
+
+    /* The abandoned reply: more tokens, a new compressor state and logits. */
+    for (int i = P; i < Q; i++) ds4_tokens_push(&s->checkpoint, 7);
+    assert(ds4_gpu_tensor_fill_f32(g->layer_attn_state_kv[1], 209.0f, 4));
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) s->logits[i] = i == 6 ? 10.0f : -1.0f;
+    assert(ds4_session_argmax(s) == 6);
+
+    assert(ds4_session_anchor_rewind(s, P));
+    assert(ds4_session_pos(s) == P && s->checkpoint_valid);
+    float state = 0;
+    assert(ds4_gpu_tensor_read(g->layer_attn_state_kv[1], 0, &state, sizeof(state)));
+    assert(state == 105.0f);
+    assert(ds4_session_argmax(s) == 1);
+    uint64_t rng = 1;
+    assert(ds4_session_sample(s, 0, 0, 1, 0, &rng) == 1);
+
+    session_anchors_clear(s);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_raw_cache[il]);
+        ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
+        ds4_gpu_tensor_free(g->layer_attn_state_score[il]);
+        ds4_gpu_tensor_free(g->layer_index_state_kv[il]);
+        ds4_gpu_tensor_free(g->layer_index_state_score[il]);
+    }
+    ds4_tokens_free(&s->checkpoint);
+    free(s->logits);
+    free(s);
+    ds4_gpu_cleanup();
+    memcpy(g_ds4_compress_ratios, saved_ratios, sizeof(saved_ratios));
+    g_ds4_shape = saved_shape;
+}
 #endif
 
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -986,6 +1068,7 @@ int main(void) {
     test_glm_mixed_ssd_prefill();
 #endif
     test_glm_spec_rollback();
+    test_anchor_rewind_logits();
 #endif
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     test_spark_dspark_policy();
