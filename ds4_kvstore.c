@@ -754,6 +754,9 @@ struct ds4_kvstore_sig {
     uint64_t file_size;
     uint32_t n;
     uint64_t *v;
+    /* The last len % KV_SIG_GRID bytes, which no sample covers. */
+    uint32_t tail_n;
+    char tail[KV_SIG_GRID];
     /* Its images.  unknown: they could not be read, so it neither covers
      * anything nor is covered. */
     ds4_kvstore_image *image;
@@ -764,6 +767,8 @@ typedef struct ds4_kvstore_sig kv_sig;
 
 static void kv_sig_compute(const char *text, size_t len, kv_sig *sig) {
     sig->n = (uint32_t)(len / KV_SIG_GRID);
+    sig->tail_n = (uint32_t)(len % KV_SIG_GRID);
+    memcpy(sig->tail, text + (size_t)sig->n * KV_SIG_GRID, sig->tail_n);
     sig->v = sig->n ? kv_xmalloc((size_t)sig->n * sizeof(sig->v[0])) : NULL;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     for (uint32_t k = 0; k < sig->n; k++) {
@@ -857,6 +862,21 @@ static bool kv_sig_extends(const kv_sig *e, const kv_sig *w) {
     return e->n >= need && e->v[need - 1] == w->v[need - 1];
 }
 
+/* Whether the text of entry e has the bytes of w's tail at the same place.
+ * The signature already matched everything before it. */
+static bool kv_entry_has_tail(const ds4_kvstore_entry *e, const kv_sig *w) {
+    if (w->tail_n == 0) return true;
+    char text[KV_SIG_GRID];
+    FILE *fp = fopen(e->path, "rb");
+    const bool ok = fp &&
+        fseek(fp, (long)(DS4_KVSTORE_FIXED_HEADER + 4 +
+                         (uint64_t)w->n * KV_SIG_GRID), SEEK_SET) == 0 &&
+        fread(text, 1, w->tail_n, fp) == w->tail_n &&
+        memcmp(text, w->tail, w->tail_n) == 0;
+    if (fp) fclose(fp);
+    return ok;
+}
+
 /* Whether entry x is a longer checkpoint of the text and images of entry w. */
 static bool kv_cache_pair_extends(const ds4_kvstore *kc, const int *sig,
                                   int w, int x) {
@@ -873,7 +893,8 @@ static bool kv_cache_pair_extends(const ds4_kvstore *kc, const int *sig,
     return (whole ? es->n >= ws->n && es->v[ws->n - 1] == ws->v[ws->n - 1]
                   : kv_sig_extends(es, ws)) &&
            kv_images_agree(ws->image, ws->image_n, es->image, es->image_n,
-                           W->text_bytes);
+                           W->text_bytes) &&
+           (!whole || kv_entry_has_tail(E, ws));
 }
 
 /* Dead tips seen lately, kept after their files are gone: a conversation
@@ -992,7 +1013,9 @@ static kv_cover *kv_cache_covers(ds4_kvstore *kc,
         }
         if (in_images_agree && kv_cache_incoming_compatible(W, incoming) &&
             (w_tip ? kv_sig_extends(&in, ws)
-                   : in.n >= ws->n && in.v[ws->n - 1] == ws->v[ws->n - 1]) &&
+                   : in.n >= ws->n && in.v[ws->n - 1] == ws->v[ws->n - 1] &&
+                     !memcmp(incoming->text + (size_t)ws->n * KV_SIG_GRID,
+                             ws->tail, ws->tail_n)) &&
             (w_tip || !in_suspect))
             kv_cover_add(&cover[w], incoming->text_len, in_unproven);
         for (int x = 0; x < n; x++) {
