@@ -467,6 +467,8 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * usable, but a partial layer-major pass is invalidated and the next sync
  * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+/* Distributed code: true when the installed cancel callback asks to stop. */
+bool ds4_session_cancelled(ds4_session *s);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* A pipelined distributed prefill runs the coordinator's layers ahead of the
  * stages behind it, and only its last chunk returns logits.  While it is under
