@@ -45709,31 +45709,40 @@ static int bpe_rank(const ds4_vocab *vocab, const owned_str *a, const owned_str 
     return rank;
 }
 
+/* Twice cap elements of elem_size bytes, or 0 when that many bytes do not
+ * fit in a size_t.  One piece holds a symbol per character, and the server
+ * accepts bodies of gigabytes, so the count can pass INT_MAX. */
+static size_t bpe_grow_capacity(size_t cap, size_t elem_size) {
+    if (cap > SIZE_MAX / 2 / elem_size) return 0;
+    return cap * 2;
+}
+
 /* Apply byte-level BPE to one regex-like pre-tokenized piece and emit token ids. */
 static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
 
-    int n_sym = 0;
-    int cap_sym = 32;
-    owned_str *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
+    size_t n_sym = 0;
+    size_t cap_sym = 32;
+    owned_str *sym = xcalloc(cap_sym, sizeof(sym[0]));
 
     for (uint64_t off = 0; off < encoded_len;) {
         int n = utf8_len_from_first_byte((uint8_t)encoded[off]);
         if (off + (uint64_t)n > encoded_len) n = 1;
         if (n_sym == cap_sym) {
-            cap_sym *= 2;
-            sym = xrealloc(sym, (size_t)cap_sym * sizeof(sym[0]));
+            cap_sym = bpe_grow_capacity(cap_sym, sizeof(sym[0]));
+            if (cap_sym == 0) ds4_die("allocation size overflow");
+            sym = xrealloc(sym, cap_sym * sizeof(sym[0]));
         }
         sym[n_sym++] = owned_copy(encoded + off, (uint64_t)n);
         off += (uint64_t)n;
     }
 
     for (;;) {
-        int best_i = -1;
+        size_t best_i = SIZE_MAX;
         int best_rank = INT32_MAX;
 
-        for (int i = 0; i + 1 < n_sym; i++) {
+        for (size_t i = 0; i + 1 < n_sym; i++) {
             int rank = bpe_rank(vocab, &sym[i], &sym[i + 1]);
             if (rank >= 0 && rank < best_rank) {
                 best_rank = rank;
@@ -45741,7 +45750,7 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
             }
         }
 
-        if (best_i < 0) break;
+        if (best_i == SIZE_MAX) break;
 
         owned_str merged;
         merged.len = sym[best_i].len + sym[best_i + 1].len;
@@ -45753,13 +45762,13 @@ static void bpe_emit_piece(const ds4_vocab *vocab, ds4_str raw_piece, token_vec 
         free(sym[best_i + 1].ptr);
         sym[best_i] = merged;
 
-        for (int j = best_i + 1; j + 1 < n_sym; j++) {
+        for (size_t j = best_i + 1; j + 1 < n_sym; j++) {
             sym[j] = sym[j + 1];
         }
         n_sym--;
     }
 
-    for (int i = 0; i < n_sym; i++) {
+    for (size_t i = 0; i < n_sym; i++) {
         int token = -1;
         if (table_get(&vocab->token_to_id, sym[i].ptr, sym[i].len, &token)) {
             token_vec_push(out, token);
