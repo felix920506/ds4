@@ -5618,16 +5618,24 @@ extern "C" void ds4_gpu_set_memory_pressure_handler(
     g_memory_pressure_user = user;
 }
 
+/* Set while this thread is inside the reclaim chain, or holds it off. */
+static thread_local bool g_memory_pressure_busy;
+
+extern "C" int ds4_gpu_memory_pressure_hold(int hold) {
+    const int was = g_memory_pressure_busy;
+    g_memory_pressure_busy = hold != 0;
+    return was;
+}
+
 /* Before an allocation that must not fail (fixed weights, session buffers):
  * if it does not fit, give up memory in the order of the reclaim chain: the
  * owner's idle sessions, the F16 cache, routed experts.  The handler frees
  * sessions and may allocate while it saves them, hence the guard; the other
  * steps synchronize the device before they free anything. */
 static void cuda_memory_make_room(uint64_t bytes) {
-    static thread_local bool busy;
     uint64_t missing = ds4_gpu_memory_shortfall(bytes, 0);
-    if (!missing || busy) return;
-    busy = true;
+    if (!missing || g_memory_pressure_busy) return;
+    g_memory_pressure_busy = true;
     if (g_memory_pressure_fn && g_memory_pressure_fn(g_memory_pressure_user, missing)) {
         missing = ds4_gpu_memory_shortfall(bytes, 0);
     }
@@ -5635,7 +5643,7 @@ static void cuda_memory_make_room(uint64_t bytes) {
         missing = ds4_gpu_memory_shortfall(bytes, 0);
     }
     if (missing) (void)ds4_gpu_reclaim_weights(missing);
-    busy = false;
+    g_memory_pressure_busy = false;
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {

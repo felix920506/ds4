@@ -358,6 +358,10 @@ uint64_t ds4_gpu_memory_shortfall(uint64_t bytes, int keep_cache_headroom);
  * route through its own reclaim (session buffers): asked first, as there. */
 void ds4_gpu_set_memory_pressure_handler(
         uint64_t (*fn)(void *user, uint64_t need_bytes), void *user);
+/* Keep this thread's allocations from running the reclaim chain (nonzero) or
+ * let them again (0); returns the previous setting.  For allocations that
+ * never need room and run where the handler must not free a session. */
+int ds4_gpu_memory_pressure_hold(int hold);
 uint64_t ds4_gpu_memory_ceiling(int movable);
 #endif
 void ds4_gpu_set_quality(bool quality);
