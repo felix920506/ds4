@@ -343,7 +343,7 @@ static int cuda_elastic_resize(cuda_elastic_layer &l, uint32_t new_slots) {
         l.block = NULL;
         parked = 1;
         if (!cuda_ok(cudaMalloc(&block, (size_t)new_bytes), "elastic expert block")) {
-            /* The layer is unusable now; launches fail instead of misrouting. */
+            /* No block until its next launch (cuda_elastic_restore_block). */
             cuda_elastic_clear_slots(l, 0);
             return 0;
         }
@@ -475,7 +475,7 @@ static int cuda_elastic_shrink_in_place(cuda_elastic_layer &l) {
     void *block = NULL;
     if (!cuda_ok(cudaMalloc(&block, (size_t)cuda_elastic_block_bytes(l, slots)),
                  "elastic expert block")) {
-        /* The layer is unusable now; launches fail instead of misrouting. */
+        /* No block until its next launch (cuda_elastic_restore_block). */
         cuda_elastic_clear_slots(l, 0);
         return 0;
     }
@@ -492,6 +492,36 @@ static int cuda_elastic_shrink_in_place(cuda_elastic_layer &l) {
     }
     /* Slots that could not be read stay empty and load on their first miss. */
     if (!cuda_elastic_read_jobs(jobs)) cuda_elastic_clear_slots(l, slots);
+    return 1;
+}
+
+static uint64_t cuda_elastic_max_table_bytes(void);
+
+/*
+ * Both shrinks above free a layer's block before they allocate the smaller
+ * one, and leave the layer without any when that allocation fails.  Its next
+ * launch allocates a minimum block again, every slot empty: they load on their
+ * first miss, as after a failed read.  A shrunk layer gathers its batches in
+ * the scratch block, which the failed reclaim may not have taken yet.  Until
+ * both exist the launch fails instead of misrouting.
+ */
+static int cuda_elastic_restore_block(cuda_elastic_layer &l) {
+    if (!g_elastic_scratch) {
+        const uint64_t bytes = std::max(cuda_elastic_max_table_bytes(),
+                                        cuda_elastic_block_bytes(l, l.t.n_total_expert));
+        void *scratch = NULL;
+        if (!cuda_ok(cudaMalloc(&scratch, (size_t)bytes), "elastic scratch block")) return 0;
+        g_elastic_scratch = (char *)scratch;
+        g_elastic_scratch_bytes = bytes;
+        g_elastic_scratch_layer = -1;
+    }
+    void *block = NULL;
+    if (!cuda_ok(cudaMalloc(&block, (size_t)cuda_elastic_block_bytes(l, DS4_ROCM_ELASTIC_MIN_SLOTS)),
+                 "elastic expert block")) {
+        return 0;
+    }
+    cuda_elastic_clear_slots(l, DS4_ROCM_ELASTIC_MIN_SLOTS);
+    l.block = (char *)block;
     return 1;
 }
 
@@ -757,7 +787,7 @@ static int cuda_elastic_apply(
     cuda_elastic_trace(*l, selected, n_tokens, n_expert);
     g_elastic_clock++;
     if (g_elastic_scratch) cuda_elastic_maybe_grow();
-    if (!l->block) return -1;
+    if (!l->block && !cuda_elastic_restore_block(*l)) return -1;
     if (cuda_elastic_full(*l)) {
         /* Resident layout.  Record which experts are in use so reclaim knows
          * the cold ones: every batch (one readback per layer and chunk), but
