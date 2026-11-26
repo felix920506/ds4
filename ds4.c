@@ -63681,7 +63681,7 @@ static void ds4_acquire_instance_lock(void) {
     char dir[PATH_MAX];
     const char *name;
     int dir_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
-    bool made_dir = false, custom_path = false;
+    bool made_dir = false;
     if (!path || !path[0]) {
         path = "/tmp/ds4-lock/ds4.lock";
         snprintf(dir, sizeof(dir), "/tmp/ds4-lock");
@@ -63689,7 +63689,6 @@ static void ds4_acquire_instance_lock(void) {
         dir_flags |= O_NOFOLLOW;
         made_dir = mkdir(dir, 0700) == 0;
     } else {
-        custom_path = true;
         const char *slash = strrchr(path, '/');
         name = slash ? slash + 1 : path;
         if (!slash) snprintf(dir, sizeof(dir), ".");
@@ -63703,6 +63702,9 @@ static void ds4_acquire_instance_lock(void) {
         dir_flags |= O_PATH; /* only searched, so it need not be readable */
 #endif
     }
+    /* The hints name the remedies for the default directory; DS4_LOCK_FILE
+     * may point there too (the compose files set it). */
+    const bool custom_path = strcmp(dir, "/tmp/ds4-lock") != 0;
 
     const int dfd = open(dir, dir_flags);
     struct stat st;
@@ -63722,7 +63724,7 @@ static void ds4_acquire_instance_lock(void) {
                 dir, (unsigned)st.st_uid, (unsigned)(st.st_mode & 07777),
                 euid == 0 ? "" : " or by you");
         if (custom_path) {
-            fprintf(stderr, " Point DS4_LOCK_FILE into a directory that others cannot write to");
+            fprintf(stderr, " Point DS4_LOCK_FILE into a directory owned by root or by you that others cannot write to");
         } else {
             fprintf(stderr, " With no ds4 running, remove it (sudo rm -r %s) or recreate it as root "
                     "(sudo install -d -m 1777 %s)", dir, dir);
