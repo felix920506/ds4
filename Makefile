@@ -1749,3 +1749,8 @@ gguf-tools/quality-testing/score_official_verify.o: gguf-tools/quality-testing/s
 
 gguf-tools/quality-testing/score_official_verify: gguf-tools/quality-testing/score_official_verify.o ds4_verify_test_hooks.o $(filter-out ds4.o,$(CORE_OBJS)) rax.o ds4_gpu_args.o
 	$(if $(filter Darwin,$(UNAME_S)),$(CC) $(CFLAGS),$(DS4_LINK)) -o $@ $^ $(if $(filter Darwin,$(UNAME_S)),$(METAL_LDLIBS),$(DS4_LINK_LIBS))
+
+# ds4.h includes ds4_metrics.h and its users size arrays with DS4_METRIC_COUNT, so any
+# existing object may be stale when the metric list changes. This stays last so that it
+# never becomes the first prerequisite ($<) of a rule defined above.
+$(wildcard *.o tests/*.o): ds4_metrics.h
