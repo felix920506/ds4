@@ -282,6 +282,49 @@ static void test_snapshot_bytes(void) {
     g_ds4_compress_ratios[0] = saved_ratio;
 }
 
+/* The symbol array of one BPE piece grows past INT_MAX entries without
+ * overflow (one unbroken run of letters is one piece, and a request body can
+ * hold gigabytes of them), and refuses a size that does not fit. */
+static void test_bpe_symbol_capacity(void) {
+    const size_t sym = sizeof(owned_str);
+    assert(bpe_grow_capacity(32, sym) == 64);
+    assert(bpe_grow_capacity((size_t)1 << 30, sym) == (size_t)1 << 31);
+    assert(bpe_grow_capacity((size_t)1 << 31, sym) == (size_t)1 << 32);
+    assert(bpe_grow_capacity(SIZE_MAX / 2 / sym, sym) == SIZE_MAX / 2 / sym * 2);
+    assert(bpe_grow_capacity(SIZE_MAX / 2 / sym + 1, sym) == 0);
+    assert(bpe_grow_capacity(SIZE_MAX / 2, 1) == SIZE_MAX - 1);
+    assert(bpe_grow_capacity(SIZE_MAX / 2 + 1, 1) == 0);
+
+    /* A piece longer than the first allocation, merged pairwise. */
+    ds4_vocab v = {0};
+    char bytes[256][5] = {{0}};
+    v.n_vocab = 257;
+    v.token = calloc((size_t)v.n_vocab, sizeof(*v.token));
+    assert(v.token);
+    table_init(&v.token_to_id, v.n_vocab);
+    table_init(&v.merge_rank, 1);
+    for (int i = 0; i < 256; i++) {
+        char *p = bytes[i];
+        utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)i));
+        v.token[i] = (ds4_str){bytes[i], (uint64_t)(p - bytes[i])};
+        table_put(&v.token_to_id, v.token[i], i);
+    }
+    v.token[256] = (ds4_str){"aa", 2};
+    table_put(&v.token_to_id, v.token[256], 256);
+    table_put(&v.merge_rank, (ds4_str){"a a", 3}, 0);
+    char run[101];
+    memset(run, 'a', 100);
+    run[100] = '\0';
+    token_vec out = {0};
+    bpe_emit_piece(&v, (ds4_str){run, 100}, &out);
+    assert(out.len == 50);
+    for (int i = 0; i < out.len; i++) assert(out.v[i] == 256);
+    token_vec_free(&out);
+    table_free(&v.token_to_id);
+    table_free(&v.merge_rank);
+    free(v.token);
+}
+
 static uint64_t metric_value(ds4_metric m) {
     uint64_t v[DS4_METRIC_COUNT];
     ds4_metrics_snapshot(v);
@@ -881,6 +924,7 @@ int main(void) {
     test_session_memory();
     test_payload_tokens();
     test_snapshot_bytes();
+    test_bpe_symbol_capacity();
     test_kv_save_metrics();
     test_text_observations();
 #ifndef DS4_NO_GPU
