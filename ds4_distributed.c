@@ -2678,11 +2678,19 @@ static int dist_logits_argmax(const float *logits, int n_vocab) {
  * worker registration.  Every caller that produces a usable plan goes through
  * this function, including the recovery path in
  * dist_coordinator_rebuild_from_transcript(), so every plan gets a connection.
+ *
+ * The wait runs inside a request, with the server's inference lock held, so it
+ * stops as soon as cancel fires (a client that left, or a server shutting
+ * down): DS4_SESSION_SYNC_INTERRUPTED.  wait=false fails at once instead.
+ * Returns 0 with a usable plan and 1 on failure.
  */
-static bool dist_coordinator_ensure_route(
+static int dist_coordinator_ensure_route(
         ds4_dist_coordinator_state *state,
         ds4_dist_route_plan *plan,
         uint64_t *generation,
+        ds4_session_cancel_fn cancel,
+        void *cancel_ud,
+        bool wait,
         char *err,
         size_t errlen) {
     /* Only a missing layer is worth waiting for: it is the one failure that
@@ -2695,13 +2703,23 @@ static bool dist_coordinator_ensure_route(
                                               &layer_missing, err, errlen)) {
             break;
         }
-        if (!layer_missing || dist_now_sec() - t0 >= DS4_DIST_ROUTE_WAIT_SEC) {
+        if (!layer_missing || !wait || dist_now_sec() - t0 >= DS4_DIST_ROUTE_WAIT_SEC) {
             if (waited) {
                 fprintf(stderr,
                         "ds4: distributed coordinator: no complete route after %.0f s: %s\n",
                         dist_now_sec() - t0, err);
             }
-            return false;
+            return 1;
+        }
+        if (cancel && cancel(cancel_ud)) {
+            if (waited) {
+                fprintf(stderr,
+                        "ds4: distributed coordinator: request interrupted after %.1f s "
+                        "of waiting for a worker\n",
+                        dist_now_sec() - t0);
+            }
+            if (errlen) snprintf(err, errlen, "interrupted while waiting for a worker");
+            return DS4_SESSION_SYNC_INTERRUPTED;
         }
         if (!waited) {
             fprintf(stderr,
@@ -2717,7 +2735,7 @@ static bool dist_coordinator_ensure_route(
     }
     /* count == 0 is a local-only route; fd >= 0 is the one-shot coordinator's
      * dup() of the control link. */
-    if (plan->count == 0 || plan->entry[0].fd >= 0) return true;
+    if (plan->count == 0 || plan->entry[0].fd >= 0) return 0;
 
     int fd = dist_connect_endpoint(plan->entry[0].host,
                                    (int)plan->entry[0].port,
@@ -2726,11 +2744,16 @@ static bool dist_coordinator_ensure_route(
     if (fd < 0) {
         dist_route_plan_free(plan);
         if (generation) *generation = 0;
-        return false;
+        return 1;
     }
     dist_set_socket_low_latency(fd);
     plan->entry[0].fd = fd;
-    return true;
+    return 0;
+}
+
+/* cancel callback for a route wait on behalf of a coordinator session. */
+static bool dist_owner_cancelled(void *owner) {
+    return ds4_session_cancelled(owner);
 }
 
 static uint64_t dist_coordinator_generation(ds4_dist_coordinator_state *state) {
@@ -3409,11 +3432,13 @@ static int dist_coordinator_rebuild_from_transcript(
         dist_coordinator_forget_route_workers(state, plan);
         dist_route_plan_free(plan);
         uint64_t generation = 0;
-        if (!dist_coordinator_ensure_route(state, plan, &generation, err, errlen)) return 1;
+        if (dist_coordinator_ensure_route(state, plan, &generation, dist_owner_cancelled,
+                                          session, true, err, errlen) != 0) return 1;
         if (plan_generation) *plan_generation = generation;
     } else if (plan->count == 0) {
         uint64_t generation = 0;
-        if (!dist_coordinator_ensure_route(state, plan, &generation, err, errlen)) return 1;
+        if (dist_coordinator_ensure_route(state, plan, &generation, dist_owner_cancelled,
+                                          session, true, err, errlen) != 0) return 1;
         if (plan_generation) *plan_generation = generation;
     }
     if (dist_coordinator_prefill_prompt(state,
@@ -4421,7 +4446,8 @@ static int dist_run_coordinator_generation(
     char err[256];
     ds4_dist_route_plan plan;
     uint64_t plan_generation = 0;
-    if (!dist_coordinator_ensure_route(state, &plan, &plan_generation, err, sizeof(err))) {
+    if (dist_coordinator_ensure_route(state, &plan, &plan_generation, NULL, NULL, true,
+                                      err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: distributed coordinator: %s\n", err);
         return 1;
     }
@@ -4938,7 +4964,9 @@ static uint64_t dist_make_session_id(const void *ptr) {
     return id ? id : 1u;
 }
 
-static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errlen) {
+/* wait as in dist_coordinator_ensure_route(); the result is its result. */
+static int dist_session_ensure_route(ds4_dist_session *d, ds4_session *owner, bool wait,
+                                     char *err, size_t errlen) {
     if (!d) {
         if (errlen) snprintf(err, errlen, "missing distributed session");
         return 1;
@@ -4946,10 +4974,13 @@ static int dist_session_ensure_route(ds4_dist_session *d, char *err, size_t errl
     uint64_t generation = dist_coordinator_generation(&d->coord->state);
     if (d->plan_ready && d->plan_generation == generation) return 0;
     dist_route_plan_free(&d->plan);
-    if (!dist_coordinator_ensure_route(&d->coord->state, &d->plan, &generation, err, errlen)) {
+    const int rc = dist_coordinator_ensure_route(&d->coord->state, &d->plan, &generation,
+                                                 dist_owner_cancelled, owner, wait,
+                                                 err, errlen);
+    if (rc != 0) {
         d->plan_ready = false;
         d->plan_generation = 0;
-        return 1;
+        return rc;
     }
     d->plan_ready = true;
     d->plan_generation = generation;
@@ -5708,7 +5739,10 @@ int ds4_dist_session_save_payload(
         if (errlen) snprintf(err, errlen, "invalid distributed payload save");
         return 1;
     }
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    /* No wait: a missing stage took its shard of this session with it, so
+     * the save cannot succeed even once a worker comes back.  Shutdown and
+     * eviction saves run here with no request to cancel them. */
+    if (dist_session_ensure_route(d, owner, false, err, errlen) != 0) return 1;
     if (dist_kv_route_validate(d, err, errlen) != 0) return 1;
 
     const ds4_tokens *tokens = ds4_session_tokens(owner);
@@ -5842,7 +5876,7 @@ int ds4_dist_session_load_payload(
         if (errlen) snprintf(err, errlen, "invalid distributed payload load");
         return 1;
     }
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (dist_session_ensure_route(d, owner, true, err, errlen) != 0) return 1;
     if (dist_kv_route_validate(d, err, errlen) != 0) return 1;
     d->prefix_request = 0;
 
@@ -6233,7 +6267,8 @@ int ds4_dist_session_sync(
         if (errlen) snprintf(err, errlen, "invalid distributed sync request");
         return 1;
     }
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    const int route_rc = dist_session_ensure_route(d, owner, true, err, errlen);
+    if (route_rc != 0) return route_rc;
 
     if (checkpoint &&
         checkpoint->len >= 0 &&
@@ -6546,7 +6581,7 @@ static int dist_batch_submit_member(
     ds4_dist_session *d = item->dist;
     const uint32_t pos0 = (uint32_t)item->checkpoint->len;
     member->pos0 = pos0;
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (dist_session_ensure_route(d, item->owner, true, err, errlen) != 0) return 1;
 
     uint64_t prefix_hash = DS4_DIST_TOKEN_HASH_INIT;
     if (dist_session_prefix_hash(d, item->owner, pos0, &prefix_hash,
@@ -6738,7 +6773,7 @@ int ds4_dist_session_eval(
         if (errlen) snprintf(err, errlen, "invalid distributed decode request");
         return 1;
     }
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (dist_session_ensure_route(d, owner, true, err, errlen) != 0) return 1;
 
     /* Read before the span, whose local slice commits the token onto the
      * timeline; the recovery below has to replay from here, not from where the
@@ -6927,7 +6962,7 @@ int ds4_dist_session_dspark_cycle(
         return 1;
     }
     if (d->dspark_unavailable) return 1;
-    if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
+    if (dist_session_ensure_route(d, owner, true, err, errlen) != 0) return 1;
     if (!dist_session_dspark_route_ok(d)) {
         fprintf(stderr,
                 "ds4: distributed DSpark needs exactly one remote stage that owns the "

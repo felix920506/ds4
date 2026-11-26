@@ -10541,6 +10541,13 @@ static bool job_cancelled(void *ud) {
     return cancelled;
 }
 
+/* The engine's view of a running job: its client left, or the server is
+ * shutting down.  The distributed route wait polls it, and would otherwise
+ * hold the executor for up to 120 s after either. */
+static bool job_session_cancelled(void *ud) {
+    return g_stop_requested || job_cancelled(ud);
+}
+
 static void job_mark_cancelled(job *j) {
     if (!j) return;
     pthread_mutex_lock(&j->mu);
@@ -15998,7 +16005,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 503,
                    "not enough memory for a session context");
     } else {
-        ds4_session_set_cancel(slot->session, job_cancelled, j);
+        ds4_session_set_cancel(slot->session, job_session_cancelled, j);
         generate_job_inner(s, slot, j);
         ds4_session_set_cancel(slot->session, NULL, NULL);
     }

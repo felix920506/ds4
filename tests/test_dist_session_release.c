@@ -5,7 +5,8 @@
  * release frame is what lets ordinary session churn reuse a worker's
  * --max-sessions budget.  This test drives the real coordinator broadcast and
  * the real worker frame handler over socketpairs, with placeholder sessions so
- * no model or GPU is needed; it also pins the widened session-id sequence.
+ * no model or GPU is needed; it also pins the widened session-id sequence,
+ * and that the coordinator's wait for a missing stage can be interrupted.
  */
 #include "../ds4_distributed.c"
 
@@ -220,6 +221,41 @@ static void test_release_backpressure(uint64_t id) {
     close(pair[1]);
 }
 
+/* A request waiting for a missing stage holds the server's inference lock, so
+ * the wait has to end when the request is cancelled, and a KV save (shutdown,
+ * eviction) must not wait at all: the missing stage took its shard along. */
+static int cancel_polls;
+static bool cancel_on_third_poll(void *ud) {
+    (void)ud;
+    return ++cancel_polls >= 3;
+}
+
+static void test_route_wait_interrupt(void) {
+    ds4_dist_coordinator_state state;
+    memset(&state, 0, sizeof(state));
+    pthread_mutex_init(&state.mu, NULL);
+    state.n_layers = 4;
+    state.local_end = 1;  /* no worker registered for layers 2..3 */
+
+    ds4_dist_route_plan plan;
+    char err[128] = {0};
+    const double t0 = dist_now_sec();
+    assert(dist_coordinator_ensure_route(&state, &plan, NULL, cancel_on_third_poll, NULL,
+                                         true, err, sizeof(err)) ==
+           DS4_SESSION_SYNC_INTERRUPTED);
+    assert(cancel_polls == 3);
+    assert(dist_now_sec() - t0 < 5.0);
+    assert(strstr(err, "interrupted") != NULL);
+
+    cancel_polls = 0;
+    err[0] = '\0';
+    assert(dist_coordinator_ensure_route(&state, &plan, NULL, cancel_on_third_poll, NULL,
+                                         false, err, sizeof(err)) == 1);
+    assert(cancel_polls == 0);
+    assert(strstr(err, "missing layer 2") != NULL);
+    pthread_mutex_destroy(&state.mu);
+}
+
 int main(void) {
     const uint64_t first = dist_make_session_id(NULL);
     test_session_id_sequence(first);
@@ -229,6 +265,7 @@ int main(void) {
     test_worker_control_loop(dist_worker_read_loop_prefetch,
                              UINT64_C(0xabc000000004));
     test_release_backpressure(UINT64_C(0xabc000000005));
+    test_route_wait_interrupt();
     fprintf(stderr, "test_dist_session_release PASS\n");
     return 0;
 }
