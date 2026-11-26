@@ -5,9 +5,6 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include "../ds4_image.h"
-#ifdef DS4_ROCM_BUILD
-#include "../ds4_linux_memory.h"
-#endif
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
@@ -5330,14 +5327,6 @@ static bool test_logits_identical(ds4_engine *engine, ds4_session *a, ds4_sessio
 }
 
 #ifdef DS4_ROCM_BUILD
-/* Host memory still allocatable: on a unified-memory device every GPU buffer
- * is pinned host memory, and unlike the kfd counters this works in a container. */
-static uint64_t test_rocm_free_bytes(void) {
-    uint64_t bytes = 0;
-    TEST_ASSERT(ds4_linux_nonmovable_memory(&bytes));
-    return bytes;
-}
-
 /* On-demand context memory: a session whose compressed caches start at four
  * rows and grow while it decodes must produce exactly the logits of a session
  * allocated up front, through checkpoints exchanged in both directions and a
@@ -5352,21 +5341,26 @@ static void test_rocm_context_growth(void) {
     ds4_tokens prompt = {0};
     char err[192] = {0};
 
-    const uint64_t free0 = test_rocm_free_bytes();
     setenv("DS4_ROCM_KV_UPFRONT", "1", 1);
     TEST_ASSERT(ds4_session_create(&upfront, engine, CTX) == 0);
     unsetenv("DS4_ROCM_KV_UPFRONT");
-    const uint64_t free1 = test_rocm_free_bytes();
     setenv("DS4_ROCM_KV_MIN_ROWS", "4", 1);
     TEST_ASSERT(ds4_session_create(&grown, engine, CTX) == 0);
-    const uint64_t free2 = test_rocm_free_bytes();
+    /* Sizes the engine accounts for.  Host free memory is no measure: the
+     * reclaim chain, CMA placement and other processes move it while a
+     * session is created.  The two sessions differ only in the tensors that
+     * grow on demand; the on-demand session reports what it committed of
+     * them, an up-front one reports 0 and holds the whole reservation, the
+     * estimate.  Its compressed caches and indexer scratch are 5.5 GiB. */
+    const ds4_context_memory full = ds4_context_memory_estimate_with_prefill(
+            test_model_backend(), CTX, (uint32_t)ds4_session_prefill_cap(upfront));
+    const uint64_t grown_bytes = ds4_session_context_memory_bytes(grown);
     if (!upfront || !grown) goto cleanup;
-    /* The compressed caches and indexer scratch of this context are 5.5 GiB. */
-    fprintf(stderr, "ds4-test: context growth: up-front session %.2f GiB, "
+    fprintf(stderr, "ds4-test: context growth: up-front reservation %.2f GiB, "
             "on-demand session %.2f GiB\n",
-            (double)(free0 - free1) / (double)gib, (double)(free1 - free2) / (double)gib);
-    TEST_ASSERT(free0 > free1 && free1 > free2 &&
-                free0 - free1 > free1 - free2 + 4 * gib);
+            (double)full.total_bytes / (double)gib, (double)grown_bytes / (double)gib);
+    TEST_ASSERT(ds4_session_context_memory_bytes(upfront) == 0);
+    TEST_ASSERT(grown_bytes != 0 && grown_bytes + 4 * gib < full.total_bytes);
 
     ds4_chat_begin(engine, &prompt);
     ds4_chat_append_message(engine, &prompt, "user",
